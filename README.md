@@ -4,7 +4,7 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 through M6.** The bridge registers the packed schemas, resolves **four** topics
+**Status: M1 through M7 — complete, bar one P2 requirement and the demo recording.** The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
 subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
 streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
@@ -22,27 +22,47 @@ conformance reader in `tests/capture-reader/` was written from it alone — it l
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
-There is no signal handling yet: a live run ends when the simulation host stops publishing, or
-on a record budget if you set one. Ctrl-C with a clean drain is M7, and so is the byte-limited
-capture (BTB-CAP-6).
+A live run ends on host loss, on Ctrl-C with a clean drain, or on a record budget if you set
+one. Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
+[Backpressure](#backpressure) for the values and why they are those values.
 
-Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
-[Backpressure](#backpressure) below for the values and why they are those values.
+**`docs/capture-format-v1.md` is frozen.** It is a cross-repo contract consumed by EXT-17;
+after the freeze, a change to what it specifies is a version bump and a downstream change, not
+an edit.
+
+**What is not here**, stated plainly rather than left to be discovered:
+
+- **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
+  count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
+  stop-or-rotate choice, and neither is stated in the `header` as the requirement asks.
+- **The 5-minute demo recording (BTB-DOC-2).** It needs a person and a screen recorder.
+  Everything it should show is scripted and runnable — see [Reproducing the
+  evidence](#reproducing-the-evidence) for the command behind each beat.
+
+`docs/decisions-m5-m7.md` records every judgment call made across M5–M7, with what it turned on
+and what would reverse it.
 
 ### Two things to know before you compare or trust a capture
 
-**Two live runs of one scenario are not byte-identical, and that is the platform, not the
-recorder.** `n8ro-sim-local` paces against the wall clock and skips about 1% of frames — a
-different 1% each run — so the two runs are not the same published stream. The recorder
-contributes no variation of its own. [`docs/capture-format-v1.md`](docs/capture-format-v1.md)
-§14 has the measurement and what to do instead if you are building a determinism self-test.
+**Two live runs of one scenario are not byte-identical — and the simulation is still
+reproducible.** Measured on both hosts: the wall-clock-paced `n8ro-sim-local` skips ~1% of
+frames, a different 1% each run, and even the fixed-step headless `n8ro-sim-app` skips ~0.2%.
+But comparing *content* rather than bytes on two headless runs stopped at the same frame,
+**50 358 of 50 358 samples agree and none differ** — the runs disagree only about which frames
+were published.
+
+So a byte comparison of two captures fails, and it is reporting the publication schedule rather
+than the simulation. Compare on content: `tests/determinism/compare_captures.py` does it, and
+[`docs/capture-format-v1.md`](docs/capture-format-v1.md) §14 has the measurement and the two
+traps (`sim_time_s` is not a key, and a frozen-clock segment cannot be aligned at all).
 
 **All-zero drop counters mean nothing the platform counts was lost — not that nothing was
-lost.** Measured against the simulation host's own record, a reference capture held 99 953 of
-99 981 published samples; nine of the 28 absent were the record budget cutting the final
-frame, and the other 19 (0.019%) are unexplained with every available counter reading zero.
-Risk R7 in the PRD, §14 of the spec. Do not read the absence of a message from a capture as
-evidence that it never happened.
+lost.** Measured against the simulation host's own record: at the reference rate a capture was
+short by 30 samples in a single frame, with every counter reading zero. Under three times the
+load it was complete. And the host's own record loses whole frames too — 203 under the overload
+— so it bounds our completeness from one side only and is not ground truth. Risk R7 in the PRD,
+§14 of the spec. Do not read the absence of a message from a capture as evidence that it never
+happened.
 
 ## Requirements
 
@@ -263,6 +283,7 @@ scenario load is *refused* — `Component type 'componentPhysics' has no registe
 | 16 | `--out-dir` is missing, is not a directory, or is not writable |
 | 17 | the condition file is malformed — named parse error, **before any subscription** (BTB-REF-1) |
 | 18 | a replay failed: the capture is missing, truncated, malformed, or declares a `format_version` this build does not implement |
+| 19 | a second interrupt arrived while the queue was draining, and the drain was forced to stop (BTB-SD-1). The capture may lack its trailer — one interrupt alone would have saved it |
 
 ### Loss reporting
 
@@ -564,6 +585,129 @@ float_format_probe.exe
 Exit code 0 if at least one candidate passes both axes. The result and what it means for
 the capture format are in [`notes.md`](notes.md).
 
+## Reproducing the evidence
+
+Everything the project claims is re-runnable with one command. The scripts are in the
+repository so a result is checkable rather than asserted, and so the 5-minute demo recording
+(the one deliverable that needs a person) has a script to follow.
+
+Each of these assumes a shell that has run `C:\N8RO\setup.cmd`.
+
+### The four unit suites — no simulator needed
+
+```cmd
+build\tests\entity_picture_test.exe     :: 72 checks - the roster and ADR-6
+build\tests\referee_test.exe            :: 93 checks - the three condition kinds
+build\tests\determinism_test.exe        :: 18 checks - R4's three hazards, and the locale
+build\tests\capture_reader.exe docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+    --spec docs\capture-format-v1.md     :: the format spec, checked against a real file
+python tests\capture-reader\mutate.py docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+    build\tests\capture_reader.exe docs\capture-format-v1.md   :: 16 mutations, 0 survivors
+```
+
+The build lines for each are in the file's own header comment, and in [Tests](#tests) above.
+
+### Clean Ctrl-C, twenty times (BTB-SD-1)
+
+```cmd
+powershell -ExecutionPolicy Bypass -File tests\shutdown\shutdown_loop.ps1 -Cycles 20
+```
+
+Each cycle starts its own simulator (bridge first), interrupts the bridge with a **real console
+Ctrl-C**, and checks that it exited 0, that the file's last line is a well-formed trailer with
+`end_reason: shutdown`, and that the trailer's own sample count matches the records in the
+file. Result: **20 of 20 clean.**
+
+### The determinism harness, both halves (BTB-CAP-3)
+
+```cmd
+build\tests\determinism_test.exe        :: the emission path, against R4's three hazards
+powershell -ExecutionPolicy Bypass -File tests\determinism\replay_hashes.ps1
+```
+
+The second replays one stored capture ten times and hashes the verdicts. **10 of 10 identical.**
+A live pair is deliberately *not* the test — on a wall-clock-paced host it measures the host's
+repeatability, not the recorder's, which is what PRD rev 5 exists to say.
+
+### The R1 teardown spike
+
+```cmd
+powershell -ExecutionPolicy Bypass -File tests\teardown-spike\teardown_spike.ps1 -Cycles 20
+```
+
+Twenty consecutive load-run-teardown cycles with the bridge attached. `0xC0000005` would appear
+as exit code `-1073741819`. Result: **host 0 ×20, bridge 0 ×20 — it did not reproduce.**
+
+### The R8 spike: is the headless host repeatable?
+
+This is the one that changes what EXT-17 should build. It needs the headless host, driven over
+the bus — the invocation OQ-2 asked about:
+
+```cmd
+:: terminal 1 - the bridge, started first
+build\x64\Release\n8ro-bridge.exe --config SimEngineClient_SharedMemory ^
+    --model-path C:\N8RO\data\db --schema-file N8roSimSchema --out-dir captures --run-label r8a
+
+:: terminal 2 - the headless host. Note: it takes NO scenario argument
+n8ro-sim-app.exe --sim-config SimEngineHost_SharedMemory ^
+    --model-path C:\N8RO\data\db --schema-file N8roSimSchema
+
+:: terminal 3 - load, start, run to a FRAME budget, stop
+build\tests\host_driver.exe --scenario "Atacama Air Defense" --frames 1200
+```
+
+Repeat for `r8b`, then compare:
+
+```cmd
+fc /b captures\capture-atacama-air-defense-r8a.n8rocap.jsonl ^
+      captures\capture-atacama-air-defense-r8b.n8rocap.jsonl        :: differs
+
+python tests\determinism\compare_captures.py ^
+    captures\capture-atacama-air-defense-r8a.n8rocap.jsonl ^
+    captures\capture-atacama-air-defense-r8b.n8rocap.jsonl          :: 50358 of 50358 agree
+```
+
+**The frame budget is the point.** `--frames 1200` stops both runs at the same simulation
+instant; a wall-clock budget stops them at different ones, and their captures would then differ
+for a reason that has nothing to do with determinism.
+
+`tests/host-driver/` is a **test tool, not part of the bridge**. The bridge subscribes and never
+publishes, and that is what lets it promise it cannot perturb the run it records.
+
+### Capture versus the publisher's own record (R7)
+
+```cmd
+python tests\publisher-compare\compare.py <capture> ^
+    test_artifacts\n8ro-sim-local\sim_entity_state.jsonl
+```
+
+Read it in both directions: the host's dump is lossy too, so it bounds our completeness from
+one side only.
+
+### Making a committable sample capture
+
+```cmd
+python tests\evidence\trim_capture.py <big-capture> docs\sample-capture\<name>.n8rocap.jsonl
+```
+
+Keeps every non-sample record and the samples of two entities, and rewrites one number in the
+trailer. The result still reports CONFORMS, which is the check that it stayed valid.
+
+## The sample capture
+
+[`docs/sample-capture/`](docs/sample-capture/) holds a real capture from a real run, trimmed to
+3.2 MB. It carries the whole story in one file:
+
+- **both segments** — the run, and the teardown reload the engine's stop path produces
+- **`RedUAV_N_01` at two occupancies** — created, `destroyed` at `t = 149.45`, re-created at
+  occupancy 2. The end-to-end proof of ADR-6
+- **all 132 `entity_add` and 90 `entity_remove` records**, with reasons verbatim
+- **all seven verdicts**, including the two never-met ones
+
+Its header says `producer 0.6.0` because that is the build that recorded it. That is accurate
+rather than tidy: the file is a real artifact of a real run, not a regenerated one, and §16 of
+the format spec carries the producer version history.
+
 ## Layout
 
 ```
@@ -587,10 +731,18 @@ src/Json.{h,cpp}                         JSON escaping and the round-trip-exact 
 src/JsonParse.{h,cpp}                    reading JSON back — conditions and captures
 src/ExitCodes.h                          one table of process exit codes
 conditions/                              a working condition file for the reference scenario
+src/Signals.{h,cpp}                      BTB-SD-1 — the handler sets a flag and nothing else
+docs/sample-capture/                     a real capture, trimmed, for the evidence pack
 tests/entity-picture/                    unit tests for the picture — no simulator needed
 tests/referee/                           unit tests for the referee — no simulator needed
+tests/determinism/                       R4's three hazards, plus the replay-hash harness
+                                         and the content comparison EXT-17 should use
 tests/capture-reader/                    conformance reader, written from the format spec alone
 tests/publisher-compare/                 capture vs the host's own record — how R7 is measured
+tests/shutdown/                          the twenty-cycle Ctrl-C loop
+tests/teardown-spike/                    the R1 spike
+tests/host-driver/                       drives the headless host — a TEST TOOL, not the bridge
+tests/evidence/                          the capture trimmer
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
 ```

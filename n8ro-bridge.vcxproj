@@ -117,6 +117,7 @@
     <ClCompile Include="src\JsonParse.cpp" />
     <ClCompile Include="src\Referee.cpp" />
     <ClCompile Include="src\Replay.cpp" />
+    <ClCompile Include="src\Signals.cpp" />
     <ClCompile Include="src\HandlerTiming.cpp" />
     <ClCompile Include="src\RecordQueue.cpp" />
     <ClCompile Include="src\Json.cpp" />
@@ -133,6 +134,7 @@
     <ClInclude Include="src\JsonParse.h" />
     <ClInclude Include="src\Referee.h" />
     <ClInclude Include="src\Replay.h" />
+    <ClInclude Include="src\Signals.h" />
     <ClInclude Include="src\HandlerTiming.h" />
     <ClInclude Include="src\RecordQueue.h" />
     <ClInclude Include="src\EntityPicture.h" />

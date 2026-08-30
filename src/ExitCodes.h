@@ -26,5 +26,6 @@ constexpr int kExitEngineStateUnresolved = 15;   // BTB-CX-3: no host-loss detec
 constexpr int kExitOutDirInvalid = 16;           // --out-dir missing, not a directory, or unwritable
 constexpr int kExitConditionsInvalid = 17;       // BTB-REF-1: malformed condition file, before subscribing
 constexpr int kExitReplayFailed = 18;            // BTB-REF-4: the capture could not be re-judged
+constexpr int kExitDrainForced = 19;             // BTB-SD-1: a second interrupt during the drain
 
 }  // namespace n8ro::bridge

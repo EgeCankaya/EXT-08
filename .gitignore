@@ -24,9 +24,10 @@ test_artifacts/
 # Deliberately untracked: it is a proprietary binary and its content is Arkheon's, not ours.
 *.docx
 
-# Capture files produced by real runs. A reference run of Atacama Air Defense at the
-# default 100 000-sample budget is roughly 45 MB of JSON Lines - an artifact to produce and
-# check, not one to version. M7's evidence pack carries a small trimmed sample instead.
+# Capture files produced by real runs. A full reference run of Atacama Air Defense is about
+# 64 MB of JSON Lines - an artifact to produce and check, not one to version. The evidence
+# pack carries a trimmed sample instead (see the un-ignore below), and README's "Reproducing
+# the evidence" says how to make a full one.
 captures/
 *.n8rocap.jsonl
 build.log
@@ -36,3 +37,10 @@ buildtests.log
 # schema database and a logger file into its working directory. Run artifacts, never ours.
 data/
 logs/
+
+# ...except the evidence pack's sample capture, which is a deliverable (BTB-DOC-2). It is a
+# real capture from a real run, trimmed by tests/evidence/trim_capture.py to two entities'
+# samples with every structural record kept, and it still reports CONFORMS. The unit suites
+# run against it, so it is test input as well as evidence.
+!docs/sample-capture/
+!docs/sample-capture/*.n8rocap.jsonl

@@ -1,4 +1,4 @@
-// EXT-08 Bus Telemetry Bridge - M6: the referee, live and offline.
+// EXT-08 Bus Telemetry Bridge - M7: shutdown, and the finished program.
 //
 // Registers the packed schemas, resolves four topics from the registry, subscribes decoded,
 // maintains a roster and a latest-sample map, streams a `n8ro-capture/1` file through a
@@ -15,13 +15,12 @@
 // available conformance test for the capture format: if the referee can re-derive its own
 // verdicts from the file alone, the file demonstrably contains enough.
 //
-// Scope: BTB-REF-1 through BTB-REF-4 on top of M2-M5. The normative description of what it
-// writes is docs/capture-format-v1.md; every decision taken while building it is in
+// Scope: BTB-SD-1 on top of M2-M6. The normative description of what it writes is
+// docs/capture-format-v1.md; every decision taken while building it is in
 // docs/decisions-m5-m7.md.
 //
-// What M6 deliberately does not have (docs/prd.md, M7): no signal handling or Ctrl-C drain,
-// no determinism harness, no size limit in bytes (BTB-CAP-6). A live run ends on host loss
-// or on the record budget.
+// A live run ends on host loss, on Ctrl-C, or on the record budget. The one requirement left
+// unbuilt is BTB-CAP-6's byte-limited capture, which is P2 - see docs/decisions-m5-m7.md.
 //
 // The four topics, and why each is here:
 //
@@ -44,6 +43,7 @@
 #include "RecordQueue.h"
 #include "Referee.h"
 #include "Replay.h"
+#include "Signals.h"
 #include "TopicResolution.h"
 
 #include <DbModel.h>
@@ -834,6 +834,15 @@ int run(const Options& options) {
     // file, and the queue is the only thing the two threads share.
     std::thread writerThread([&writer, &queue] { writer.run(queue); });
 
+    if (!installInterruptHandlers()) {
+        // Not fatal: the bridge still records correctly, it just has to be ended by the host
+        // going away or by the record budget. Worth saying out loud rather than discovering.
+        N8RO_LOG_WARNING(std::string("could not install interrupt handlers; Ctrl-C will not "
+                                     "produce a clean shutdown and the capture would be "
+                                     "truncated. The run will still end cleanly on host loss"),
+                         kCategory);
+    }
+
     N8RO_LOG_INFO(std::string("message pump and writer thread started. Waiting for the "
                               "simulation host; no start order is required (BTB-CX-2). Host loss "
                               "is declared after ") +
@@ -887,6 +896,19 @@ int run(const Options& options) {
                               "; the bridge is subscribed and will begin capturing the moment "
                               "one publishes",
                           kCategory);
+        }
+
+        // BTB-SD-1. The handler set a counter and returned; everything the interrupt means
+        // happens here, on a thread that is allowed to allocate, lock and write.
+        if (interruptCount() > 0) {
+            N8RO_LOG_INFO(std::string("interrupt received; unsubscribing, stopping the pump, "
+                                      "draining the queue and closing the capture with "
+                                      "end_reason=shutdown. Every record enqueued before the "
+                                      "signal will be in the file (BTB-SD-1). Interrupt again "
+                                      "to force exit"),
+                          kCategory);
+            endReason = EndReason::Shutdown;
+            break;
         }
 
         if (writer.budgetReached()) {
@@ -956,6 +978,11 @@ int run(const Options& options) {
     // Unsubscribe, stop the pump, close the queue, join the writer, then write the trailer.
     // In that order: nothing may be enqueued after close(), and nothing may be written after
     // the writer thread has returned.
+    // From here to the trailer is the drain. A second interrupt inside this window forces
+    // exit with a logged warning rather than letting an operator watch a hang (BTB-SD-1); the
+    // watchdog exists because a signal handler cannot write that warning itself.
+    startDrainWatchdog(kExitDrainForced);
+
     static_cast<void>(packed.unsubscribe(stateSubscription));
     static_cast<void>(packed.unsubscribe(eventSubscription));
     static_cast<void>(packed.unsubscribe(scenarioSubscription));

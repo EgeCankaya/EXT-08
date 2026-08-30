@@ -1557,3 +1557,187 @@ queue drop anything was `--queue-size 4`, which is three orders of magnitude bel
   and the verdict file both go through `std::to_chars` rather than the `printf` family.
 - **`n8ro-sim-local`'s per-entity dump is ~58 MB for a 60-second 126-entity run**, on top of
   our own 72 MB capture. Running two lossy recorders to check one another is not free.
+
+## M7 — Shutdown, determinism, and the two spikes that were carried from the start
+
+The milestone where the two risks the PRD had been carrying since rev 1 finally got measured.
+Both had been described as "unknown, and cheap to resolve"; both were, and one of them
+returned an answer more useful than the question.
+
+### Ctrl-C: twenty of twenty
+
+BTB-SD-1 asks for twenty scripted interrupt-and-verify cycles, each leaving a valid capture
+ending in a well-formed trailer, exit code 0 every time.
+
+```
+cycle  1  ok    exit 0, trailer end_reason=shutdown, 7126 samples
+...
+cycle 20  ok    exit 0, trailer end_reason=shutdown, 7083 samples
+
+20 of 20 cycles clean: exit 0, well-formed trailer, end_reason=shutdown
+```
+
+The interrupt is a real console Ctrl-C, not a kill: the harness attaches to the bridge's own
+console and raises `CTRL_C_EVENT` there, so the path exercised is the operator's. Each cycle
+runs its **own** simulator, bridge first — sharing one host across twenty cycles was the first
+thing tried and it made the test worthless, because every cycle after the first attached
+mid-run and recorded nothing but orphans. A capture with no records has no tail to lose, so
+the harness now fails a cycle that produces one.
+
+It also counts the `sample` records in the file and compares them with the trailer's own
+`counts.samples`, because "every record enqueued before the signal is present" is the actual
+requirement and a trailer that merely exists does not establish it.
+
+**13 of the 20 cycles recorded exactly 7 083 samples.** That is a wall-clock-paced host being
+more repeatable than expected over a short window, and it is worth noting next to the
+frame-skipping finding rather than instead of it.
+
+The division of labour inside the program is the part worth keeping. The signal handler does
+exactly one thing — increments a lock-free counter — and everything the interrupt *means*
+happens on the main loop, which is already awake four times a second. A handler that allocated
+or locked could deadlock against the thread it interrupted. The second Ctrl-C is handled by a
+watchdog on an ordinary thread rather than in the handler, because the requirement is "forces
+exit **with a logged warning**" and a handler cannot log.
+
+### R1, the teardown access violation: did not reproduce
+
+Carried since rev 1: *"a `0xC0000005` host-side teardown access violation has been observed on
+this platform, with a `userPlugins/sim` plugin loaded. These projects load no plugins, so it
+may not apply."* It matters because EXT-17 needs twenty or more unattended runs with clean
+teardown.
+
+Twenty consecutive plugin-free load-run-teardown cycles, with the bridge attached to each:
+
+```
+host exit codes:     0 x20
+bridge exit codes:   0 x20
+
+20 of 20 cycles torn down cleanly. R1 did not reproduce in this configuration.
+```
+
+`0xC0000005` would have arrived as exit code `-1073741819`. It did not, once. The spike also
+answers the second-order question nobody had asked: a bus client observing the run does not
+perturb the teardown either.
+
+**R1 is closed for the plugin-free configuration**, which is the configuration EXT-08 and
+EXT-17 both use. It says nothing about the plugin-loaded case that produced the original
+observation, and the risk register now says exactly that rather than "closed".
+
+### R8, and the answer EXT-17 actually needs
+
+This is the finding of the milestone.
+
+R8 asked whether the host EXT-17 will really use is repeatable. M4 measured `n8ro-sim-local`
+and found it is not — it paces against the wall clock and skips ~1% of frames, a different 1%
+each run. But that is a *test driver*, and PRD rev 6 was right to narrow the claim: the
+headless `n8ro-sim-app.exe`, in a closed configuration, had never been measured. [S2] states
+the simulation is deterministic by contract and makes "two identical runs produce identical
+captures" a hard gate at its step 4.
+
+**OQ-2 is answerable by observation.** The invocation is
+
+```
+n8ro-sim-app.exe --sim-config SimEngineHost_SharedMemory ^
+                 --model-path C:\N8RO\data\db --schema-file N8roSimSchema
+```
+
+It takes **no scenario argument** — that was the puzzle. It hosts an engine and subscribes to
+its command topic; loading a scenario is a separate step published on `sim/scenario/command`,
+and starting is `{"command":"start"}` on `sim/engine/command`. `tests/host-driver/` is a small
+driver that does exactly that, kept out of `src/` because the bridge is a passive observer and
+must stay one.
+
+**The run is bounded by frame number, not by wall-clock time.** That is the whole reason the
+experiment works: `--frames 1200` stops both runs at exactly the same simulation instant.
+`n8ro-sim-local`'s `--run-ms` cannot, and two runs that end at different frames are guaranteed
+to produce different captures for a reason that has nothing to do with determinism.
+
+Two runs, each stopped at frame 1200 (simTime 60.000000 exactly, both times):
+
+```
+byte comparison      FAILS   - the files differ at line 339 and differ in length
+content comparison   PASSES  - 50 358 samples compared, 50 358 agree, 0 differ
+```
+
+The runs differ only in **which** samples were published: 83 samples across 4 frames, out of
+about 1 198 frames. Every sample present in both, at the same `(entity, occupancy,
+sim_time_s)`, carries byte-identical values.
+
+**So the simulation is reproducible and its publication schedule is not.** That is a far more
+useful answer than yes or no, and it lands before EXT-17 writes a line of its self-test:
+byte-for-byte capture comparison will fail on this platform and will be reporting the
+schedule, not the simulation. `tests/determinism/compare_captures.py` is the comparison that
+does work, kept in the repository so EXT-17 does not have to invent it.
+
+The frame loss is also much lower here than on the test driver — about 0.2% of frames against
+~1% — which is consistent with a fixed-step host being better behaved, without being clean.
+
+### `sim_time_s` is not a unique key, and that broke the first comparison
+
+Writing that comparison turned up something the format spec had understated. §14 recommends
+comparing "per-`(entity, occupancy)` value sequences keyed by `sim_time_s`". Keyed by
+`sim_time_s` **does not work**, and the first version of the tool reported 35 differences that
+were not differences.
+
+The reason is the teardown segment. The engine resets the clock before republishing the
+roster, so every sample in that segment carries `sim_time_s = 0.0` — about **93 per entity**.
+Nothing distinguishes one from the next, so the Nth sample at t=0 in run A is not the same
+moment as the Nth in run B; lose one early sample and everything after it shifts by one, and
+the comparison starts matching `phase: "uninitialized"` against `phase: "standby"`.
+
+**A frozen-clock segment cannot be content-compared at all.** The tool now detects one exactly
+rather than by a threshold — in a running segment each entity publishes once per frame, so the
+maximum number of samples any one `(entity, occupancy)` has at a single `sim_time_s` is exactly
+1; in a teardown segment it is ~93 — and excludes it, saying so. §5.1 of the format spec now
+carries the same warning, because a consumer building on the §14 advice would have hit this on
+their first attempt.
+
+### The determinism harness, in two halves
+
+BTB-CAP-3 as rev 5 scoped it: *given the same sequence of published messages, produce the same
+bytes.* Two harnesses, because they answer different questions.
+
+**`tests/determinism/replay_hashes.ps1`** is the requirement's literal criterion — ten replays
+of one stored capture, hashed. Ten of ten identical. It removes the host from the experiment
+entirely, which is the only way the answer is about us.
+
+**`tests/determinism/determinism_test.cpp`** is the one that would actually localise a
+regression. R4 names three non-determinism sources and says all three are easy to reintroduce,
+so each gets a test that fails if it comes back:
+
+- **Unordered-map iteration.** The same payload is built with its fields inserted in the
+  opposite order and must serialise identically. A serialiser that iterated the
+  `StreamValueMap` instead of walking `MessageSchema::fields` would fail this.
+- **Locale-dependent float formatting.** The whole record set is serialised again under a
+  comma-decimal locale — both the C locale and the C++ global locale — and must be
+  byte-identical. This is the failure `%.17g` produces *silently*, and this machine's own
+  locale is comma-decimal, so the test runs for real rather than being skipped. (PowerShell
+  reported one of the replay timings as `1,02 s`, which is the same hazard visible in passing.)
+- **Ordered output containers.** The header's schema array is supplied out of alphabetical
+  order and must come out sorted; a verdict's values must come out in key order.
+
+Plus a set of **golden lines** — the exact bytes of an `entity_remove`, a `segment_open` and
+the header's opening keys. After the format freeze those are the friction that makes changing
+the spelling a deliberate act rather than an accident.
+
+18 checks, and the locale one is the one that earns its keep.
+
+### The evidence pack, and the one deliverable that is not here
+
+`docs/sample-capture/` holds a real capture, trimmed to 3.2 MB by
+`tests/evidence/trim_capture.py`: every non-sample record is kept — the header, both segment
+pairs, all 132 `entity_add` records, all 90 `entity_remove` records, all 7 verdicts — and only
+the samples of two entities survive. The trimmer rewrites exactly one number, `counts.samples`,
+by editing that number in the trailer line rather than re-encoding the record, so every other
+byte is preserved. The result still reports CONFORMS, which is the check that the trimming did
+not quietly invalidate anything, and the mutation suite now runs against it too.
+
+It contains the whole story in one file: `RedUAV_N_01` created, destroyed at t = 149.45,
+re-created at occupancy 2 in the teardown segment; both segments; and the seven verdicts,
+including the two never-met ones.
+
+**The 5-minute demo recording (BTB-DOC-2) is the one deliverable not in the repository.** It
+needs a person and a screen recorder. Everything it is supposed to show is scripted and
+runnable — start-before-simulator, a reload producing two segments, an entity removal, a
+verdict firing, the backpressure demonstration and a clean Ctrl-C — and the README says which
+command produces each.

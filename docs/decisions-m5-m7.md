@@ -415,3 +415,136 @@ direction that surprised us is the one M4 had not thought to print.
 BTB-CAP-6 (bounded capture size, P2) is still unbuilt: no byte limit, no rotation choice, no
 statement of either in the `header`. Flagged again for the project owner — it is P2 and M7 is
 budgeted for shutdown, determinism and evidence, so it stays out unless asked for.
+
+---
+
+## M7 — shutdown, determinism, evidence
+
+### D-29 — The signal handler increments a counter and nothing else
+
+BTB-SD-1 specifies this and it is a correctness requirement, not a style one: a handler runs
+asynchronously with respect to the thread it interrupted, so allocating, locking or writing
+from one can deadlock against it. `src/Signals.cpp` increments a `std::atomic<int>` that a
+`static_assert` proves lock-free, re-arms itself, and returns.
+
+Everything the interrupt *means* happens on the main loop, which already wakes four times a
+second — so the response latency is bounded by the poll interval and nothing else.
+
+### D-30 — The second interrupt is handled by a watchdog thread, not by the handler
+
+"A second Ctrl-C during drain forces exit with a logged warning rather than hanging." A signal
+handler cannot write that warning. So the teardown path starts a detached watchdog that polls
+the counter every 50 ms and, on seeing two, logs the warning and calls `std::_Exit`.
+
+It is never joined, deliberately. The process is on its way out either way, and a watchdog that
+must be joined is one more thing that can fail to be joined while something else is stuck.
+
+### D-31 — Each shutdown cycle runs its own simulator
+
+The first version of the loop shared one host across all twenty cycles, and every cycle after
+the first passed while testing nothing: the `entity_created` burst fires once at scenario load,
+so a bridge started later records nothing but orphans, and a capture with no records has no
+tail to lose.
+
+The harness now starts a simulator per cycle, bridge first, and **fails a cycle whose capture
+has no samples**. It also counts the `sample` records in the file and compares them against the
+trailer's own `counts.samples`, because "every record enqueued before the signal is present" is
+the requirement and a trailer that merely exists does not establish it.
+
+### D-32 — The determinism harness is two harnesses
+
+BTB-CAP-3's literal criterion is ten replays of one stored capture, hashed
+(`tests/determinism/replay_hashes.ps1`, ten of ten identical). That is the end-to-end check and
+it removes the host from the experiment, which is the only way the answer is about the
+recorder.
+
+But it would not localise a regression, so `tests/determinism/determinism_test.cpp` tests the
+emission path directly against each of R4's three named hazards — unordered-map iteration,
+locale-dependent float formatting, and unordered output containers — plus a set of golden
+lines. The locale test is the one that earns its keep: it is the failure `%.17g` produces
+*silently*, and this machine's locale is comma-decimal so it runs for real.
+
+Golden lines are deliberate friction. After the M7 freeze, changing the spelling of a record
+should require editing a test that says "these exact bytes", not slip through.
+
+### D-33 — OQ-2 answered by observation, and the driver lives in `tests/`
+
+The headless invocation is
+`n8ro-sim-app.exe --sim-config SimEngineHost_SharedMemory --model-path <dir> --schema-file
+<name>`. It takes **no scenario argument** — that was the puzzle — because loading a scenario is
+a separate step published on `sim/scenario/command`, and starting is `{"command":"start"}` on
+`sim/engine/command`.
+
+`tests/host-driver/` does that. It is in `tests/` and not `src/` because **the bridge is a
+passive observer and must stay one**: it subscribes and never publishes, which is what lets
+ADR-4 and §14 promise consumers that it cannot perturb the run it records. A control direction
+inside the bridge would undermine that promise even unused.
+
+The driver bounds its run by **frame number**, not wall-clock time. That is what makes the R8
+experiment possible at all: two runs stopped after the same number of seconds have not covered
+the same simulation, and their captures are guaranteed to differ for a reason that has nothing
+to do with determinism.
+
+OQ-2 is answered as far as EXT-08 can answer it — the invocation works and is demonstrated.
+[S2] asked for the mentor to confirm it; that confirmation is still worth having, because what
+is demonstrated here is that it *works*, not that it is the intended production shape.
+
+### D-34 — R8 resolved: the simulation is reproducible, the schedule is not
+
+Two runs on the headless host, each stopped at frame 1200:
+
+| | |
+|---|---|
+| byte comparison | **fails** — differ at line 339, different lengths |
+| content comparison over running segments | **50 358 samples compared, 50 358 agree, 0 differ** |
+| difference | 83 samples across 4 frames, out of ~1 198 |
+
+So EXT-17's step-4 gate cannot be met byte-for-byte on this platform, and the property it was
+reaching for — that the simulation is reproducible — holds exactly.
+`tests/determinism/compare_captures.py` is the comparison that works, kept in the repository so
+EXT-17 inherits it rather than deriving it.
+
+Frame loss on the fixed-step host is ~0.2%, against ~1% on `n8ro-sim-local`. Better, not clean,
+and consistent with R7's unattributed mechanism still being present.
+
+### D-35 — A frozen-clock segment cannot be content-compared, and §14 needed to say so
+
+§14 recommended comparing "per-`(entity, occupancy)` value sequences keyed by `sim_time_s`".
+Keyed by `sim_time_s` does not work, and the first version of the comparison tool reported 35
+differences that were alignment artifacts.
+
+The engine resets the clock before republishing the roster at teardown, so every sample in that
+segment carries `sim_time_s = 0.0` — about 93 per entity. Nothing distinguishes them, so the
+Nth at t=0 in one run is not the same moment as the Nth in another.
+
+Detected **exactly** rather than by a threshold: in a running segment each entity publishes once
+per frame, so the maximum number of samples any one `(entity, occupancy)` carries at a single
+`sim_time_s` is 1; in a frozen segment it is ~93. §5.1 and §14 both now say so.
+
+### D-36 — The committed sample capture is trimmed, not synthesised
+
+BTB-DOC-2 wants a sample capture from a real run; a real run is 64 MB.
+`tests/evidence/trim_capture.py` keeps every non-sample record and the samples of two entities,
+and rewrites exactly one number — `counts.samples` — by editing that number in the trailer
+*line* rather than re-encoding the record, so every other byte is the producer's own.
+
+3.2 MB, still reports CONFORMS, and the mutation suite runs against it. It carries the whole
+story: `RedUAV_N_01` created, destroyed at t = 149.45, re-created at occupancy 2; both
+segments; all seven verdicts including the two never-met ones.
+
+### D-37 — What is NOT delivered, and why
+
+Recorded plainly rather than left for the project owner to discover.
+
+- **The 5-minute demo recording (BTB-DOC-2).** Needs a person and a screen recorder. Everything
+  it is meant to show is scripted and runnable, and the README names the command for each beat.
+- **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
+  count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
+  stop-or-rotate choice, and neither is stated in the `header` as the FR requires. It is P2 and
+  M7's budget went to shutdown, the two spikes and the evidence pack. **This is the one
+  P1-or-P2 requirement left unimplemented.**
+- **The PRD's CLI table does not list `--capture-max-samples`.** It exists and is documented.
+  Either the table should gain it or CAP-6 should absorb it — a one-line PRD edit either way,
+  and not one to make unilaterally.
+- **OQ-2's mentor confirmation.** The invocation is demonstrated to work; whether it is the
+  intended production shape is still a question for a person.

@@ -53,13 +53,20 @@ constexpr const char* kProducerName = "n8ro-bridge";
 // driven by scenario events, entity_add / entity_remove from the roster, and a real overflow
 // count in `drops.samples_not_recorded`.
 //
-// 0.6.0 is M6: `verdict` records are emitted, which completes the eight-type vocabulary. The
+// 0.7.0 is M7: clean interruption, so `end_reason: "shutdown"` is reachable. No format change.
+//
+// **The format is frozen from here.** docs/capture-format-v1.md is a cross-repo contract, and
+// after the M7 freeze a change to what it specifies is a version bump and a downstream change,
+// not an edit. Adding a key to an existing record stays non-breaking (spec section 13);
+// renaming one, retyping one, changing a unit, or adding a record type does not.
+//
+// 0.6.0 was M6: `verdict` records are emitted, which completes the eight-type vocabulary. The
 // referee also writes them to a `verdicts-*.jsonl` beside the capture, so a live run and a
 // `--replay` of its own capture can be compared as files - and they are byte-identical, which
 // is what makes BTB-REF-4 a test rather than a claim. Nothing about the format changed: every
 // record type emitted was already specified and no key was renamed or retyped, so this is
 // still n8ro-capture/1.
-constexpr const char* kProducerVersion = "0.6.0";
+constexpr const char* kProducerVersion = "0.7.0";
 
 // Every value here is observed, not asserted. `runtimeVersion` comes from the SDK's own
 // getN8roVersion(), which reports "unknown" when the release headers were compiled without

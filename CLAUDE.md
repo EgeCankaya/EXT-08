@@ -82,7 +82,15 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
-**M1 through M6 are delivered. M7 is next.**
+**M1 through M7 are delivered. The project is complete**, bar BTB-CAP-6 (P2, the byte-limited
+capture) and the 5-minute demo recording, which needs a person. `docs/decisions-m5-m7.md` D-37
+is the complete list of what is not delivered and why.
+
+**`docs/capture-format-v1.md` is FROZEN.** After the M7 freeze, a change to what it specifies is
+a version bump and a downstream change for EXT-17 — not an edit. Adding a key to an existing
+record is still non-breaking (spec §13); renaming one, retyping one, changing a unit, or adding
+a record type is not. `tests/determinism/determinism_test.cpp` carries golden lines for exactly
+this reason: changing the spelling of a record now means editing a test that says "these bytes".
 
 **OQ-1 is decided: we own the entity picture permanently** (PRD rev 3, ADR-1). It is not a
 shim. It has tests in `tests/entity-picture/` that need no simulator — keep them passing, and
@@ -99,7 +107,7 @@ the code that ordinal is `Occupancy::generation`; in the capture it is spelled `
 **Every decision taken during M5–M7 is recorded in `docs/decisions-m5-m7.md`** — read it
 before revisiting one, because most of them turned on a measurement rather than a preference.
 
-M7 inherits these from M5 and M6, all measured rather than assumed:
+Things established by measurement, which it would be expensive to re-derive:
 
 - **A single run produces two segments**, because the engine's stop path unloads and reloads.
   Segment 1 is the teardown reload and holds the re-created roster at occupancy 2. Not a bug.
@@ -126,6 +134,20 @@ M7 inherits these from M5 and M6, all measured rather than assumed:
 - **R7 was re-measured and reframed, not closed.** The rate hypothesis was falsified, and the
   host's own per-entity dump - the instrument M4 measured against - loses whole frames too.
   Treat it as a one-sided bound, never as ground truth.
+- **R8 resolved, R1 closed** (PRD rev 8). The simulation is reproducible; its publication
+  schedule is not. Two headless runs stopped at the same *frame* agree on 50 358 of 50 358
+  samples but are not byte-identical, so a determinism gate must compare content -
+  `tests/determinism/compare_captures.py`. R1's teardown access violation did not reproduce in
+  20 of 20 plugin-free cycles.
+- **OQ-2 answered:** `n8ro-sim-app.exe --sim-config SimEngineHost_* --model-path <dir>
+  --schema-file <name>`, and it takes **no scenario argument** - load and start are published on
+  `sim/scenario/command` and `sim/engine/command`. `tests/host-driver/` does it, and it lives in
+  `tests/` because **the bridge subscribes and never publishes**. Keep it that way: ADR-4 and
+  format spec section 14 both promise consumers the recorder cannot perturb the run.
+- **`sim_time_s` is not a key.** A frozen-clock teardown segment carries ~93 samples per entity
+  at one value, and such a segment cannot be aligned across two runs at all. Spec sections 5.1
+  and 14 say so; the comparison tool detects one exactly (in a running segment each entity
+  publishes once per frame).
 
 ## Conventions
 

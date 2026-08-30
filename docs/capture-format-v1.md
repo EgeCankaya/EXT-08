@@ -1,8 +1,10 @@
 # `n8ro-capture/1` — capture format specification
 
 **Version string:** `n8ro-capture/1`
-**Status:** Draft until the EXT-08 M7 format freeze. Pre-freeze, this document may change;
-after it, a change is a version bump (see [Versioning and compatibility](#versioning-and-compatibility)).
+**Status:** **FROZEN** at the end of EXT-08 M7. From this point a change to what this document
+specifies is a version bump, not an edit — see [Versioning and compatibility](#versioning-and-compatibility).
+Clarifications that do not change what a conformant file contains (worked examples, warnings,
+the producer-conformance section) may still be added.
 **Produced by:** EXT-08 Bus Telemetry Bridge (`n8ro-bridge`)
 **Platform baseline observed:** N8RO runtime 2.1.328
 
@@ -150,8 +152,21 @@ observed platform behaviour rather than format choices:
   for any record; where a record has no causing message at all (a `segment_close` for
   `host_lost` or `shutdown`, and the `trailer`) it carries the simulation time of the last
   record before it, which is the same rule §11 states for the trailer.
-- **It is not unique.** Every entity publishes on the same simulation frame, so a 42-entity
-  scenario produces 42 records sharing one `sim_time_s` value.
+- **It is not unique, and in one case it is very far from unique.** Every entity publishes on
+  the same simulation frame, so a 42-entity scenario produces 42 records sharing one
+  `sim_time_s` value. That much is expected. What is not: **in the segment the engine's stop
+  path opens, the clock is frozen, so one entity can publish dozens of samples all stamped
+  `0.0`** — about 93 each in a measured run. Within such a segment `sim_time_s` does not
+  identify a moment at all, and `(entity, occupancy, sim_time_s)` is not a key.
+
+  This matters to anyone comparing two captures. Two runs cannot be aligned inside a
+  frozen-clock segment: nothing distinguishes one sample from the next, so if one run is
+  missing an early one, everything after it shifts by one and a comparison starts matching
+  unrelated samples against each other. **Detect such a segment and exclude it.** The test is
+  exact rather than a heuristic: in a running segment each entity publishes once per frame, so
+  the maximum number of samples any one `(entity, occupancy)` carries at a single `sim_time_s`
+  is 1; in a frozen one it is not. §14 says the same thing from the determinism side, and
+  `tests/determinism/compare_captures.py` in the producer's repository implements it.
 - **It carries accumulated floating-point error, and the capture preserves it exactly.**
   Values such as `35.20000000000014` and `65.74999999999841` are real and correct — a 0.05 s
   frame increment summed a few hundred times. They are not rounded, because rounding them
@@ -764,9 +779,33 @@ On the host this producer was developed against, the answer is no. Two runs of
 **Read that as a fact about one host binary, not about the platform.** The measurement was
 taken against `n8ro-sim-local.exe`, a *test driver* that hosts an engine and paces it against
 the wall clock for a wall-clock run budget (`--run-ms`). Frame skipping is the expected
-behaviour of wall-clock pacing under load. It says nothing about a headless, fixed-step host
-in a closed configuration — the shipped `n8ro-sim-app.exe` — which **has not been measured
-here and may well be fully repeatable.**
+behaviour of wall-clock pacing under load.
+
+### The headless host, measured
+
+The obvious follow-up question — does a headless, fixed-step host in a closed configuration do
+better? — has now been answered, and the answer is the practically important one.
+
+Two runs of `Atacama Air Defense` on the shipped `n8ro-sim-app.exe`, each stopped at **exactly
+frame 1200** rather than after a wall-clock budget, so both cover the same simulation:
+
+| | |
+|---|---|
+| **Byte comparison** | **fails.** The files differ at line 339 and differ in length |
+| **Content comparison**, per `(entity, occupancy)` aligned on `sim_time_s`, running segments only | **50 358 samples compared, 50 358 agree, zero differ** |
+| What actually differed | 83 samples, across 4 frames, out of about 1 198 |
+
+**So the simulation is reproducible and its publication schedule is not.** Every sample present
+in both runs at the same simulation instant carries byte-identical values; the runs disagree
+only about which frames were published at all — roughly 0.2% of them, against `n8ro-sim-local`'s
+~1%.
+
+**If you are designing a determinism gate, this is the load-bearing consequence:** a
+byte-for-byte comparison of two captures will fail on this platform, and it will be reporting
+the publication schedule rather than the simulation. Compare on content. The producer's
+repository carries `tests/determinism/compare_captures.py`, which does exactly that and
+excludes frozen-clock segments (§5.1) — it exists so this comparison does not have to be
+re-derived.
 
 ### If you are building a determinism self-test
 
@@ -783,9 +822,16 @@ The distinction above is the whole of the practical advice, so it is worth stati
    producer never uses `BLOCK` for that reason, and `header.subscription.backpressure_policy`
    records what it did use, so a capture always states whether the recorder could have
    perturbed the run.
-3. **If your host does not turn out to be repeatable**, compare on content rather than bytes —
-   for example per-`(entity, occupancy)` value sequences keyed by `sim_time_s`, which are
-   stable across runs where the raw byte stream is not.
+3. **If your host does not turn out to be repeatable — and on the two measured here, neither
+   is byte-repeatable — compare on content rather than bytes.** Per-`(entity, occupancy)` value
+   sequences, aligned on `sim_time_s`, are stable across runs where the raw byte stream is not:
+   measured at 50 358 of 50 358 agreeing on the headless host.
+
+   Two cautions, both learned by getting them wrong first. **`sim_time_s` is not a key** —
+   align on it, but compare *sequences*, because a frozen-clock segment carries dozens of
+   samples per entity at one value (§5.1). And **exclude frozen-clock segments entirely**;
+   they cannot be aligned across runs, and a comparison that tries reports differences that
+   are artifacts of the alignment rather than of the data.
 4. **When two captures do differ, find the first differing record rather than reporting only
    that they differ.** The header, the record counts and a long identical prefix are all
    diagnostic: identical headers with divergence deep in the sample stream points at the
@@ -879,7 +925,7 @@ This section describes **what the current producer emits**, as distinct from wha
 specification requires. It exists so that a reader author is never surprised by a real file,
 and it shrinks as the producer is completed.
 
-`n8ro-bridge` **0.6.0** (EXT-08 milestone M6) emits **all eight record types**:
+`n8ro-bridge` **0.7.0** (EXT-08 milestone M7) emits **all eight record types**:
 
 | Record | Status |
 |---|---|
@@ -888,7 +934,7 @@ and it shrinks as the producer is completed.
 | `sample` | Complete |
 | `entity_add` / `entity_remove` | Complete. Every occupancy the producer witnessed opening is bracketed by its own pair |
 | `verdict` | Complete, when the producer is given a condition file. Without one it evaluates nothing and `trailer.counts.verdicts` is `0`, which is an accurate report of a run that declared no conditions |
-| `trailer` | Complete. `end_reason` is `host_lost` for an ordinary run — the producer follows the run rather than deciding when it ends — or `size_limit` if a record budget was configured and reached. `shutdown` arrives at M7 with signal handling |
+| `trailer` | Complete, and all three live `end_reason` values are reachable: `host_lost` for an ordinary run — the producer follows the run rather than deciding when it ends — `shutdown` on an operator interrupt, and `size_limit` if a record budget was configured and reached. `replay_end` is specified but not emitted: replay produces verdicts, not a capture |
 
 A reader written from this specification reads a 0.6.0 capture with no special casing.
 
@@ -959,6 +1005,7 @@ It goes to the producer's log.
 | 0.4.2 | `bus_metrics` gained the four delivery-side counters. Nothing had been reading them, so a capture could report all-zero drops while the bus was discarding messages. Adding keys is non-breaking (§13), so the format version is unchanged |
 | 0.5.0 | The writer thread and the bounded queue. `segment_open` / `segment_close` are driven by scenario events, `entity_add` / `entity_remove` are emitted, `drops.samples_not_recorded` carries a real overflow count, and `drops.events_not_recorded` joins it. `end_reason: "host_lost"` is reachable. The bus subscription moved off the `KEEP_LATEST` default to `FIFO_DROP` with a queue of 1024, which `header.subscription` records. Every record type emitted was already specified and only keys were added, so the format version does not move |
 | 0.6.0 | `verdict` records are emitted, completing the eight-type vocabulary. Nothing about the format changed — no key renamed, none retyped, no type added that was not already specified — so this is still `n8ro-capture/1` |
+| 0.7.0 | Clean interruption: `end_reason: "shutdown"` is reachable, verified over twenty scripted interrupt-and-verify cycles. No format change |
 
 ---
 
