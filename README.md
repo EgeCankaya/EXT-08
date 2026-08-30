@@ -152,6 +152,33 @@ the file it could not open and then names all three values back:
 [ERROR] (n8ro-bridge)   --schema-file = NoSuchSchema
 ```
 
+## Tests
+
+The entity picture (`src/EntityPicture.*`) is a component we own permanently rather than a
+shim awaiting an SDK type, so it has tests. They need **no simulator, no bus and no model
+database** — they drive the picture by handing it `StreamValueMap`s, which is exactly what
+the bus's `DecodedHandler` does, so they exercise the real entry points. They also link no
+N8RO import library; headers alone are enough.
+
+```cmd
+call C:\N8RO\setup.cmd
+cl /std:c++17 /EHsc /W4 /O2 ^
+   /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
+   /Fe:entity_picture_test.exe ^
+   tests\entity-picture\entity_picture_test.cpp src\EntityPicture.cpp
+entity_picture_test.exe
+```
+
+Exit code 0 if every check passes, 1 otherwise with each failure named. 62 checks covering
+occupancy lifecycle (ADR-6), orphan counting, verbatim reasons and payloads, absent-field
+accounting, deterministic ordering, the bounded event log, and concurrent handler/snapshot
+traffic.
+
+The suite's own adequacy is checked by mutation: deliberate defects introduced into
+`EntityPicture.cpp` must make it fail. That is worth re-running when the picture changes —
+it is how the "stale sample survives a re-creation" gap was found, which every other test
+had been passing over.
+
 ## Determinism probe
 
 `tests/float-format/float_format_probe.cpp` settles which double-to-text format is
@@ -174,6 +201,7 @@ src/main.cpp                             CLI, wiring, the once-a-second report
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and both topics from the registry
 src/EntityPicture.{h,cpp}                BTB-EP-3/EP-4 — the roster and the latest-sample map
 src/ExitCodes.h                          one table of process exit codes
+tests/entity-picture/                    unit tests for the picture — no simulator needed
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
 ```

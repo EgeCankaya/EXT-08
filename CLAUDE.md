@@ -84,6 +84,11 @@ M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture form
 
 **M1, M2 and M3 are delivered. M4 is next.**
 
+**OQ-1 is decided: we own the entity picture permanently** (PRD rev 3, ADR-1). It is not a
+shim. It has tests in `tests/entity-picture/` that need no simulator — keep them passing, and
+mutation-check them when the picture changes. It still stays schema-driven and verbatim:
+owning the layer is a reason to test it, never a reason to start modelling the payload.
+
 Build only the current milestone. Ask before adding anything outside it.
 
 M4 inherits two things from M3 worth knowing before starting: field order comes from the

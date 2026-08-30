@@ -375,6 +375,80 @@ as the platform's, which is a small argument in its favour beyond the test resul
 moves `inactive → daemon → active`. The middle one is a cleaner "is a scenario loaded"
 signal than inferring it from entity traffic.
 
+### Reading the brief against the runtime, and OQ-1 closed
+
+The brief was read directly before deciding OQ-1, to check whether it settles the question.
+**It does not** — it asserts the entity picture exists and points at
+`include\n8ro-sim\infrastructure\EntityStateSample.h`, but says nothing about whether that
+layer is shipping, planned, or ours. Reading it did turn up two things worth recording.
+
+**The brief describes an entity picture that carries a field the schema has never had.** Its
+"what the client gives you" section lists the latest sample as *"name, team, geodetic
+position, orientation, velocity, **acceleration**, phase, health, presence, condition flags,
+and the simulation time"*. There is no acceleration field anywhere in `simEntityStateUpdate` —
+the twelve declared fields are listed above and acceleration is not among them, published or
+otherwise. So the brief is not describing 2.1.328 slightly early; it is describing a different
+API. That is now three independent discrepancies in one paragraph of the brief: a header that
+does not exist, a field that does not exist, and a published-versus-predicted choice this
+release cannot offer.
+
+**The brief's own removal criterion is looser than the PRD's, and we satisfy it directly.**
+The brief says *"Entity removal is reflected: nothing lingers in the output after a body is
+gone."* The PRD tightened that into "no `sample` record for that entity appears after its
+`entity_remove`", which is what turned out to be unsatisfiable. The brief's wording is about
+the **output** — the capture — and the occupancy model satisfies it exactly: a closed
+occupancy stops receiving samples, so nothing about a dead body reaches the file. Worth
+recording because the brief is the outer contract, and ADR-6 complies with it rather than
+merely working around the PRD.
+
+**OQ-1 is closed: we own the layer.** The reasoning that decided it is that the layer is cheap
+to change or delete in either direction — EXT-17 binds to the capture file, not to EXT-08
+source, so nothing downstream constrains `EntityPicture`'s internal shape and it can be
+rewritten at any point, before or after the format freeze. Given a reversible decision, the
+robust choice is to own it: if a later release ships the type, deleting ours costs a day,
+whereas being under-built while permanent costs every milestone after M3.
+
+### What owning it actually changed
+
+Three things, and one deliberate omission.
+
+**Tests that need no simulator.** `tests/entity-picture/` drives the picture by handing it
+`StreamValueMap`s directly — which is exactly what `MessageBusPacked`'s `DecodedHandler` does,
+so the tests exercise the real entry points rather than a stand-in. 62 checks over occupancy
+lifecycle, orphan counting, verbatim reasons and payloads, absent-field accounting,
+deterministic ordering, the bounded event log, and concurrent handler/snapshot traffic. No
+framework, matching `tests/float-format/`. It compiles against headers alone and links **no
+N8RO import library**, which is itself a useful fact: the picture has no DLL dependency.
+
+**The tests were mutation-checked, and that immediately paid.** Five deliberate defects were
+introduced into `EntityPicture.cpp` and the suite re-run. Four were caught. One was **missed**:
+
+```
+[MISSED] keep stale sample on recreate : 59 checks, 0 failures
+```
+
+Deleting the `latest_.erase()` on re-creation left every test green, because every test that
+re-created a name published a fresh sample immediately afterwards. The gap is the window
+*between* the two — a stale sample from a closed tenure readable as the current state of the
+new occupancy, which is precisely what BTB-EP-4's ordering criterion forbids. A test now
+covers that window explicitly, and all five mutants are caught. **A suite that passes on
+broken code is worth nothing, and the only way to know which one you have is to break it.**
+
+**A snapshot API that cannot report a dead entity as live.** The latest-sample map keeps a
+closed occupancy's final sample on purpose — "where was it when it died" is a question the
+referee will ask — which means the map alone is not a liveness answer. Rather than leave every
+future caller to join it against the roster correctly, the snapshot now offers
+`liveSample()` (nothing for a removed entity) and `lastKnownSample()` (named so that reaching
+for a dead entity's state is a visible choice). The retention rule is documented on the type:
+retained while the occupancy stays closed, dropped when a new one opens under the same name.
+
+**No interface, deliberately.** Owning a component is not automatically a reason to put a
+pure-virtual base under it. There is no second implementation, and the seam that actually
+matters already exists and is cheaper: the picture consumes a decoded `StreamValueMap`, so
+M6's replay path can feed the same class from a stored capture instead of from the bus. Adding
+indirection for a hypothetical would be exactly the speculative generality the PRD warns
+against elsewhere. Ownership bought tests and a safer API, not architecture.
+
 ### Open questions this milestone touched
 
 - **OQ-3 — the topic string and its schema fields: answered above**, by observation.
@@ -557,7 +631,7 @@ immediately re-creates the whole roster under the same names. BTB-EP-3's accepta
 **unsatisfiable read literally**, because samples demonstrably resume under a name that has
 been removed.
 
-Resolved (mentor decision on the day) by making a name **not** the identity. The roster keys
+Resolved by decision on the day by the project owner: make a name **not** the identity. The roster keys
 on name but tracks a monotonically increasing **occupancy generation**: `entity_created` opens
 generation *N+1*, `entity_deleted` closes it, and a sample belongs to the occupancy open when
 it arrives. The criterion then reads *"no sample after the removal, within that occupancy"* —
@@ -656,13 +730,10 @@ recipe is bridge first, simulator second.
 
 ### Open questions this milestone touched
 
-- **OQ-1 — is the entity-picture layer coming in a later release, or do we own it permanently?
-  Still open, and now asked with evidence.** M3 came in on budget, so this changes nothing
-  about *whether* to build the layer. It changes how much abstraction it deserves:
-  `EntityPicture` is currently a deliberately thin roster plus latest-sample map behind one
-  mutex, with no interface and no seam. If we own it permanently that is probably too thin; if
-  it is a shim awaiting an SDK type, it is exactly right. **Mentor question — ask it, do not
-  infer it from release notes.**
+- **OQ-1 — do we own the entity-picture layer permanently? Closed: yes, we own it.** Decided
+  by the project owner after checking the brief, which is silent on the question. The layer is
+  reversible in either direction, so the robust choice wins. See the two sections above for
+  what that changed and what it deliberately did not.
 - **OQ-4 — backpressure. Unchanged, still M6's, but M3 adds a data point:** the run above took
   132 188 samples through the bus default (`KEEP_LATEST`, queue 100) with zero drops at ~660
   samples/s. The default is lossy, and on this scenario it lost nothing. That is a measurement

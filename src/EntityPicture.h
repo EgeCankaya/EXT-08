@@ -88,6 +88,13 @@ struct PictureCounters {
 
 // What the referee and the reporter read. Internally consistent by construction: it is
 // built under the lock in one pass, so no entry is observed mid-write (BTB-EP-4).
+//
+// Retention invariant: `latest` keeps the final sample of a *closed* occupancy. That is
+// deliberate - "where was it when it died" is a question the referee will ask, and erasing
+// on removal would make it unanswerable. It also means `latest` alone is not a liveness
+// answer, so use liveSample() / isLive() rather than joining the two maps by hand. The
+// brief's "nothing lingers in the output after a body is gone" is about the capture, and
+// the capture stops emitting samples for a closed occupancy by construction.
 struct PictureSnapshot {
     std::map<std::string, Occupancy> roster;
     std::map<std::string, LatestSample> latest;
@@ -95,6 +102,19 @@ struct PictureSnapshot {
     std::map<std::string, std::uint64_t> unhandledEventNames; // e.g. entity_updated
     PictureCounters counters;
     std::size_t liveCount = 0;    // occupancies currently open
+
+    // True while `name` has an open occupancy. False for a name never seen, and for one
+    // whose body is gone.
+    [[nodiscard]] bool isLive(const std::string& name) const;
+
+    // The latest sample for `name`, or nullptr if it has no open occupancy. This is the
+    // accessor a condition should use: it makes the safe reading the easy one, so a
+    // removed entity can never be evaluated as though it were still on the field.
+    [[nodiscard]] const LatestSample* liveSample(const std::string& name) const;
+
+    // The latest sample regardless of liveness, for a caller that genuinely wants the last
+    // known state of something that has been removed. Named so that using it is a choice.
+    [[nodiscard]] const LatestSample* lastKnownSample(const std::string& name) const;
 };
 
 class EntityPicture {

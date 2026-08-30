@@ -153,6 +153,23 @@ void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
     ++unhandledEventNames_[*eventName];
 }
 
+bool PictureSnapshot::isLive(const std::string& name) const {
+    const auto entry = roster.find(name);
+    return entry != roster.end() && entry->second.open;
+}
+
+const LatestSample* PictureSnapshot::liveSample(const std::string& name) const {
+    if (!isLive(name)) {
+        return nullptr;
+    }
+    return lastKnownSample(name);
+}
+
+const LatestSample* PictureSnapshot::lastKnownSample(const std::string& name) const {
+    const auto entry = latest.find(name);
+    return entry == latest.end() ? nullptr : &entry->second;
+}
+
 PictureSnapshot EntityPicture::snapshot() const {
     const std::lock_guard<std::mutex> guard(mutex_);
 

@@ -3,7 +3,7 @@
 > **One-liner:** A standalone C++17 console program that connects to a running N8RO simulation over the message bus and turns the published stream into a durable, versioned, self-describing capture file plus a pass/fail verdict — so a run can be analysed, and re-judged, long after it has ended.
 
 **Date:** 2026-08-30
-**Revision:** 2 — reconciled with what M1 and M3 measured. See §"Revision history".
+**Revision:** 3 — reconciled with M1–M3; OQ-1 decided. See §"Revision history".
 **Status:** Draft
 **Owner:** EXT-08 implementer
 **DRI:** egemencankaya14@gmail.com
@@ -16,6 +16,7 @@
 | Rev | Date | Change |
 |----:|------|--------|
 | 1 | 2026-08-30 | Initial PRD. |
+| 3 | 2026-08-30 | **OQ-1 decided: we own the entity-picture layer.** The brief was checked and is silent on the question, so it did not settle it. The layer is treated as a permanent component: unit tests that need no simulator (`tests/entity-picture/`), documented invariants, and a snapshot API that cannot report a removed entity as live. No interface was added, and ADR-1 says why. |
 | 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was unsatisfiable as written** and is now scoped to an entity occupancy; `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so the criterion is checkable in the capture itself (ADR-6). BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
 
 > Rev 2 changes the **logical capture shape** (a new field on three record types). This is
@@ -860,7 +861,7 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 
 | # | Question | Status | Decision target | Rationale (why open / what would resolve it) |
 |---|----------|--------|-----------------|----------------------------------------------|
-| OQ-1 | Is a newer release expected to ship the `EntityStateSample` / entity-picture layer, or do we own it permanently? | **Needs input — still open; M3 shipped without it** | Was "before M3 begins"; now **before M4 hardens the capture format around the layer** | [S1] describes the layer as shipped; 2.1.328 does not have it. The answer changes whether the built layer is a permanent component or a shim to be deleted, and therefore how much abstraction it deserves. **This is a mentor question** — ask it explicitly, do not infer it from release notes |
+| OQ-1 | Is a newer release expected to ship the `EntityStateSample` / entity-picture layer, or do we own it permanently? | **Resolved — we own it** (decided by the project owner, rev 3) | Closed | [S1] describes the layer as shipped; 2.1.328 does not have it, and [S1] is silent on whether it is coming — checked directly, it specifies the layer's *contents* but says nothing about ownership or roadmap. Decided in favour of owning it, on the reasoning that the layer is cheap to change or delete either way: EXT-17 binds to the capture file, not to EXT-08 source, so nothing downstream constrains its internal shape. Owning it is therefore the robust choice — if a later release ships the type, deleting ours costs a day; being under-built while permanent costs every milestone after M3. **Consequence:** the layer gets tests, documented invariants and a misuse-resistant API (ADR-1, rev 3) |
 | OQ-2 | What is the exact `n8ro-sim-app.exe` headless invocation? | Needs input | Before the controller stretch goal; **before EXT-17 starts** | [S2] itself says "confirm the invocation with your mentor." EXT-17 depends on it outright. Raised here because EXT-08's controller stretch goal touches the same surface, and because raising it now buys EXT-17 lead time it would otherwise lose |
 | OQ-3 | What is the entity-state topic string, and what fields does its schema actually declare? | **Resolved (M1, corrected at M3)** | M1 (observe the bus) | `sim/entity/state`, message `simEntityStateUpdate`, **twelve** declared fields — eleven of which are ever published. Recorded in the notes deliverable, not restated here as a constant: the code still resolves both at runtime (BTB-EP-1), and this PRD deliberately does not become the second copy that drifts |
 | OQ-4 | Which bus-side backpressure policy is correct for a recorder — `FIFO_DROP` with a large queue, or `BLOCK`? | Provisional | M6 (backpressure) | `KEEP_LATEST` is ruled out: it discards the older of two samples, which is the one already part of the run's history. Between the remaining two, `BLOCK` risks perturbing the observed simulation and `FIFO_DROP` risks losing data. Provisional answer: `FIFO_DROP` with a queue sized from the M1 rate, because a recorder that changes the run it records is worse than one that admits a gap. Confirm under the M6 overload. **M1/M3 sizing input:** 100 messages is ~120 ms of headroom at the reference scenario's 818 packets/s and ~40 ms at the 126-entity overload scenario's 2487/s. M3 ran the reference scenario on the `KEEP_LATEST` default and lost nothing — a measurement of headroom at this load, not a reason to keep the default |
@@ -935,6 +936,7 @@ Continue observing runs through the GUI.
 
 ## Validation and test plan
 
+- **Unit — the entity picture:** `tests/entity-picture/` covers occupancy lifecycle, orphan counting, verbatim reasons and payloads, absent-field accounting, deterministic ordering, the bounded event log, and concurrent handler/snapshot traffic. Needs no simulator, no bus and no model database, so it runs on any checkout in seconds. Its own adequacy is checked by mutation — deliberate defects introduced into the picture must fail it.
 - **Unit — determinism primitives:** float formatting is round-trip exact and locale-independent; field ordering follows `MessageSchema::fields` and not map iteration; record serialisation is stable for fixed input. These are the three known non-determinism sources (R4), tested directly rather than only end-to-end.
 - **Unit — format:** every record type round-trips through the reader; an unknown `format_version` is rejected with a named error; the spec's version string equals the `header`'s.
 - **Unit — condition evaluation:** each of the three condition kinds against synthetic sample sequences, including the boundary case (exactly at the threshold) and the never-met case.
@@ -1204,14 +1206,20 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 
 > These ADR stubs capture the major decisions in this PRD. Expand them into full ADRs in the repository's decision log as implementation proceeds.
 
-### ADR-1: The entity picture is ours to build
-**Status:** Proposed
-**Context:** [S1] describes a roster and per-entity latest-sample cache as provided by `SimulationEngineClient`. Release 2.1.328 ships neither; `EntityStateSample.h` does not exist and the library exports no such symbols.
-**Decision:** Build the entity picture in EXT-08 on top of `MessageBusPacked`'s decoded subscription and `sim/entity/event`, budgeting 2–3 days as a first-class work item.
+### ADR-1: The entity picture is ours to build, and ours to own
+**Status:** Accepted (built at M3; ownership decided at rev 3)
+**Context:** [S1] describes a roster and per-entity latest-sample cache as provided by `SimulationEngineClient`. Release 2.1.328 ships neither; `EntityStateSample.h` does not exist and the library exports no such symbols. [S1] also lists an `acceleration` field on the entity picture that the runtime schema does not declare at all, and describes a published-versus-predicted choice this release cannot offer — so it is not merely early, it is describing a different API. Checked directly at rev 3: [S1] says nothing about whether the layer is coming, so it does not settle the question.
+**Decision:** Build the entity picture in EXT-08 on top of `MessageBusPacked`'s decoded subscription and `sim/entity/event` — and, from rev 3, **treat it as a permanent component rather than a shim.**
+**What "permanent" buys, and what it deliberately does not:**
+- **Tests, and they run without a simulator.** `tests/entity-picture/` drives the picture by handing it `StreamValueMap`s, which is exactly what `DecodedHandler` does — so the tests exercise the real entry points rather than a stand-in. Verified by mutation: five deliberate defects introduced into the picture, five caught.
+- **Documented invariants**, chiefly the retention rule — the latest-sample map keeps a *closed* occupancy's final sample, so "where was it when it died" stays answerable, and drops it when a new occupancy opens under the same name.
+- **A misuse-resistant snapshot API.** `liveSample()` returns nothing for a removed entity, so the safe reading is the easy one; `lastKnownSample()` exists for the caller who genuinely wants a dead entity's final state, and is named so that reaching for it is a choice.
+- **No interface, deliberately.** A pure-virtual seam would buy substitutability we have no second implementation for. The seam that matters already exists and is cheaper: the picture consumes a decoded `StreamValueMap`, so M6's replay path feeds the same class from a stored capture instead of from the bus. Adding indirection for a hypothetical would be the speculative generality OQ-6 warns about elsewhere.
 **Consequences:**
-- The bridge is not blocked on an SDK release that may never come (OQ-1).
-- We own the layer's correctness and its maintenance across platform upgrades.
-- If a later release ships the layer, this becomes a shim to delete — which is why it stays thin and schema-driven rather than modelled.
+- The bridge is not blocked on an SDK release that may never come.
+- We own the layer's correctness and its maintenance across platform upgrades — which the tests now make tractable rather than aspirational.
+- If a later release ships the layer, this becomes a shim to delete. That stays cheap: EXT-17 binds to the capture file, not to EXT-08 source, so the layer's internal shape constrains nobody downstream and can change at any time — before or after the M7 format freeze.
+- It stays schema-driven and verbatim regardless (BTB-CAP-4). Ownership is a reason to test the layer, never a reason to start modelling the payload.
 
 **Supersedes:** None
 
