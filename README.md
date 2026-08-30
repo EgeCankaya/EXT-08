@@ -504,6 +504,32 @@ referee_test.exe
 
 93 checks, exit 0 if all pass.
 
+### The determinism harness
+
+`tests/determinism/determinism_test.cpp` tests the emission path against each of the three
+non-determinism sources R4 names, because all three are ours and all three are easy to
+reintroduce: unordered-map iteration, locale-dependent float formatting, and unordered output
+containers. It also carries **golden lines** — the exact bytes of an `entity_remove`, a
+`segment_open` and the header's opening keys — so that after the format freeze, changing a
+record's spelling means editing a test that says "these bytes".
+
+The locale check is the one that earns its keep. `%.17g` is round-trip exact and *silently*
+locale-dependent, and this machine's locale is comma-decimal, so the test runs for real rather
+than being skipped.
+
+```cmd
+cl /std:c++17 /EHsc /W4 /O2 ^
+   /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
+   /Fe:determinism_test.exe ^
+   tests\determinism\determinism_test.cpp src\CaptureFormat.cpp src\Json.cpp ^
+   src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp
+determinism_test.exe
+```
+
+18 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
+— is `tests\determinism\replay_hashes.ps1`; see [Reproducing the
+evidence](#reproducing-the-evidence).
+
 ### Capture conformance reader
 
 `tests/capture-reader/` is a reader for the capture format, **written from
