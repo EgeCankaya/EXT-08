@@ -110,6 +110,14 @@
 
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\EntityPicture.cpp" />
+    <ClCompile Include="src\TopicResolution.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\EntityPicture.h" />
+    <ClInclude Include="src\ExitCodes.h" />
+    <ClInclude Include="src\TopicResolution.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

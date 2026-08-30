@@ -94,7 +94,8 @@ Field lists for the topics EXT-08 will need beyond entity state:
 
 ### The entity-state schema
 
-Eleven fields. Decoded (shark's `decodedJson`, which sorts keys alphabetically):
+Eleven fields observed on the wire — twelve declared, as M3 found. Decoded (shark's
+`decodedJson`, which sorts keys alphabetically):
 
 | field | type | notes |
 |---|---|---|
@@ -125,6 +126,14 @@ positionGeodetic[3], orientationYprRad[3], velocityNed[3]  (doubles)
 209 payload bytes for a 23-character entity name. The presence mask `0x07FF` is exactly
 eleven bits — every field present. **Orientation precedes velocity**, which is only visible
 on a packet where the two differ; a stationary entity has both all-zero and cannot settle it.
+
+> **Corrected in M3: the schema declares twelve fields, and this list is missing one.**
+> "Eleven bits — every field present" is the wrong reading. The `u16 = 12` two bytes earlier
+> is the declared field count, so `0x07FF` is eleven bits of *twelve* — the twelfth,
+> `activeAnimation`, is simply absent from every packet ever observed. The count and the mask
+> contradicted each other on the same line above and it was read as agreement. See
+> [M3 — The entity picture](#m3--the-entity-picture). The eleven fields and their order below
+> are correct; the list is just not the whole schema.
 
 > **Trap for M4/M5.** Shark's `decodedJson` is alphabetised, so it is *not* a model for our
 > capture's field order. BTB-CAP-3 requires field order to come from `MessageSchema::fields`,
@@ -417,3 +426,237 @@ Three things worth writing down:
   opened, before our own diagnostic runs. Our contribution is echoing all three
   configuration values back as resolved, and exiting 3. Exercised: wrong schema file, wrong
   option, missing value, no arguments. No exception reaches `main` in any of them.
+
+---
+
+## M3 — The entity picture
+
+The layer the brief assumed was free. `SimulationEngineClient` holds a
+`MessageBusPackedSchemaRegistry` and a `MessageBusPacked` privately and exposes **neither** —
+only `messageBus()`. So the packed layer is ours to build over the client's bus, from our own
+`DbModel`. That is the passive-observer recipe `n8ro-shark`'s developer docs prescribe, and it
+is four lines; the work is everything downstream of it.
+
+### The headline: the entity-state schema has **twelve** fields, not eleven
+
+M1 derived the field list two independent ways and both said eleven. The runtime
+`MessageSchema` declares twelve:
+
+```
+simulationTime:double, scenarioEntityName:string, name:string, team:string, phase:string,
+health:string, presence:string, conditions:int, positionGeodetic:double[3],
+orientationYprRad:double[3], velocityNed:double[3], activeAnimation:string
+```
+
+**`activeAnimation` was never published — not once in 132 188 samples** on the reference run,
+and not once in the 28 370 lines of `n8ro-sim-local`'s own `sim_entity_state.jsonl`. It is
+declared in the schema and absent from the wire.
+
+M1's own decode said so and it was misread. The packed header M1 wrote down is
+
+```
+"N8RO" magic (4) | version 1,1 (2) | schemaHash (8) | u16 = 12 (2) | field-presence mask 0x07FF (2)
+```
+
+That `u16 = 12` is the **declared field count**. The presence mask `0x07FF` is eleven bits, and
+M1 read it as "exactly eleven bits — every field present". It is eleven of *twelve*: the
+twelfth field is absent. The count and the mask disagreed on the same line, and the
+disagreement was read as agreement.
+
+So the three-way check comes out as: **all three derivations agree on the first eleven fields
+and their order; only the runtime schema knows about the twelfth.** The bridge logs this as a
+`DISAGREES` warning at startup and keeps running — the runtime schema is authoritative by
+definition, so a mismatch is a fact about the notes, not a reason to refuse to work.
+
+> **This is BTB-CAP-4's verbatim rule earning its place before M4 has even started.** A
+> curated `EntitySample` struct built from M1's careful, twice-checked observations would have
+> been born with a field missing, and nothing would ever have said so. The "what the stream
+> contained that we did not expect" deliverable would have been unwritable, because the
+> unexpected was filtered out before anyone could see it. The rabbit-hole warning in the PRD
+> is not hypothetical.
+
+The corollary is the platform's own rule, now demonstrated rather than quoted: *a packed
+payload carries only the fields the publisher wrote, so a subscriber reads a field's presence
+rather than assuming every field arrives on every message.* Every field read in
+`EntityPicture` returns `std::optional` and counts its own absence.
+
+### Schema identity, for M4's capture header
+
+```
+messageName  simEntityStateUpdate      messageName  simEntityEvent
+topic        sim/entity/state          topic        sim/entity/event
+fields       12                        fields       7
+schemaHash   2652370635                wireVersion  1
+messageId    1308183250
+```
+
+Registry size on a good configuration: **35 message schemas.**
+
+### The entity-event field order also differs from the M1 table
+
+Runtime: `eventName, simulationTime, scenarioEntityName, profileName, teamName,
+positionGeodetic, reason`. The M1 table listed `simulationTime` last. That table was a field
+*inventory* and never claimed to be wire order, so it is not an error there — but M4 must take
+event field order from the schema too, not from that table.
+
+### Resolving topics without a literal
+
+BTB-EP-1 says the topic comes from the registry, never from a literal — but the registry is
+indexed *by topic* and *by message name*, so resolution needs an anchor. Two chains, both
+anchored on something checked by the compiler or by the database:
+
+```
+entity state   "simEntityStateUpdate"  (--entity-state-message, default)
+                 -> registry.getByName() -> MessageSchema::topic == "sim/entity/state"
+                 -> structural check: declares scenarioEntityName + simulationTime?
+
+entity event   kEventEntityCreated / kEventEntityDeleted   (EventNames.h constants)
+                 -> EventConfigReader::readVocabularyFromModel()
+                 -> EventConfigData::topic == "simEntityEvent"     <- a MESSAGE NAME
+                 -> registry.getByName() -> MessageSchema::topic == "sim/entity/event"
+```
+
+**`EventConfigData::topic` is not a topic string.** It names the Message instance whose
+envelope carries the event; the topic string is on that message's schema. The header says so
+in a comment, and the field name actively works against it. Two hops, not one.
+
+The event chain needs no configuration at all, because `EventNames.h` gives compile-checked
+constants and states the rule outright: *"The topic each event travels on is the Event
+instance's own `topic` field, not a constant here: a consumer reads the pairing from the
+database, and a second copy in a header would drift from it."*
+
+The state chain has no event to anchor on, so it anchors on a message name and then **checks
+the shape** of what that name resolved to. A name alone is not enough: `simEntityTrackUpdate`
+and `simEntityPoseUpdate` are plausible neighbours in the same database, and resolving to one
+would subscribe successfully and roster nothing, forever. Verified by pointing it at
+`simEngineState`:
+
+```
+[ERROR] message simEngineState resolves to topic sim/engine/state but does not declare the
+        fields the entity picture keys on: missing scenarioEntityName. This is not the
+        entity-state message; refusing to subscribe to a topic that would roster nothing
+[ERROR]   declared fields: state:string, scenarioState:string, scenarioName:string, ...
+```
+
+The three EP-1 failure modes, each a distinct exit code, all verified:
+
+| condition | how provoked | exit |
+|---|---|---:|
+| registry empty | `--schema-file NoSuchSchema` | 7 |
+| message name unresolvable | `--entity-state-message simNoSuchMessage` | 8 |
+| resolves, wrong shape | `--entity-state-message simEngineState` | 9 |
+
+The empty-registry case is the one that matters, because it is the failure that looks like
+success. It names the model path and the schema file, and refuses to run.
+
+### BTB-EP-3, and the criterion that could not be met as written
+
+M1 found that stopping the engine deletes every entity with `reason="scenario_unload"` and
+immediately re-creates the whole roster under the same names. BTB-EP-3's acceptance criterion
+— *"No `sample` record for that entity appears after its `entity_remove`"* — is therefore
+**unsatisfiable read literally**, because samples demonstrably resume under a name that has
+been removed.
+
+Resolved (mentor decision on the day) by making a name **not** the identity. The roster keys
+on name but tracks a monotonically increasing **occupancy generation**: `entity_created` opens
+generation *N+1*, `entity_deleted` closes it, and a sample belongs to the occupancy open when
+it arrives. The criterion then reads *"no sample after the removal, within that occupancy"* —
+exactly satisfiable, and strictly stronger than the segment-scoped reading because it needs no
+segment machinery, which belongs to M5.
+
+The real violation the criterion was reaching for gets its own counter: **a sample for an
+entity with no open occupancy** is `orphaned`, counted, and never entered into the map.
+
+Confirmed on the reference run. `RedUAV_N_01` is the sharpest case — not merely unloaded but
+*killed*, and then back:
+
+```
+entity_created RedUAV_N_01 gen=1 at simTime=0.000000
+entity_deleted RedUAV_N_01 gen=1 at simTime=149.450000 reason=destroyed
+entity_created RedUAV_N_01 gen=2 at simTime=0.000000
+```
+
+### The reference run
+
+`n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 200000`
+
+```
+engine=idle  frame=0  simTime=0.000  scenario=Atacama Air Defense
+    live=42  names=90  samples=132188  drops=0(hash=0 decode=0 noschema=0)
+    removals=destroyed:23 expended:48 scenario_unload:19  created=132 deleted=90 orphaned=0
+```
+
+| | |
+|---|---:|
+| entities at scenario load (gen 1, simTime 0) | **42** |
+| distinct names ever seen | 90 |
+| occupancies opened (90 gen-1 + 42 gen-2) | 132 |
+| removals: `destroyed` / `expended` / `scenario_unload` | 23 / 48 / 19 |
+| samples accepted | 132 188 |
+| `schemaHashDrops + decodeFailures + missingSchemaPassthrough` | **0** |
+| orphaned samples | **0** |
+
+**42 at scenario load matches M1's count exactly**, arrived at independently — M1 counted it
+off a shark capture, M3 counts it off our own roster.
+
+Everything M3 was asked to show is in that one line: both removal kinds visible and carried
+verbatim (the kills `destroyed`, the munitions `expended`), zero drops, zero orphans, across a
+full load-run-teardown cycle.
+
+Three things worth keeping:
+
+- **The teardown churn is quantified, not just described.** 19 live entities removed with
+  `scenario_unload` and 42 re-created, every one stamped `simTime=0.000000` — the clock is
+  already reset when they are published, so the removals that end a run sort *before* every
+  sample in the run they end. M1 flagged this as an ordering hazard for M5; it is now a
+  measured one.
+- **`orphaned=0` through that churn is the whole argument for the generation scheme.** A
+  name-only roster would have counted every post-teardown sample as an orphan — or worse,
+  accepted it silently against a closed entry.
+- **`entity_updated` was never published.** The constant is in `EventNames.h` and the instance
+  is in the database; nothing raised it in 200 s. The unhandled-event-name counter stayed empty
+  all run, which is how we know rather than assume.
+
+### Two operational traps, both of which cost real time
+
+**1. `n8ro-sim-local` resolves its plugin directory from `N8RO_RELEASE`, and fails the scenario
+load without it.** Launched from a scratch directory in an environment that had not run
+`setup.cmd`, it scans `<cwd>\bin\plugins\sim`, finds no physics plugin, and *refuses* the load:
+
+```
+[WARN]  N8RO_RELEASE not set; falling back to current working directory for runtime path resolution.
+[ERROR] Scenario load refused: Component type 'componentPhysics' has no registered factory, so 42
+        entities, e.g. 'BlueBase_AmmoDepot' would load without it and the scenario would run with
+        that capability missing.
+```
+
+The bridge attaches happily and reports `engine=running scenario=(none)` — a correct report of
+a real state, and indistinguishable at a glance from a bridge that failed to attach.
+
+**2. Start the bridge before the simulator.** The `entity_created` burst is published once, at
+scenario load. A bridge started 4 s late missed all 42 of them:
+
+```
+engine=running  simTime=12.350  live=0  names=0  samples=0  orphaned=7740
+```
+
+Every sample orphaned, roster empty, and — the point — **`drops=0` and no error anywhere**.
+Without the orphan counter this reads as a working bridge attached to an empty scenario. It is
+the same shape of failure as the empty registry, caught by a different net. Surviving either
+start order without operator intervention is BTB-CX-2 and belongs to M5; until then the run
+recipe is bridge first, simulator second.
+
+### Open questions this milestone touched
+
+- **OQ-1 — is the entity-picture layer coming in a later release, or do we own it permanently?
+  Still open, and now asked with evidence.** M3 came in on budget, so this changes nothing
+  about *whether* to build the layer. It changes how much abstraction it deserves:
+  `EntityPicture` is currently a deliberately thin roster plus latest-sample map behind one
+  mutex, with no interface and no seam. If we own it permanently that is probably too thin; if
+  it is a shim awaiting an SDK type, it is exactly right. **Mentor question — ask it, do not
+  infer it from release notes.**
+- **OQ-4 — backpressure. Unchanged, still M6's, but M3 adds a data point:** the run above took
+  132 188 samples through the bus default (`KEEP_LATEST`, queue 100) with zero drops at ~660
+  samples/s. The default is lossy, and on this scenario it lost nothing. That is a measurement
+  of headroom on *this* load, not a reason to keep the default. The bridge warns about the
+  policy at startup so that it is never an implicit choice.

@@ -1,0 +1,130 @@
+// EXT-08 Bus Telemetry Bridge - M3: the entity picture.
+//
+// The roster (BTB-EP-3) and the latest-sample map (BTB-EP-4). The SDK ships neither -
+// SimulationEngineClient has no roster accessor and no per-entity sample cache, and
+// EntityStateSample.h does not exist in 2.1.328 - so this is the layer we build.
+//
+// Threading: every public method takes the same mutex. The bus calls onSample() and
+// onEntityEvent() from the pump thread; our own thread calls snapshot() and
+// drainEvents(). Nothing here does IO, parsing or formatting - a handler is a courier
+// (CLAUDE.md hard rule 2), so it copies, hands off, and returns.
+//
+// Ordering: every container iterated here is ordered (CLAUDE.md hard rule 4, BTB-EP-4).
+// StreamValueMap is an std::unordered_map and is stored verbatim, but it is only ever
+// *looked up* by name, never iterated - field order comes from MessageSchema::fields.
+
+#pragma once
+
+#include <messaging/packed/MessageBusPacked.h>
+#include <messaging/packed/StreamValue.h>
+
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace n8ro::bridge {
+
+// One entity's tenure in the roster under a single name.
+//
+// The generation is the answer to the ambiguity M1 found: the engine's stop path deletes
+// every entity with reason="scenario_unload" and then immediately re-creates it under the
+// same name, so samples resume. A name is therefore not a unique identity across a run -
+// a (name, generation) pair is. BTB-EP-3's "no sample after the removal" holds within an
+// occupancy, which is exactly satisfiable; read across occupancies it is not.
+struct Occupancy {
+    std::uint64_t generation = 0;    // 1 for the first tenure of this name, then 2, 3, ...
+    bool open = false;               // created and not yet deleted
+    std::string profileName;         // from entity_created
+    std::string teamName;            // from entity_created
+    std::string lastRemovalReason;   // verbatim, including a value outside the engine's set
+    double createdSimTimeS = 0.0;
+    double removedSimTimeS = 0.0;
+};
+
+// The most recent published sample for one entity, kept verbatim.
+//
+// `values` is the decoded StreamValueMap exactly as delivered. Nothing is mapped onto a
+// curated struct: BTB-CAP-4's verbatim rule is what makes a schema that gains a field
+// carry it through with no code change, and what keeps the "what the stream contained
+// that we did not expect" deliverable writable.
+struct LatestSample {
+    double simulationTimeS = 0.0;    // the sample's own clock - the only clock (tenet 2)
+    std::uint64_t generation = 0;    // the occupancy this sample belongs to
+    n8ro::sim::StreamValueMap values;
+};
+
+// A roster transition, queued for our own thread to log. The handler must not format or
+// write, so it pushes one of these and returns.
+struct RosterEvent {
+    std::string eventName;           // verbatim from the payload
+    std::string scenarioEntityName;
+    std::string reason;              // verbatim; empty on create
+    double simulationTimeS = 0.0;
+    std::uint64_t generation = 0;
+};
+
+// Counted losses and surprises. Nothing here is ever silent (tenet 3).
+struct PictureCounters {
+    std::uint64_t samplesAccepted = 0;
+    std::uint64_t samplesOrphaned = 0;       // a sample whose entity has no open occupancy
+    std::uint64_t samplesUnnamed = 0;        // no scenarioEntityName field in the payload
+    std::uint64_t samplesUntimed = 0;        // no simulationTime field in the payload
+    std::uint64_t entityCreated = 0;
+    std::uint64_t entityDeleted = 0;
+    std::uint64_t deleteOfUnknownEntity = 0; // entity_deleted for a name never created
+    std::uint64_t eventsUnnamed = 0;         // no eventName field in the payload
+    std::uint64_t eventsWithoutEntity = 0;   // eventName present, scenarioEntityName absent
+    std::uint64_t eventQueueDropped = 0;     // roster-event log overflowed (bounded, counted)
+};
+
+// What the referee and the reporter read. Internally consistent by construction: it is
+// built under the lock in one pass, so no entry is observed mid-write (BTB-EP-4).
+struct PictureSnapshot {
+    std::map<std::string, Occupancy> roster;
+    std::map<std::string, LatestSample> latest;
+    std::map<std::string, std::uint64_t> removalsByReason;   // verbatim reason -> count
+    std::map<std::string, std::uint64_t> unhandledEventNames; // e.g. entity_updated
+    PictureCounters counters;
+    std::size_t liveCount = 0;    // occupancies currently open
+};
+
+class EntityPicture {
+public:
+    // The bounded roster-event log. 134 events was a whole run of the reference scenario,
+    // so this is three orders of magnitude of headroom; overflow is counted, not silent.
+    static constexpr std::size_t kEventLogCapacity = 4096;
+
+    // Called from the bus pump thread. Copies, updates, returns - no IO, no formatting.
+    void onSample(const n8ro::sim::StreamValueMap& values);
+    void onEntityEvent(const n8ro::sim::StreamValueMap& values);
+
+    // Called from our own thread.
+    [[nodiscard]] PictureSnapshot snapshot() const;
+    [[nodiscard]] std::vector<RosterEvent> drainEvents();
+    [[nodiscard]] std::size_t liveCount() const;
+
+private:
+    void pushEventLocked(RosterEvent event);
+
+    mutable std::mutex mutex_;
+    std::map<std::string, Occupancy> roster_;
+    std::map<std::string, LatestSample> latest_;
+    std::map<std::string, std::uint64_t> removalsByReason_;
+    std::map<std::string, std::uint64_t> unhandledEventNames_;
+    std::deque<RosterEvent> eventLog_;
+    PictureCounters counters_;
+};
+
+// Field readers over a decoded payload. A packed payload carries only the fields the
+// publisher wrote, so presence is read rather than assumed - these never throw and never
+// dereference a missing or wrongly-typed field.
+[[nodiscard]] std::optional<std::string> tryReadString(
+    const n8ro::sim::StreamValueMap& values, const std::string& field);
+[[nodiscard]] std::optional<double> tryReadDouble(
+    const n8ro::sim::StreamValueMap& values, const std::string& field);
+
+}  // namespace n8ro::bridge

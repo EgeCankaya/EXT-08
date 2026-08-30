@@ -4,10 +4,15 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 + M2.** The bridge creates a `SimulationEngineClient`, starts the message pump,
-and prints the engine state, frame number, simulation time and scenario name once a second
-from the client's local getters. It does not subscribe, capture, or judge anything yet —
-that is M3 onward.
+**Status: M1 + M2 + M3.** The bridge registers the packed schemas, resolves the
+entity-state and entity-event topics *from the registry*, subscribes decoded to both, and
+maintains a roster and a latest-sample map of its own. Once a second it prints the engine
+state plus the entity picture and the bus decoder's drop counters.
+
+It does not write a capture file, does not know about segments, and does not judge
+anything — those are M4 onward. The bus-side subscription still runs on the lossy
+`KEEP_LATEST` default; M6 sets both backpressure boundaries explicitly. The bridge says so
+in a warning at startup rather than leaving it implicit.
 
 ## Requirements
 
@@ -80,8 +85,44 @@ bus.
 | `--config` | client-side engine config entry, e.g. `SimEngineClient_SharedMemory`. Must be a `SimEngineClient_*` entry — a `SimEngineHost_*` one names the wrong side and will not connect |
 | `--model-path` | directory holding the schema and instance database, e.g. `C:\N8RO\data\db` |
 | `--schema-file` | schema name inside that database, e.g. `N8roSimSchema` |
+| `--entity-state-message` | message instance name the entity-state topic is resolved *from*. Default `simEntityStateUpdate`. Optional |
 
-All three are required; none are compiled in.
+The first three are required; none are compiled in.
+
+**No topic string is hand-written anywhere in this program.** `--entity-state-message`
+names a *message instance*, and the topic is read off the schema that name resolves to, so
+a topic rename in the database needs no rebuild. The entity-event topic is not even
+configurable: it is resolved from the `entity_created` / `entity_deleted` constants in the
+SDK's own `EventNames.h`, through the database's event-to-message pairing, to that
+message's topic. `EventNames.h` prescribes exactly that chain — "the topic each event
+travels on is the Event instance's own `topic` field, not a constant here."
+
+### Startup diagnostics
+
+Registry size and both resolved topics are logged before anything is subscribed:
+
+```
+[INFO] (n8ro-bridge) packed schema registry loaded: 35 message schemas
+[INFO] (n8ro-bridge) resolved entity-state topic sim/entity/state from message simEntityStateUpdate via the registry - not from a literal (BTB-EP-1)
+[INFO] (n8ro-bridge) entity-state schema: name=simEntityStateUpdate topic=sim/entity/state fields=12 schemaHash=2652370635 messageId=1308183250 wireVersion=1
+[INFO] (n8ro-bridge) resolved entity-event topic sim/entity/event from the database pairing for entity_created / entity_deleted via message simEntityEvent
+```
+
+An empty registry, an unresolvable message name, or a message that resolves but is not
+shaped like entity state each produce a named diagnostic and a distinct non-zero exit. The
+bridge never proceeds to silent operation (BTB-EP-1).
+
+### Start order
+
+Start the bridge **before** the simulator when you want the roster from scenario load. The
+`entity_created` burst is published once, at load; a bridge that attaches after it sees
+samples for entities it never saw created, counts them as `orphaned`, and reports a live
+count of zero. That is the counter working, not a fault — but it is not the picture you
+wanted. Surviving either start order without operator intervention is BTB-CX-2, in M5.
+
+Note also that `n8ro-sim-local.exe` resolves its plugin directory from `N8RO_RELEASE`. Run
+it from a shell that has run `setup.cmd`, or the physics plugin will not be found and the
+scenario load is *refused* — `Component type 'componentPhysics' has no registered factory`.
 
 ### Exit codes
 
@@ -91,6 +132,14 @@ All three are required; none are compiled in.
 | 2 | bad invocation — unknown option, missing value, missing required option |
 | 3 | `SimulationEngineClient::create()` returned `nullopt`; all three configuration values are echoed back as resolved |
 | 4 | an exception reached `main` — it is caught and logged, never propagated |
+| 5 | `DbModel::Open()` failed for the given schema file |
+| 6 | `MessageBusPackedSchemaRegistry::loadAllFromDb()` failed |
+| 7 | the registry loaded but is **empty** — BTB-EP-1's loud empty registry |
+| 8 | no schema registered under the entity-state message name; the registry's own contents are listed back |
+| 9 | that name resolved, but the schema does not declare the fields the picture keys on — it is not the entity-state message |
+| 10 | the entity-event topic could not be resolved, so no roster could be built |
+| 11 | `subscribeByTopic` returned no subscription |
+| 12 | the client was created but exposes no message bus |
 
 Configuration is where the difficulty lives. A wrong `--schema-file`, for example, names
 the file it could not open and then names all three values back:
@@ -121,7 +170,10 @@ the capture format are in [`notes.md`](notes.md).
 ```
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
 notes.md                                 what the bus actually carries (graded deliverable)
-src/main.cpp                             the bridge
+src/main.cpp                             CLI, wiring, the once-a-second report
+src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and both topics from the registry
+src/EntityPicture.{h,cpp}                BTB-EP-3/EP-4 — the roster and the latest-sample map
+src/ExitCodes.h                          one table of process exit codes
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
 ```
