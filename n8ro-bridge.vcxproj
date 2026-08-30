@@ -111,18 +111,23 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\CaptureFormat.cpp" />
+    <ClCompile Include="src\CaptureWriter.cpp" />
+    <ClCompile Include="src\HandlerTiming.cpp" />
+    <ClCompile Include="src\RecordQueue.cpp" />
     <ClCompile Include="src\Json.cpp" />
-    <ClCompile Include="src\SampleBuffer.cpp" />
     <ClCompile Include="src\EntityPicture.cpp" />
     <ClCompile Include="src\TopicResolution.cpp" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="src\CaptureFormat.h" />
+    <ClInclude Include="src\CaptureRecord.h" />
+    <ClInclude Include="src\CaptureWriter.h" />
+    <ClInclude Include="src\HandlerTiming.h" />
+    <ClInclude Include="src\RecordQueue.h" />
     <ClInclude Include="src\EntityPicture.h" />
     <ClInclude Include="src\ExitCodes.h" />
     <ClInclude Include="src\Json.h" />
-    <ClInclude Include="src\SampleBuffer.h" />
     <ClInclude Include="src\TopicResolution.h" />
   </ItemGroup>
 

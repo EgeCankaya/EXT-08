@@ -16,6 +16,18 @@
 //                   -> EventConfigReader vocabulary -> message instance name
 //                   -> registry.getByName() -> MessageSchema::topic
 //
+//   scenario evt  kEventScenarioLoaded / kEventScenarioUnloaded  (same chain) - M5's
+//                   segment boundaries (BTB-CX-4). Never a topic literal, for the same
+//                   reason as the other two.
+//
+//   engine state  --engine-state-message (default simEngineState)
+//                   -> registry.getByName() -> MessageSchema::topic
+//                   -> structural check that it declares the fields a heartbeat needs
+//                 M5's host-loss signal (BTB-CX-3). Entity state cannot serve: it goes
+//                 silent legitimately at every unload, so silence there means nothing.
+//                 Engine state publishes through idle frames - 4 017 messages across a
+//                 200 s reference run - so its silence is evidence.
+//
 // EventNames.h states the rule the second chain follows: "The topic each event travels on
 // is the Event instance's own `topic` field, not a constant here: a consumer reads the
 // pairing from the database, and a second copy in a header would drift from it."
@@ -41,6 +53,8 @@ struct Resolution {
     int exitCode = 0;
     n8ro::sim::MessageSchema entityState;   // copied out of the registry, not borrowed
     n8ro::sim::MessageSchema entityEvent;
+    n8ro::sim::MessageSchema scenarioEvent;
+    n8ro::sim::MessageSchema engineState;
 };
 
 // Loads every packed schema in the model into `registry`, then resolves both topics.
@@ -51,6 +65,7 @@ struct Resolution {
     n8ro::schema::DbModel& model,
     n8ro::sim::MessageBusPackedSchemaRegistry& registry,
     const std::string& entityStateMessageName,
+    const std::string& engineStateMessageName,
     const std::string& modelPath,
     const std::string& schemaFile);
 

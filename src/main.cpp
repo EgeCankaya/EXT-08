@@ -1,26 +1,37 @@
-// EXT-08 Bus Telemetry Bridge - M4: the capture format and its specification.
+// EXT-08 Bus Telemetry Bridge - M5: the output path and the session lifecycle.
 //
-// Registers the packed schemas, resolves the entity-state and entity-event topics from the
-// registry, subscribes decoded to both, maintains a roster and a latest-sample map, and -
-// new at M4 - records the run into a `n8ro-capture/1` capture file.
+// Registers the packed schemas, resolves four topics from the registry, subscribes decoded,
+// maintains a roster and a latest-sample map, and streams a `n8ro-capture/1` file through a
+// writer thread behind a bounded queue.
 //
-// Scope: BTB-CAP-1, BTB-CAP-4 and BTB-CAP-5, on top of M2's BTB-CX-1 and M3's BTB-EP-1
-// through BTB-EP-4. The normative description of what it writes is
-// docs/capture-format-v1.md, which is the artifact EXT-17 is handed.
+// Scope: BTB-CX-2, BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-BP-3, BTB-BP-4, BTB-EP-3's
+// records, on top of M2-M4. The normative description of what it writes is
+// docs/capture-format-v1.md; every decision taken while building it is in
+// docs/decisions-m5-m7.md.
 //
-// What M4 deliberately does not have (docs/prd.md, M5-M7): no writer thread and no
-// handler-to-writer queue, no event-driven segment boundaries, no entity_add /
-// entity_remove records, no referee or verdicts, no --replay, no signal handling, no
-// --out-dir. The recording strategy below - fill a bounded buffer on the pump thread, then
-// write the whole file from our own thread once recording has stopped - exists so that M4
-// can prove the format against a real run without building any of that early. M5 replaces
-// it with the streaming writer; capture::write*() survives unchanged, because a record's
-// text is a function of the record and of nothing else.
+// What M5 deliberately does not have (docs/prd.md, M6-M7): no referee, no conditions file,
+// no verdict records, no --replay, no signal handling or Ctrl-C drain, no determinism
+// harness, no size limit in bytes (BTB-CAP-6). An M5 run ends on host loss or on the record
+// budget.
+//
+// The four topics, and why each is here:
+//
+//   sim/entity/state   the stream being recorded                        (BTB-EP-2)
+//   sim/entity/event   the roster, and entity_add / entity_remove       (BTB-EP-3)
+//   sim/scenario/event segment boundaries                               (BTB-CX-4)
+//   sim/engine/state   the heartbeat whose silence is host loss         (BTB-CX-3)
+//
+// Not one of those strings is written anywhere in this program. Each is read off a schema
+// the registry resolved from a message-instance name or an EventNames.h constant
+// (CLAUDE.md hard rule 3, BTB-EP-1).
 
 #include "CaptureFormat.h"
+#include "CaptureRecord.h"
+#include "CaptureWriter.h"
 #include "EntityPicture.h"
 #include "ExitCodes.h"
-#include "SampleBuffer.h"
+#include "HandlerTiming.h"
+#include "RecordQueue.h"
 #include "TopicResolution.h"
 
 #include <DbModel.h>
@@ -29,15 +40,17 @@
 #include <core/messaging/IMessageBus.h>
 #include <core/version/BuildInfo.h>
 #include <infrastructure/SimulationEngineClient.h>
+#include <messaging/EventNames.h>
 #include <messaging/packed/MessageBusPacked.h>
 #include <messaging/packed/MessageBusPackedSchemaRegistry.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <fstream>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -50,22 +63,60 @@ using namespace n8ro::bridge;
 
 constexpr const char* kCategory = "n8ro-bridge";
 
-// The default anchor for entity-state resolution. This is a *message instance name*, not a
-// topic: the topic string is always read off the schema this name resolves to, so a topic
-// rename in the database needs no rebuild. It is overridable because a message rename
-// should be a flag change rather than a rebuild too.
+// Message-instance names, not topics: the topic string is always read off the schema each
+// name resolves to, so a topic rename in the database needs no rebuild. Both are overridable
+// because a message rename should be a flag change rather than a rebuild too.
 constexpr const char* kDefaultEntityStateMessage = "simEntityStateUpdate";
+constexpr const char* kDefaultEngineStateMessage = "simEngineState";
 
-// The recording budget. It is what ends an M4 run, so it is also what makes the capture
-// deterministic: the same scenario recorded to the same budget stops at the same sample,
-// with no clock involved in the decision. 100 000 samples is about 150 s of the reference
-// scenario at its measured 818 samples/s, and about 200 MB of held StreamValueMaps.
-constexpr std::size_t kDefaultCaptureMaxSamples = 100000;
+// --- The two backpressure boundaries (BTB-BP-3, BTB-BP-4, ADR-4) ------------------------
+//
+// BUS SIDE. SubscriptionOptions defaults to KEEP_LATEST with queueSize 100, and for a
+// recorder that is precisely wrong: it discards the older of two messages, which is the one
+// already part of the run's history. FIFO_DROP is the provisional answer (OQ-4); BLOCK is
+// rejected outright because a recorder that stalls the bus changes the run it is recording,
+// and docs/capture-format-v1.md section 14 states that to consumers in writing.
+//
+// 1024 rather than the default 100: at the reference scenario's 818 packets/s that is ~1.25 s
+// of headroom instead of ~120 ms, and at the 126-entity overload scenario's 2 487/s it is
+// ~410 ms instead of ~40 ms. Provisional, and M6 confirms it under load.
+constexpr std::size_t kBusQueueSize = 1024;
+constexpr n8ro::core::BackpressurePolicy kBusPolicy = n8ro::core::BackpressurePolicy::FIFO_DROP;
+
+// INTERNAL SIDE. See RecordQueue.h for the shape and docs/decisions-m5-m7.md D-6 to D-9 for
+// the reasoning. 8192 records is ~16 MB at M4's measured ~2 KB per held StreamValueMap -
+// 10.0 s of headroom at 818/s against a p95 enqueue-to-durable target of 250 ms.
+constexpr std::size_t kDefaultQueueSize = 8192;
+constexpr std::size_t kStructuralReserve = 1024;
+
+// --- Host-loss detection (BTB-CX-3) -----------------------------------------------------
+//
+// Derived, not guessed. sim/engine/state publishes at ~19.5/s through idle frames - before
+// the scenario loads and after the engine stops - so its silence is evidence in a way that
+// entity-state silence is not. Measured across two full bring-up/load/run/teardown cycles:
+// nominal period 51 ms, and the largest inter-arrival gap anywhere was 548 ms, at scenario
+// load on the reference scenario (408 ms on the 126-entity one - the stall does not scale
+// with entity count).
+//
+// 3.0 s is 5.5x that largest observed gap and ~59 heartbeat periods. Deliberately far below
+// SubscriptionOptions::activityThresholdS, whose 30 s default is the bus's own "this
+// subscription looks idle" semantics and is two orders of magnitude too slow to be a
+// host-loss signal for a campaign runner. docs/decisions-m5-m7.md, D-3.
+constexpr double kHostLossWindowS = 3.0;
+
+// How often the main loop wakes. The status line is printed once a second; the loop runs
+// four times faster so that host loss is noticed within a quarter of a second of the window
+// expiring rather than up to a second later.
+constexpr auto kPollInterval = std::chrono::milliseconds(250);
+constexpr int kPollsPerStatusLine = 4;
+constexpr auto kWaitingLogInterval = std::chrono::seconds(5);
 
 constexpr const char* kUsage =
     "usage: n8ro-bridge --config <SimEngineClient_*> --model-path <dir> --schema-file <name>\n"
-    "                   [--entity-state-message <name>]\n"
-    "                   [--capture-out <file>] [--capture-max-samples <n>]\n"
+    "                   --out-dir <dir> [--run-label <label>]\n"
+    "                   [--entity-state-message <name>] [--engine-state-message <name>]\n"
+    "                   [--queue-size <n>] [--overflow-policy <drop_newest|drop_oldest>]\n"
+    "                   [--capture-max-samples <n>]\n"
     "\n"
     "  --config                 client-side sim engine config entry, e.g.\n"
     "                           SimEngineClient_SharedMemory. A SimEngineHost_* entry names\n"
@@ -73,25 +124,50 @@ constexpr const char* kUsage =
     "  --model-path             directory holding the schema and instance database, e.g.\n"
     "                           C:\\N8RO\\data\\db\n"
     "  --schema-file            schema name inside that database, e.g. N8roSimSchema\n"
+    "  --out-dir                existing, writable directory for the capture. The file is\n"
+    "                           named capture-<scenario>-<run-label>.n8rocap.jsonl.\n"
+    "  --run-label              label for this run. Defaults to the next unused zero-padded\n"
+    "                           ordinal in --out-dir. Never a timestamp: campaign tooling\n"
+    "                           addresses runs by path, and a wall-clock name makes two\n"
+    "                           identical runs unaddressable as a pair.\n"
     "  --entity-state-message   message instance name to resolve the entity-state topic\n"
-    "                           from. Default simEntityStateUpdate. The topic itself is\n"
-    "                           always read from the registry, never from a literal.\n"
-    "  --capture-out            write a n8ro-capture/1 capture to this path. Without it the\n"
-    "                           bridge only reports, exactly as at M3. M4 only: M5 replaces\n"
-    "                           this with --out-dir / --run-label and the naming convention\n"
-    "                           in the PRD.\n"
-    "  --capture-max-samples    stop recording after this many accepted samples, then write\n"
-    "                           the file and exit 0. Default 100000. This budget is what\n"
-    "                           ends an M4 run - there is no signal handling until M7.\n";
+    "                           from. Default simEntityStateUpdate.\n"
+    "  --engine-state-message   message instance name to resolve the engine-state heartbeat\n"
+    "                           from. Default simEngineState. Its silence is how host loss\n"
+    "                           is detected, within a 3.0 s window.\n"
+    "  --queue-size             handler-to-writer queue bound, in records. Default 8192.\n"
+    "                           Overflow is counted into trailer.drops.samples_not_recorded.\n"
+    "  --overflow-policy        drop_newest (default) or drop_oldest. block is not offered;\n"
+    "                           ask for it to be told why.\n"
+    "  --capture-max-samples    stop after this many sample records and close the capture\n"
+    "                           with end_reason=size_limit. Default 0, meaning no bound -\n"
+    "                           an M5 run ends on host loss.\n";
 
 struct Options {
     std::string config;
     std::string modelPath;
     std::string schemaFile;
+    std::string outDir;
+    std::string runLabel;
     std::string entityStateMessage = kDefaultEntityStateMessage;
-    std::string captureOut;
-    std::size_t captureMaxSamples = kDefaultCaptureMaxSamples;
+    std::string engineStateMessage = kDefaultEngineStateMessage;
+    std::size_t queueSize = kDefaultQueueSize;
+    OverflowPolicy overflowPolicy = OverflowPolicy::DropNewest;
+    std::size_t captureMaxSamples = 0;   // 0 = unbounded
 };
+
+[[nodiscard]] bool parseCount(const std::string& flag, const std::string& value, bool allowZero,
+                              std::size_t& out, std::string& error) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0' || (!allowZero && parsed == 0)) {
+        error = flag + " needs a " + (allowZero ? "non-negative" : "positive") +
+                " integer, got " + value;
+        return false;
+    }
+    out = static_cast<std::size_t>(parsed);
+    return true;
+}
 
 // Returns false and names the offending argument. Never throws: argv parsing is the first
 // place an exception would escape main, and the platform contract forbids that (CLAUDE.md,
@@ -103,43 +179,46 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
             error = "help";
             return false;
         }
-
-        std::string* target = nullptr;
-        bool isSampleBudget = false;
-        if (arg == "--config") {
-            target = &out.config;
-        } else if (arg == "--model-path") {
-            target = &out.modelPath;
-        } else if (arg == "--schema-file") {
-            target = &out.schemaFile;
-        } else if (arg == "--entity-state-message") {
-            target = &out.entityStateMessage;
-        } else if (arg == "--capture-out") {
-            target = &out.captureOut;
-        } else if (arg == "--capture-max-samples") {
-            isSampleBudget = true;
-        } else {
-            error = "unrecognised option " + arg;
+        if (arg.rfind("--", 0) != 0) {
+            error = "unrecognised argument " + arg;
             return false;
         }
-
         if (i + 1 >= argc) {
             error = arg + " requires a value";
             return false;
         }
         const std::string value = argv[++i];
 
-        if (isSampleBudget) {
-            char* end = nullptr;
-            const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
-            if (end == value.c_str() || *end != '\0' || parsed == 0) {
-                error = "--capture-max-samples needs a positive integer, got " + value;
+        if (arg == "--config") {
+            out.config = value;
+        } else if (arg == "--model-path") {
+            out.modelPath = value;
+        } else if (arg == "--schema-file") {
+            out.schemaFile = value;
+        } else if (arg == "--out-dir") {
+            out.outDir = value;
+        } else if (arg == "--run-label") {
+            out.runLabel = value;
+        } else if (arg == "--entity-state-message") {
+            out.entityStateMessage = value;
+        } else if (arg == "--engine-state-message") {
+            out.engineStateMessage = value;
+        } else if (arg == "--queue-size") {
+            if (!parseCount(arg, value, false, out.queueSize, error)) {
                 return false;
             }
-            out.captureMaxSamples = static_cast<std::size_t>(parsed);
-            continue;
+        } else if (arg == "--overflow-policy") {
+            if (!parseOverflowPolicy(value, out.overflowPolicy, error)) {
+                return false;
+            }
+        } else if (arg == "--capture-max-samples") {
+            if (!parseCount(arg, value, true, out.captureMaxSamples, error)) {
+                return false;
+            }
+        } else {
+            error = "unrecognised option " + arg;
+            return false;
         }
-        *target = value;
     }
 
     if (out.config.empty()) {
@@ -154,10 +233,65 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
         error = "--schema-file is required";
         return false;
     }
-    if (out.entityStateMessage.empty()) {
-        error = "--entity-state-message cannot be empty";
+    if (out.outDir.empty()) {
+        error = "--out-dir is required";
         return false;
     }
+    if (out.entityStateMessage.empty() || out.engineStateMessage.empty()) {
+        error = "a message-name option cannot be empty";
+        return false;
+    }
+    // The PRD's threat model: "refuse traversal components in the run label used for
+    // filenames". A label is a filename component and nothing else.
+    if (out.runLabel.find_first_of("/\\:") != std::string::npos || out.runLabel == "." ||
+        out.runLabel == "..") {
+        error = "--run-label is a filename component and may not contain a path separator, a "
+                "drive letter, or a traversal component; got " + out.runLabel;
+        return false;
+    }
+    return true;
+}
+
+// The PRD's fail-safe-on-output rule: validate the directory at startup rather than
+// discovering it at first write, and never create it implicitly. A run that cannot store its
+// evidence should not start capturing into a void.
+[[nodiscard]] bool validateOutDir(const std::string& dir, std::string& canonical) {
+    std::error_code ec;
+    const std::filesystem::path path(dir);
+    if (!std::filesystem::exists(path, ec) || ec) {
+        N8RO_LOG_ERROR(std::string("--out-dir does not exist: ") + dir +
+                           ". It must be an existing, writable directory; the bridge does not "
+                           "create it, because a mistyped path would then look like success",
+                       kCategory);
+        return false;
+    }
+    if (!std::filesystem::is_directory(path, ec) || ec) {
+        N8RO_LOG_ERROR(std::string("--out-dir is not a directory: ") + dir, kCategory);
+        return false;
+    }
+
+    // Canonicalise, so a path reached through a symlink or with traversal components is
+    // resolved and logged as what it actually is.
+    const std::filesystem::path resolved = std::filesystem::canonical(path, ec);
+    if (ec) {
+        N8RO_LOG_ERROR(std::string("--out-dir could not be canonicalised: ") + dir + " (" +
+                           ec.message() + ")",
+                       kCategory);
+        return false;
+    }
+    canonical = resolved.string();
+
+    // Writability is only knowable by trying. A probe file is removed immediately; failing
+    // here is far cheaper than failing after a 200-second run.
+    const std::filesystem::path probe = resolved / ".n8ro-bridge-write-probe";
+    {
+        std::ofstream test(probe, std::ios::binary | std::ios::trunc);
+        if (!test) {
+            N8RO_LOG_ERROR(std::string("--out-dir is not writable: ") + canonical, kCategory);
+            return false;
+        }
+    }
+    std::filesystem::remove(probe, ec);
     return true;
 }
 
@@ -218,128 +352,74 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
     return "unknown";
 }
 
-// Phase 2 of M4's recording strategy: everything below runs on our own thread, after the
-// subscriptions are cancelled and the pump is stopped. All IO, all formatting, all float
-// conversion happen here and nowhere else (CLAUDE.md hard rule 2).
-//
-// The file is opened in binary mode on purpose. The format is LF-terminated, and Windows'
-// text mode would translate every one to CRLF - which would make a capture written here
-// differ byte-for-byte from the same capture written anywhere else, defeating the whole
-// point of BTB-CAP-3.
-[[nodiscard]] bool writeCaptureFile(const std::string& path, const capture::HeaderInfo& header,
-                                    const std::string& scenario, const SampleBuffer& buffer,
-                                    const n8ro::sim::MessageSchema& stateSchema,
-                                    const PictureSnapshot& snapshot,
-                                    const n8ro::sim::MessageBusPackedMetricsSnapshot& metrics,
-                                    const n8ro::core::IMessageBus::Statistics& busStats,
-                                    const std::string& endReason) {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        N8RO_LOG_ERROR(std::string("could not open capture file for writing: ") + path, kCategory);
-        return false;
-    }
+// One screen at exit (BTB-OBS-2). Everything a reader of the log needs to decide whether the
+// capture is trustworthy, in the order they would ask.
+void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
+                     const QueueCounters& queue, const RecordQueue& queueShape,
+                     const HandlerTiming& stateTiming, const HandlerTiming& eventTiming,
+                     const n8ro::sim::MessageBusPackedMetricsSnapshot& metrics,
+                     const n8ro::core::IMessageBus::Statistics& busStats, EndReason endReason) {
+    std::printf("\n=== run summary =========================================================\n");
+    std::printf("capture     %s\n", writer.path().empty() ? "(none written)" : writer.path().c_str());
+    std::printf("end_reason  %s\n", endReasonName(endReason));
+    std::printf("records     %llu written (segments=%llu samples=%llu entity_add=%llu "
+                "entity_remove=%llu verdicts=%llu)\n",
+                static_cast<unsigned long long>(writer.recordsWritten()),
+                static_cast<unsigned long long>(writer.counts().segments),
+                static_cast<unsigned long long>(writer.counts().samples),
+                static_cast<unsigned long long>(writer.counts().entitiesAdded),
+                static_cast<unsigned long long>(writer.counts().entitiesRemoved),
+                static_cast<unsigned long long>(writer.counts().verdicts));
+    std::printf("sim_time    samples %.6f -> %.6f s; last record %.6f s\n",
+                writer.firstSampleSimTimeS(), writer.lastSampleSimTimeS(),
+                writer.lastRecordSimTimeS());
+    std::printf("            (a last record of 0.0 is a teardown boundary - the engine resets "
+                "the clock before publishing those. Spec 5.1)\n");
+    std::printf("entities    %zu names seen, %zu occupancies open at exit\n", snap.roster.size(),
+                snap.liveCount);
+    std::printf("removals    %s\n", formatCountsByName(snap.removalsByReason).c_str());
 
-    file << capture::writeHeader(header) << '\n';
+    std::printf("\n-- loss, in the order it can happen ---------------------------------------\n");
+    std::printf("bus deliver  dropped=%llu backpressure=%llu queueOverflow=%llu rateLimit=%llu\n",
+                static_cast<unsigned long long>(busStats.messagesDropped),
+                static_cast<unsigned long long>(busStats.droppedByBackpressure),
+                static_cast<unsigned long long>(busStats.droppedByQueueOverflow),
+                static_cast<unsigned long long>(busStats.droppedByRateLimiting));
+    std::printf("bus decode   schemaHash=%llu messageId=%llu decodeFail=%llu noSchema=%llu "
+                "legacy=%llu\n",
+                static_cast<unsigned long long>(metrics.schemaHashDrops),
+                static_cast<unsigned long long>(metrics.messageIdDrops),
+                static_cast<unsigned long long>(metrics.decodeFailures),
+                static_cast<unsigned long long>(metrics.missingSchemaPassthrough),
+                static_cast<unsigned long long>(metrics.legacyPayloadPassthrough));
+    std::printf("picture      orphaned=%llu unnamed=%llu untimed=%llu deleteOfUnknown=%llu\n",
+                static_cast<unsigned long long>(snap.counters.samplesOrphaned),
+                static_cast<unsigned long long>(snap.counters.samplesUnnamed),
+                static_cast<unsigned long long>(snap.counters.samplesUntimed),
+                static_cast<unsigned long long>(snap.counters.deleteOfUnknownEntity));
+    std::printf("writer queue samplesDropped=%llu eventsDropped=%llu  (capacity %zu+%zu, "
+                "policy %s, highWater=%zu)\n",
+                static_cast<unsigned long long>(queue.samplesDropped),
+                static_cast<unsigned long long>(queue.structuralDropped),
+                queueShape.sampleCapacity(),
+                queueShape.hardCapacity() - queueShape.sampleCapacity(),
+                overflowPolicyName(queueShape.policy()), queue.highWater);
+    std::printf("staging      dropped=%llu   unload noise ignored=%llu\n",
+                static_cast<unsigned long long>(writer.counts().stagedDropped),
+                static_cast<unsigned long long>(writer.counts().unloadNoiseIgnored));
 
-    const std::vector<CapturedSample>& samples = buffer.records();
+    std::printf("\n-- after the end, not loss (log only, never in the file) ------------------\n");
+    std::printf("shutdown window  samples=%llu events=%llu   past the budget: samples=%llu\n",
+                static_cast<unsigned long long>(queue.samplesAfterClose),
+                static_cast<unsigned long long>(queue.structuralAfterClose),
+                static_cast<unsigned long long>(writer.samplesAfterBudget()));
 
-    // M4 opens exactly one segment, and only the state model's attach-mid-run branch of it:
-    // "attached -> segment_open on scenario_loaded, or first sample when attached mid-run"
-    // (docs/prd.md, State model). The event-driven branch, reload, and therefore any second
-    // segment are M5's BTB-CX-4. A segment is opened at all because BTB-CX-4 forbids a
-    // sample record outside one and the envelope makes `segment` required - a capture with
-    // samples and no segment would be a non-conformant file, which is the last thing to
-    // hand across a repo boundary as a reference.
-    const std::uint64_t segment = 0;
-    const bool haveSamples = !samples.empty();
-    const double firstSimTimeS = haveSamples ? samples.front().simulationTimeS : 0.0;
-    const double lastSimTimeS = haveSamples ? samples.back().simulationTimeS : 0.0;
+    std::printf("\n-- handler cost (BTB-BP-1: p50<20us p95<100us p99<500us) ------------------\n");
+    std::printf("entity-state %s\n", stateTiming.summary().c_str());
+    std::printf("entity-event %s\n", eventTiming.summary().c_str());
 
-    if (haveSamples) {
-        file << capture::writeSegmentOpen(firstSimTimeS, segment, scenario) << '\n';
-        for (const CapturedSample& sample : samples) {
-            file << capture::writeSample(sample, segment, stateSchema) << '\n';
-        }
-        file << capture::writeSegmentClose(lastSimTimeS, segment, scenario, endReason) << '\n';
-    }
-
-    capture::TrailerCounts counts;
-    // These count records in this file, not transitions in the roster. M4 emits no
-    // entity_add / entity_remove records, so both are zero however busy the roster was -
-    // and the trailer would be lying if they were not.
-    counts.segments = haveSamples ? 1 : 0;
-    counts.samples = static_cast<std::uint64_t>(samples.size());
-    counts.entitiesAdded = 0;
-    counts.entitiesRemoved = 0;
-    counts.verdicts = 0;
-
-    capture::TrailerDrops drops;
-    // Zero by construction at this version, and that is the honest value rather than a
-    // convenient one. The buffer is preallocated to exactly the budget, so it never rejects
-    // a sample *while recording* - the buffer filling IS the end of recording. Samples that
-    // arrive afterwards are not dropped, they are after the end, which is precisely what
-    // `end_reason: size_limit` tells a reader. Writing the observed tail here instead would
-    // put a scheduler-dependent number into a file that must be byte-identical across two
-    // identical runs (BTB-CAP-3), and would be misleading besides: it counts the handful
-    // that landed in the shutdown window and not the tens of thousands published after we
-    // stopped. The tail goes to the log, below. M5 fills this field with the internal
-    // queue's real overflow, and the name and meaning carry over unchanged.
-    drops.samplesNotRecorded = 0;
-    drops.samplesOrphaned = snapshot.counters.samplesOrphaned;
-    drops.samplesUnnamed = snapshot.counters.samplesUnnamed;
-    drops.samplesUntimed = snapshot.counters.samplesUntimed;
-
-    capture::TrailerBusMetrics busMetrics;
-    busMetrics.schemaHashDrops = metrics.schemaHashDrops;
-    busMetrics.messageIdDrops = metrics.messageIdDrops;
-    busMetrics.decodeFailures = metrics.decodeFailures;
-    busMetrics.missingSchemaPassthrough = metrics.missingSchemaPassthrough;
-    busMetrics.legacyPayloadPassthrough = metrics.legacyPayloadPassthrough;
-    // The delivery side, which nothing in this program read before 0.4.2. A message the bus
-    // discards never reaches the decoder, so the five counters above stay at zero through a
-    // loss - which is exactly what happened, and what made whole missing frames invisible.
-    busMetrics.messagesDropped = busStats.messagesDropped;
-    busMetrics.droppedByBackpressure = busStats.droppedByBackpressure;
-    busMetrics.droppedByQueueOverflow = busStats.droppedByQueueOverflow;
-    busMetrics.droppedByRateLimiting = busStats.droppedByRateLimiting;
-
-    file << capture::writeTrailer(lastSimTimeS, endReason, counts, drops, busMetrics) << '\n';
-    file.flush();
-    if (!file) {
-        N8RO_LOG_ERROR(std::string("capture file was opened but writing failed: ") + path,
-                       kCategory);
-        return false;
-    }
-    file.close();
-
-    N8RO_LOG_INFO(std::string("capture written: ") + path + " (" +
-                      std::to_string(counts.samples) + " sample records, segment " +
-                      std::to_string(segment) + ", simTime " + std::to_string(firstSimTimeS) +
-                      " to " + std::to_string(lastSimTimeS) + ", end_reason=" + endReason + ")",
-                  kCategory);
-
-    // The residue, reported here and deliberately not in the file. It cannot be zero - a bus
-    // subscription cannot be stopped atomically - and it varies run to run, which is exactly
-    // why a log line is its place (CLAUDE.md: wall-clock and anything like it belongs in log
-    // lines and nowhere durable).
-    N8RO_LOG_INFO(std::string("recording ended at the budget; ") +
-                      std::to_string(buffer.notRecorded()) +
-                      " further samples arrived between the budget being reached and the "
-                      "subscription being cancelled. They are not in the capture and are not "
-                      "counted as drops in it: the run was still publishing when we stopped "
-                      "on purpose, which is what end_reason=size_limit records",
-                  kCategory);
-
-    // A schema field nothing ever published is a fact about the run and belongs in the
-    // report, not only in the file's shape. The entity-state schema declares twelve fields
-    // and activeAnimation was published zero times in 132 188 samples at M3 - which is the
-    // case BTB-CAP-4's absent-not-defaulted rule exists for.
-    const std::vector<std::string> absent = capture::neverPublishedFields(stateSchema, samples);
-    if (absent.empty()) {
-        N8RO_LOG_INFO(std::string("every field the entity-state schema declares was published at "
-                                  "least once"),
-                      kCategory);
-    } else {
+    const std::vector<std::string> absent = writer.neverPublishedFields();
+    if (!absent.empty()) {
         std::string names;
         for (const std::string& field : absent) {
             if (!names.empty()) {
@@ -347,20 +427,26 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
             }
             names += field;
         }
-        N8RO_LOG_WARNING(std::string("declared but never published, so present in "
-                                     "header.schemas and in no sample record: ") +
-                             names + " (" + std::to_string(absent.size()) + " of " +
-                             std::to_string(stateSchema.fields.size()) + " declared fields)",
-                         kCategory);
+        std::printf("\nschema       declared but NEVER published, so in header.schemas and in no "
+                    "sample: %s\n",
+                    names.c_str());
     }
-    return true;
+    if (!snap.unhandledEventNames.empty()) {
+        std::printf("other events %s\n", formatCountsByName(snap.unhandledEventNames).c_str());
+    }
+    std::printf("=========================================================================\n");
+    std::fflush(stdout);
 }
 
 int run(const Options& options) {
+    std::string outDir;
+    if (!validateOutDir(options.outDir, outDir)) {
+        return kExitOutDirInvalid;
+    }
+
     // The registry is built from our own DbModel over the same model path and schema file
     // the engine was started with. SimulationEngineClient holds a registry of its own, but
     // exposes no accessor for it - only messageBus() - so the packed layer is ours to build.
-    // This is the passive-observer recipe the shipped bus monitor documents.
     n8ro::schema::DbModel model(options.modelPath);
     if (!model.Open(options.schemaFile)) {
         N8RO_LOG_ERROR(std::string("DbModel::Open failed for schema file ") + options.schemaFile +
@@ -371,8 +457,9 @@ int run(const Options& options) {
     }
 
     n8ro::sim::MessageBusPackedSchemaRegistry registry;
-    const Resolution resolution = resolveTopics(model, registry, options.entityStateMessage,
-                                                options.modelPath, options.schemaFile);
+    const Resolution resolution =
+        resolveTopics(model, registry, options.entityStateMessage, options.engineStateMessage,
+                      options.modelPath, options.schemaFile);
     if (!resolution.ok) {
         // resolveTopics has already logged a named diagnostic for whichever condition fired.
         return resolution.exitCode;
@@ -404,54 +491,88 @@ int run(const Options& options) {
 
     EntityPicture picture;
     n8ro::sim::MessageBusPacked packed(*bus, registry);
+    RecordQueue queue(options.queueSize, kStructuralReserve, options.overflowPolicy);
+    HandlerTiming stateTiming;
+    HandlerTiming eventTiming;
 
-    const bool capturing = !options.captureOut.empty();
-    SampleBuffer buffer(capturing ? options.captureMaxSamples : 0);
-    if (capturing) {
-        N8RO_LOG_INFO(std::string("capture enabled: ") + options.captureOut + " format " +
-                          capture::kFormatVersion + ", budget " +
-                          std::to_string(options.captureMaxSamples) +
-                          " samples. Recording stops at the budget, then the file is written "
-                          "and the bridge exits",
-                      kCategory);
-    } else {
-        N8RO_LOG_INFO(std::string("no --capture-out given; reporting only, no capture file "
-                                  "will be written"),
-                      kCategory);
-    }
+    // The heartbeat counter. Incremented by the engine-state handler and read by the main
+    // loop; its *rate of change* is the liveness signal, and nothing derived from it ever
+    // reaches the capture.
+    std::atomic<std::uint64_t> heartbeat{0};
 
-    // The bus-side backpressure policy. M6 owns the decision (BTB-BP-3, OQ-4); M4's job is
-    // to make it visible rather than to tune it, because the default is lossy and silence
-    // about it is exactly the failure mode tenet 3 forbids. The value goes into the capture
-    // header, so a capture always says which policy it was recorded under.
-    const n8ro::core::SubscriptionOptions subscriptionOptions;
-    N8RO_LOG_WARNING(std::string("subscribing with the bus default SubscriptionOptions: "
-                                 "queueSize=") +
-                         std::to_string(subscriptionOptions.queueSize) +
-                         " backpressurePolicy=" +
-                         backpressurePolicyName(subscriptionOptions.backpressurePolicy) +
-                         " (lossy). This is deliberate before M6 - setting both boundaries "
-                         "explicitly is BTB-BP-3/BTB-BP-4. At the reference scenario's 818 "
-                         "packets/s a 100-message queue is ~120 ms of headroom",
-                     kCategory);
+    capture::HeaderInfo header;
+    header.platform.engineConfig = options.config;
+    header.platform.modelPath = options.modelPath;
+    header.platform.schemaFile = options.schemaFile;
+    header.platform.schemaVersion = model.getSchemaVersion();
+    header.platform.runtimeVersion = std::string(n8ro::core::getN8roVersion());
+    header.subscription.topic = resolution.entityState.topic;
+    header.subscription.backpressurePolicy = backpressurePolicyName(kBusPolicy);
+    header.subscription.queueSize = static_cast<std::uint64_t>(kBusQueueSize);
+    // One entry, because one message type appears as a sample record's `message`. The other
+    // three schemas are not here: no record in the file is a verbatim dump of one, so no
+    // reader ever needs them to interpret a line.
+    header.schemas.push_back(resolution.entityState);
 
-    // BTB-EP-2: a decoded subscription. Each arrival delivers the raw Message, its
-    // MessageSchema and the decoded StreamValueMap - no manual payload parsing exists
-    // anywhere in this codebase.
+    CaptureWriter writer(
+        outDir, options.runLabel, header, resolution.entityState, options.captureMaxSamples,
+        // attached_mid_run, evaluated once when the file is opened. Derived from what the
+        // message stream contained - did samples arrive for entities whose creation we never
+        // saw - and never from a clock or a status tick (BTB-CAP-3).
+        [&picture] {
+            const PictureSnapshot snap = picture.snapshot();
+            return snap.counters.samplesAccepted > 0
+                       ? snap.counters.orphansBeforeFirstAccepted > 0
+                       : snap.counters.samplesOrphaned > 0;
+        },
+        // Only used to name the file when the bridge attached mid-run and has therefore never
+        // seen a scenario_loaded. A local read on the client; nothing here touches the bus.
+        [&client] { return client->getLoadedScenarioName().value_or(std::string{}); });
+
+    // --- subscriptions ------------------------------------------------------------------
     //
-    // Both handlers run on the bus pump thread. Each copies what it needs and returns. No
-    // IO, no formatting, no file, no float conversion: the sample is copied into the buffer
-    // exactly as delivered and is not looked at again until phase 2.
+    // Both values explicit at every call site, with the default each overrides named
+    // (BTB-BP-3). The bus default is KEEP_LATEST / 100.
+    n8ro::core::SubscriptionOptions subscriptionOptions;
+    subscriptionOptions.backpressurePolicy = kBusPolicy;    // overrides the default KEEP_LATEST
+    subscriptionOptions.queueSize = kBusQueueSize;          // overrides the default 100
+
+    N8RO_LOG_INFO(std::string("bus-side backpressure set explicitly: queueSize=") +
+                      std::to_string(subscriptionOptions.queueSize) + " backpressurePolicy=" +
+                      backpressurePolicyName(subscriptionOptions.backpressurePolicy) +
+                      " (overriding the SubscriptionOptions defaults 100 / KEEP_LATEST). "
+                      "KEEP_LATEST discards the older of two messages, which for a recorder is "
+                      "the one already part of the run's history; BLOCK would stall the bus and "
+                      "change the run being recorded (ADR-4). Provisional until M6 confirms "
+                      "under overload (OQ-4)",
+                  kCategory);
+    N8RO_LOG_INFO(std::string("internal queue: ") + std::to_string(options.queueSize) +
+                      " sample records + " + std::to_string(kStructuralReserve) +
+                      " reserved for roster and segment records, policy " +
+                      overflowPolicyName(options.overflowPolicy) +
+                      ". Overflow is counted into trailer.drops (BTB-BP-4)",
+                  kCategory);
+
+    // BTB-EP-2: decoded subscriptions. Every handler below is a courier - it copies what it
+    // needs, hands it to the queue, and returns. No IO, no formatting, no float conversion,
+    // no file. All of that is the writer thread's (CLAUDE.md hard rule 2, BTB-BP-1).
     const std::uint64_t stateSubscription = packed.subscribeByTopic(
         resolution.entityState.topic,
-        [&picture, &buffer, capturing](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
-                                       const n8ro::sim::StreamValueMap& values) {
+        [&picture, &queue, &stateTiming](const n8ro::core::Message&,
+                                         const n8ro::sim::MessageSchema&,
+                                         const n8ro::sim::StreamValueMap& values) {
+            const auto started = std::chrono::steady_clock::now();
             const SampleOutcome outcome = picture.onSample(values);
-            if (!capturing || !outcome.accepted) {
-                return;
+            if (outcome.accepted) {
+                CaptureRecord record;
+                record.kind = RecordKind::Sample;
+                record.subject = outcome.scenarioEntityName;
+                record.occupancy = outcome.generation;
+                record.simTimeS = outcome.simulationTimeS;
+                record.values = values;   // verbatim; the courier's whole job
+                queue.offer(std::move(record));
             }
-            buffer.offer(CapturedSample{outcome.scenarioEntityName, outcome.generation,
-                                        outcome.simulationTimeS, values});
+            stateTiming.note(std::chrono::steady_clock::now() - started);
         },
         subscriptionOptions);
     if (stateSubscription == 0) {
@@ -464,8 +585,23 @@ int run(const Options& options) {
 
     const std::uint64_t eventSubscription = packed.subscribeByTopic(
         resolution.entityEvent.topic,
-        [&picture](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
-                   const n8ro::sim::StreamValueMap& values) { picture.onEntityEvent(values); },
+        [&picture, &queue, &eventTiming](const n8ro::core::Message&,
+                                         const n8ro::sim::MessageSchema&,
+                                         const n8ro::sim::StreamValueMap& values) {
+            const auto started = std::chrono::steady_clock::now();
+            const EventOutcome outcome = picture.onEntityEvent(values);
+            if (outcome.kind != EventOutcome::Kind::Ignored) {
+                CaptureRecord record;
+                record.kind = outcome.kind == EventOutcome::Kind::Added ? RecordKind::EntityAdd
+                                                                        : RecordKind::EntityRemove;
+                record.subject = outcome.scenarioEntityName;
+                record.occupancy = outcome.generation;
+                record.simTimeS = outcome.simulationTimeS;
+                record.reason = outcome.reason;
+                queue.offer(std::move(record));
+            }
+            eventTiming.note(std::chrono::steady_clock::now() - started);
+        },
         subscriptionOptions);
     if (eventSubscription == 0) {
         N8RO_LOG_ERROR(std::string("subscribeByTopic returned no subscription for entity-event "
@@ -477,178 +613,245 @@ int run(const Options& options) {
         return kExitSubscribeFailed;
     }
 
-    N8RO_LOG_INFO(std::string("subscribed decoded: entity-state topic ") +
-                      resolution.entityState.topic + " (id " + std::to_string(stateSubscription) +
-                      "), entity-event topic " + resolution.entityEvent.topic + " (id " +
-                      std::to_string(eventSubscription) + ")",
+    // BTB-CX-4. The event names come from EventNames.h, which is compile-checked against the
+    // engine's own publish sites; the topic came from the registry. Neither is a literal.
+    const std::uint64_t scenarioSubscription = packed.subscribeByTopic(
+        resolution.scenarioEvent.topic,
+        [&queue](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
+                 const n8ro::sim::StreamValueMap& values) {
+            const std::optional<std::string> eventName = tryReadString(values, "eventName");
+            if (!eventName) {
+                return;
+            }
+            CaptureRecord record;
+            if (*eventName == n8ro::sim::kEventScenarioLoaded) {
+                record.kind = RecordKind::ScenarioLoaded;
+            } else if (*eventName == n8ro::sim::kEventScenarioUnloaded) {
+                record.kind = RecordKind::ScenarioUnloaded;
+            } else {
+                // Something else on the scenario-event topic. Not ours to interpret, and not
+                // a boundary; the writer never sees it.
+                return;
+            }
+            record.subject = tryReadString(values, "scenarioName").value_or(std::string{});
+            record.simTimeS = tryReadDouble(values, "simulationTime").value_or(0.0);
+            queue.offer(std::move(record));
+        },
+        subscriptionOptions);
+    if (scenarioSubscription == 0) {
+        N8RO_LOG_ERROR(std::string("subscribeByTopic returned no subscription for scenario-event "
+                                   "topic ") +
+                           resolution.scenarioEvent.topic,
+                       kCategory);
+        static_cast<void>(packed.unsubscribe(stateSubscription));
+        static_cast<void>(packed.unsubscribe(eventSubscription));
+        return kExitSubscribeFailed;
+    }
+
+    // BTB-CX-3. Arrival is the whole signal; nothing reads a value out of this message, and
+    // nothing derived from it reaches the capture. sim/engine/state carries wallElapsedS,
+    // which is exactly the field tenet 2 forbids anywhere durable - not copying the message
+    // wholesale is what keeps that impossible rather than merely avoided.
+    const std::uint64_t heartbeatSubscription = packed.subscribeByTopic(
+        resolution.engineState.topic,
+        [&heartbeat](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
+                     const n8ro::sim::StreamValueMap&) {
+            heartbeat.fetch_add(1, std::memory_order_relaxed);
+        },
+        subscriptionOptions);
+    if (heartbeatSubscription == 0) {
+        N8RO_LOG_ERROR(std::string("subscribeByTopic returned no subscription for engine-state "
+                                   "topic ") +
+                           resolution.engineState.topic,
+                       kCategory);
+        static_cast<void>(packed.unsubscribe(stateSubscription));
+        static_cast<void>(packed.unsubscribe(eventSubscription));
+        static_cast<void>(packed.unsubscribe(scenarioSubscription));
+        return kExitSubscribeFailed;
+    }
+
+    N8RO_LOG_INFO(std::string("subscribed decoded: entity-state ") + resolution.entityState.topic +
+                      ", entity-event " + resolution.entityEvent.topic + ", scenario-event " +
+                      resolution.scenarioEvent.topic + ", engine-state " +
+                      resolution.engineState.topic,
                   kCategory);
 
     // Subscribe first, then pump - nothing published between the two is missed.
     client->startMessagePump();
-    N8RO_LOG_INFO(std::string("message pump started; reporting engine state and the entity "
-                              "picture once a second (Ctrl-C to stop)"),
+
+    // The writer thread. From here until it is joined, it is the only thing that touches the
+    // file, and the queue is the only thing the two threads share.
+    std::thread writerThread([&writer, &queue] { writer.run(queue); });
+
+    N8RO_LOG_INFO(std::string("message pump and writer thread started. Waiting for the "
+                              "simulation host; no start order is required (BTB-CX-2). Host loss "
+                              "is declared after ") +
+                      std::to_string(kHostLossWindowS) +
+                      " s without an engine-state message (BTB-CX-3)",
                   kCategory);
 
-    // The scenario name for the segment records. BTB-CX-4 requires it to be the name the
-    // platform reports rather than one supplied on the command line; at M4 that is the
-    // engine's own mirrored value, and at M5 it becomes the sim/scenario/event payload.
-    std::string scenarioName;
+    // --- the main loop ------------------------------------------------------------------
+    EndReason endReason = EndReason::HostLost;
+    std::uint64_t lastHeartbeat = 0;
+    auto lastHeartbeatAt = std::chrono::steady_clock::now();
+    auto lastWaitingLogAt = lastHeartbeatAt;
+    bool everAttached = false;
+    int pollsSinceStatus = kPollsPerStatusLine;
 
     for (;;) {
         // Roster transitions first, so a removal is logged above the line whose count it
         // explains rather than below it.
         logRosterEvents(picture.drainEvents());
 
-        const PictureSnapshot snap = picture.snapshot();
-        const n8ro::sim::MessageBusPackedMetricsSnapshot metrics = packed.metricsSnapshot();
-
-        // Two independent loss surfaces, and reporting only the first is what let whole
-        // simulation frames go missing while this line said "drops=0" for four milestones.
-        //
-        //   decode  - MessageBusPacked: the message arrived and could not be turned into
-        //             values. A schema mismatch shows up here (CLAUDE.md).
-        //   deliver - IMessageBus: the message never arrived at all, because the bus
-        //             discarded it under its backpressure policy. Nothing upstream of the
-        //             decoder is visible to the decoder, so no amount of watching the first
-        //             group can reveal the second.
-        //
-        // Both are printed every second whether zero or not: a number that only appears when
-        // it is bad is a number nobody trusts.
-        const n8ro::core::IMessageBus::Statistics busStats = bus->getStatistics();
-        const std::uint64_t drops =
-            metrics.schemaHashDrops + metrics.decodeFailures + metrics.missingSchemaPassthrough;
-        const std::uint64_t busLoss = busStats.messagesDropped + busStats.droppedByBackpressure +
-                                      busStats.droppedByQueueOverflow +
-                                      busStats.droppedByRateLimiting;
-
-        // Every value on the engine line is a local read on the client; nothing here
-        // touches the bus.
-        const std::string engineState = client->getEngineState();
-        const std::optional<std::string> scenario = client->getLoadedScenarioName();
-
-        if (scenarioName.empty() && scenario && !scenario->empty()) {
-            scenarioName = *scenario;
+        const auto now = std::chrono::steady_clock::now();
+        const std::uint64_t beats = heartbeat.load(std::memory_order_relaxed);
+        if (beats != lastHeartbeat) {
+            lastHeartbeat = beats;
+            lastHeartbeatAt = now;
+            if (!everAttached) {
+                everAttached = true;
+                N8RO_LOG_INFO(std::string("attached: the simulation host is publishing "
+                                          "engine state"),
+                              kCategory);
+            }
         }
 
-        std::printf(
-            "engine=%-12s frame=%-10llu simTime=%10.3f scenario=%-24s live=%-4zu names=%-4zu "
-            "samples=%llu drops=%llu(hash=%llu decode=%llu noschema=%llu)\n",
-            engineState.empty() ? "(none yet)" : engineState.c_str(),
-            static_cast<unsigned long long>(client->getFrameNumber()),
-            client->getSimulationTimeS(),
-            scenario && !scenario->empty() ? scenario->c_str() : "(none)", snap.liveCount,
-            snap.roster.size(), static_cast<unsigned long long>(snap.counters.samplesAccepted),
-            static_cast<unsigned long long>(drops),
-            static_cast<unsigned long long>(metrics.schemaHashDrops),
-            static_cast<unsigned long long>(metrics.decodeFailures),
-            static_cast<unsigned long long>(metrics.missingSchemaPassthrough));
-        std::printf("    removals=%-40s created=%llu deleted=%llu orphaned=%llu\n",
-                    formatCountsByName(snap.removalsByReason).c_str(),
-                    static_cast<unsigned long long>(snap.counters.entityCreated),
-                    static_cast<unsigned long long>(snap.counters.entityDeleted),
-                    static_cast<unsigned long long>(snap.counters.samplesOrphaned));
-        std::printf("    busLoss=%llu(dropped=%llu backpressure=%llu queueOverflow=%llu "
-                    "rateLimit=%llu)\n",
-                    static_cast<unsigned long long>(busLoss),
-                    static_cast<unsigned long long>(busStats.messagesDropped),
-                    static_cast<unsigned long long>(busStats.droppedByBackpressure),
-                    static_cast<unsigned long long>(busStats.droppedByQueueOverflow),
-                    static_cast<unsigned long long>(busStats.droppedByRateLimiting));
-        if (capturing) {
-            std::printf("    capture=%zu/%zu records notRecorded=%llu\n", buffer.size(),
-                        options.captureMaxSamples,
-                        static_cast<unsigned long long>(buffer.notRecorded()));
-        }
-
-        // The remaining counters are surprises. They stay off the steady-state line so that
-        // a non-zero value reads as the event it is.
-        if (snap.counters.samplesUnnamed != 0 || snap.counters.samplesUntimed != 0 ||
-            snap.counters.deleteOfUnknownEntity != 0 || snap.counters.eventsUnnamed != 0 ||
-            snap.counters.eventsWithoutEntity != 0 || snap.counters.eventQueueDropped != 0) {
-            std::printf("    unexpected: unnamedSamples=%llu untimedSamples=%llu "
-                        "deleteOfUnknown=%llu unnamedEvents=%llu eventsWithoutEntity=%llu "
-                        "eventLogDropped=%llu\n",
-                        static_cast<unsigned long long>(snap.counters.samplesUnnamed),
-                        static_cast<unsigned long long>(snap.counters.samplesUntimed),
-                        static_cast<unsigned long long>(snap.counters.deleteOfUnknownEntity),
-                        static_cast<unsigned long long>(snap.counters.eventsUnnamed),
-                        static_cast<unsigned long long>(snap.counters.eventsWithoutEntity),
-                        static_cast<unsigned long long>(snap.counters.eventQueueDropped));
-        }
-        if (!snap.unhandledEventNames.empty()) {
-            std::printf("    otherEntityEvents=%s\n",
-                        formatCountsByName(snap.unhandledEventNames).c_str());
-        }
-        std::fflush(stdout);
-
-        if (capturing && buffer.atCapacity()) {
-            // Recording stops here. Unsubscribe and stop the pump *before* touching the
-            // buffer, so phase 2 reads a structure with no writer left to race with.
-            static_cast<void>(packed.unsubscribe(stateSubscription));
-            static_cast<void>(packed.unsubscribe(eventSubscription));
-            client->stopMessagePump();
-            N8RO_LOG_INFO(std::string("capture budget reached at ") +
-                              std::to_string(buffer.size()) +
-                              " samples; unsubscribed and stopped the pump, writing the file",
+        if (everAttached) {
+            const double silentS = std::chrono::duration<double>(now - lastHeartbeatAt).count();
+            if (silentS > kHostLossWindowS) {
+                N8RO_LOG_WARNING(std::string("host lost: no engine-state message for ") +
+                                     std::to_string(silentS) + " s (window " +
+                                     std::to_string(kHostLossWindowS) +
+                                     " s). Closing the capture with end_reason=host_lost",
+                                 kCategory);
+                endReason = EndReason::HostLost;
+                break;
+            }
+        } else if (now - lastWaitingLogAt >= kWaitingLogInterval) {
+            // BTB-CX-2's bounded, logged wait. Nothing to retry - the client is constructed
+            // and subscribed, and the bus delivers as soon as a host publishes.
+            lastWaitingLogAt = now;
+            N8RO_LOG_INFO(std::string("waiting for a simulation host on ") +
+                              resolution.engineState.topic +
+                              "; the bridge is subscribed and will begin capturing the moment "
+                              "one publishes",
                           kCategory);
-
-            // Taken once, after the pump has stopped, so the header and the trailer describe
-            // the same instant and nothing can change under them.
-            const PictureSnapshot finalSnapshot = picture.snapshot();
-            const n8ro::sim::MessageBusPackedMetricsSnapshot finalMetrics = packed.metricsSnapshot();
-
-            capture::HeaderInfo header;
-            header.platform.engineConfig = options.config;
-            header.platform.modelPath = options.modelPath;
-            header.platform.schemaFile = options.schemaFile;
-            header.platform.schemaVersion = model.getSchemaVersion();
-            header.platform.runtimeVersion = std::string(n8ro::core::getN8roVersion());
-            header.subscription.topic = resolution.entityState.topic;
-            header.subscription.backpressurePolicy =
-                backpressurePolicyName(subscriptionOptions.backpressurePolicy);
-            header.subscription.queueSize =
-                static_cast<std::uint64_t>(subscriptionOptions.queueSize);
-            // Derived from what happened, not from what a status tick happened to see. A
-            // bridge present at scenario load witnesses the entity_created burst first, so
-            // its first accepted sample arrives with no orphans behind it; one that attached
-            // after the burst sees nothing but orphans until the engine next creates
-            // something. Same answer on every run, no clock involved (BTB-CAP-3).
-            //
-            // The fallback covers the case where nothing was ever accepted: a bridge that
-            // attached mid-run to a scenario that then created no entity has orphans and no
-            // samples, and is still mid-run.
-            header.attachedMidRun =
-                finalSnapshot.counters.samplesAccepted > 0
-                    ? finalSnapshot.counters.orphansBeforeFirstAccepted > 0
-                    : finalSnapshot.counters.samplesOrphaned > 0;
-            // One entry, because one message type appears as a sample record's `message`.
-            // The entity-event schema is not here: no record in the file is a verbatim dump
-            // of one, so no reader ever needs it to interpret a line.
-            header.schemas.push_back(resolution.entityState);
-
-            // The budget is a configured bound on capture size, so `size_limit` is the
-            // reason the format already has for it. It is the only end_reason an M4 run can
-            // produce: `shutdown` needs signal handling (M7) and `host_lost` needs loss
-            // detection (M5).
-            const bool written =
-                writeCaptureFile(options.captureOut, header, scenarioName, buffer,
-                                 resolution.entityState, finalSnapshot, finalMetrics,
-                                 bus->getStatistics(), "size_limit");
-            return written ? kExitOk : kExitCaptureWriteFailed;
         }
 
-        // While capturing, wait on the buffer rather than sleeping blind: the budget is what
-        // ends the run, and waking a status tick after it was reached would let the run keep
-        // publishing into a subscription we have already decided to cancel. The one-second
-        // timeout keeps the report cadence identical either way. Without a capture there is
-        // nothing to wait on - and the buffer's capacity is zero, which would read as
-        // permanently full - so that path still sleeps.
-        if (capturing) {
-            static_cast<void>(buffer.waitUntilFull(std::chrono::seconds(1)));
-        } else {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (writer.budgetReached()) {
+            N8RO_LOG_INFO(std::string("record budget reached at ") +
+                              std::to_string(writer.samplesWritten()) +
+                              " samples; closing the capture with end_reason=size_limit",
+                          kCategory);
+            endReason = EndReason::SizeLimit;
+            break;
         }
+
+        if (writer.failed()) {
+            N8RO_LOG_ERROR(std::string("the writer reported a failure; stopping"), kCategory);
+            endReason = EndReason::Shutdown;
+            break;
+        }
+
+        if (++pollsSinceStatus >= kPollsPerStatusLine) {
+            pollsSinceStatus = 0;
+            const PictureSnapshot snap = picture.snapshot();
+            const n8ro::sim::MessageBusPackedMetricsSnapshot metrics = packed.metricsSnapshot();
+            const n8ro::core::IMessageBus::Statistics busStats = bus->getStatistics();
+            const QueueCounters qc = queue.counters();
+
+            const std::string engineState = client->getEngineState();
+            const std::optional<std::string> scenario = client->getLoadedScenarioName();
+
+            std::printf(
+                "engine=%-12s frame=%-10llu simTime=%10.3f scenario=%-24s live=%-4zu names=%-4zu "
+                "samples=%llu orphaned=%llu\n",
+                engineState.empty() ? "(none yet)" : engineState.c_str(),
+                static_cast<unsigned long long>(client->getFrameNumber()),
+                client->getSimulationTimeS(),
+                scenario && !scenario->empty() ? scenario->c_str() : "(none)", snap.liveCount,
+                snap.roster.size(), static_cast<unsigned long long>(snap.counters.samplesAccepted),
+                static_cast<unsigned long long>(snap.counters.samplesOrphaned));
+            std::printf("    capture=%llu records (seg=%llu samples=%llu add=%llu rm=%llu) "
+                        "queue=%zu/%zu drops=%llu/%llu\n",
+                        static_cast<unsigned long long>(writer.recordsWritten()),
+                        static_cast<unsigned long long>(writer.counts().segments),
+                        static_cast<unsigned long long>(writer.samplesWritten()),
+                        static_cast<unsigned long long>(writer.counts().entitiesAdded),
+                        static_cast<unsigned long long>(writer.counts().entitiesRemoved),
+                        queue.depth(), queue.hardCapacity(),
+                        static_cast<unsigned long long>(qc.samplesDropped),
+                        static_cast<unsigned long long>(qc.structuralDropped));
+            std::printf("    busLoss=%llu(bp=%llu qo=%llu rl=%llu) decode=%llu(hash=%llu "
+                        "fail=%llu noschema=%llu)\n",
+                        static_cast<unsigned long long>(busStats.messagesDropped),
+                        static_cast<unsigned long long>(busStats.droppedByBackpressure),
+                        static_cast<unsigned long long>(busStats.droppedByQueueOverflow),
+                        static_cast<unsigned long long>(busStats.droppedByRateLimiting),
+                        static_cast<unsigned long long>(metrics.schemaHashDrops +
+                                                        metrics.decodeFailures +
+                                                        metrics.missingSchemaPassthrough),
+                        static_cast<unsigned long long>(metrics.schemaHashDrops),
+                        static_cast<unsigned long long>(metrics.decodeFailures),
+                        static_cast<unsigned long long>(metrics.missingSchemaPassthrough));
+            std::fflush(stdout);
+        }
+
+        std::this_thread::sleep_for(kPollInterval);
     }
+
+    // --- teardown -----------------------------------------------------------------------
+    //
+    // Unsubscribe, stop the pump, close the queue, join the writer, then write the trailer.
+    // In that order: nothing may be enqueued after close(), and nothing may be written after
+    // the writer thread has returned.
+    static_cast<void>(packed.unsubscribe(stateSubscription));
+    static_cast<void>(packed.unsubscribe(eventSubscription));
+    static_cast<void>(packed.unsubscribe(scenarioSubscription));
+    static_cast<void>(packed.unsubscribe(heartbeatSubscription));
+    client->stopMessagePump();
+    queue.close();
+    writerThread.join();
+
+    // Taken once, after the pump has stopped, so the trailer describes one instant and
+    // nothing can change under it.
+    const PictureSnapshot finalSnapshot = picture.snapshot();
+    const n8ro::sim::MessageBusPackedMetricsSnapshot finalMetrics = packed.metricsSnapshot();
+    const n8ro::core::IMessageBus::Statistics finalBusStats = bus->getStatistics();
+    const QueueCounters finalQueue = queue.counters();
+
+    capture::TrailerDrops drops;
+    // The queue's genuine overflow, at last. M4 left this structurally 0 because the buffer
+    // filling *was* the end of recording; from M5 it is what BTB-BP-4 asked for.
+    drops.samplesNotRecorded = finalQueue.samplesDropped;
+    drops.eventsNotRecorded = finalQueue.structuralDropped + writer.counts().stagedDropped;
+    drops.samplesOrphaned = finalSnapshot.counters.samplesOrphaned;
+    drops.samplesUnnamed = finalSnapshot.counters.samplesUnnamed;
+    drops.samplesUntimed = finalSnapshot.counters.samplesUntimed;
+
+    capture::TrailerBusMetrics busMetrics;
+    busMetrics.schemaHashDrops = finalMetrics.schemaHashDrops;
+    busMetrics.messageIdDrops = finalMetrics.messageIdDrops;
+    busMetrics.decodeFailures = finalMetrics.decodeFailures;
+    busMetrics.missingSchemaPassthrough = finalMetrics.missingSchemaPassthrough;
+    busMetrics.legacyPayloadPassthrough = finalMetrics.legacyPayloadPassthrough;
+    busMetrics.messagesDropped = finalBusStats.messagesDropped;
+    busMetrics.droppedByBackpressure = finalBusStats.droppedByBackpressure;
+    busMetrics.droppedByQueueOverflow = finalBusStats.droppedByQueueOverflow;
+    busMetrics.droppedByRateLimiting = finalBusStats.droppedByRateLimiting;
+
+    const bool written = writer.finish(endReason, drops, busMetrics);
+
+    logRosterEvents(picture.drainEvents());
+    printRunSummary(writer, finalSnapshot, finalQueue, queue, stateTiming, eventTiming,
+                    finalMetrics, finalBusStats, endReason);
+
+    if (!written) {
+        return kExitCaptureWriteFailed;
+    }
+    // Host loss is an expected, handled state, not an error: the capture is complete and
+    // closed, and BTB-CX-3 asks for a clean exit rather than a diagnostic one.
+    return kExitOk;
 }
 
 }  // namespace

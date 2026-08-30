@@ -36,6 +36,13 @@ const std::vector<std::string>& notesDerivedFieldOrder() {
 constexpr const char* kRequiredNameField = "scenarioEntityName";
 constexpr const char* kRequiredTimeField = "simulationTime";
 
+// The fields an engine-state message must declare to be usable as a heartbeat. Nothing reads
+// their values - arrival is the whole signal - but a message that declares neither is not the
+// engine-state message, and keying host-loss detection on the wrong topic would produce a
+// bridge that looks healthy and never notices a dead host.
+constexpr const char* kEngineStateField = "state";
+constexpr const char* kEngineFrameField = "frameNumber";
+
 [[nodiscard]] bool schemaDeclares(const n8ro::sim::MessageSchema& schema, const char* field) {
     return std::any_of(schema.fields.begin(), schema.fields.end(),
                        [field](const n8ro::sim::FieldSchema& f) { return f.name == field; });
@@ -176,6 +183,7 @@ Resolution resolveTopics(
     n8ro::schema::DbModel& model,
     n8ro::sim::MessageBusPackedSchemaRegistry& registry,
     const std::string& entityStateMessageName,
+    const std::string& engineStateMessageName,
     const std::string& modelPath,
     const std::string& schemaFile) {
     Resolution result;
@@ -326,6 +334,91 @@ Resolution resolveTopics(
                       result.entityEvent.messageName + " - not from a literal (BTB-EP-1)",
                   kCategory);
     N8RO_LOG_INFO(std::string("entity-event field order: ") + fieldListToString(result.entityEvent),
+                  kCategory);
+
+    // --- scenario events (M5, BTB-CX-4) -------------------------------------------
+    // The segment source. Same two-hop chain as the entity events, and for the same reason:
+    // EventConfigData::topic names a Message instance, not a topic string.
+    const std::optional<n8ro::sim::MessageSchema> loadedSchema =
+        resolveEventTopic(*vocabulary, registry, n8ro::sim::kEventScenarioLoaded);
+    const std::optional<n8ro::sim::MessageSchema> unloadedSchema =
+        resolveEventTopic(*vocabulary, registry, n8ro::sim::kEventScenarioUnloaded);
+    if (!loadedSchema || !unloadedSchema) {
+        N8RO_LOG_ERROR(std::string("the scenario-event topic could not be resolved, so scenario "
+                                   "load and reload could not be told apart and two runs would "
+                                   "be silently mixed in one capture (BTB-CX-4)"),
+                       kCategory);
+        result.exitCode = kExitScenarioEventUnresolved;
+        return result;
+    }
+    if (loadedSchema->topic != unloadedSchema->topic) {
+        N8RO_LOG_ERROR(std::string("scenario_loaded travels on ") + loadedSchema->topic +
+                           " but scenario_unloaded on " + unloadedSchema->topic +
+                           "; one subscription cannot see both halves of a segment boundary",
+                       kCategory);
+        result.exitCode = kExitScenarioEventUnresolved;
+        return result;
+    }
+    result.scenarioEvent = *loadedSchema;
+
+    N8RO_LOG_INFO(std::string("resolved scenario-event topic ") + result.scenarioEvent.topic +
+                      " from the database pairing for " +
+                      std::string(n8ro::sim::kEventScenarioLoaded) + " / " +
+                      std::string(n8ro::sim::kEventScenarioUnloaded) + " via message " +
+                      result.scenarioEvent.messageName + " - not from a literal (BTB-EP-1)",
+                  kCategory);
+
+    // --- engine state (M5, BTB-CX-3) ----------------------------------------------
+    // The heartbeat. Its silence is what host loss looks like; entity-state silence is not,
+    // because entity state stops legitimately at every unload. Measured across two full
+    // cycles: engine state publishes at ~19.5/s through idle frames, largest observed gap
+    // 548 ms at scenario load (docs/decisions-m5-m7.md, D-3).
+    const n8ro::sim::MessageSchema* engineSchema = registry.getByName(engineStateMessageName);
+    if (engineSchema == nullptr || engineSchema->topic.empty()) {
+        N8RO_LOG_ERROR(std::string("no packed schema registered under message name ") +
+                           engineStateMessageName +
+                           ", or it declares an empty topic; the engine-state heartbeat cannot "
+                           "be resolved and host loss could not be detected. A bridge that "
+                           "cannot detect host loss blocks indefinitely on a dead bus, which is "
+                           "the failure BTB-CX-3 exists to forbid - refusing to run rather than "
+                           "running without it. Override the name with --engine-state-message",
+                       kCategory);
+        N8RO_LOG_ERROR(std::string("registry holds: ") + sampleRegisteredNames(registry, 12),
+                       kCategory);
+        result.exitCode = kExitEngineStateUnresolved;
+        return result;
+    }
+
+    // The same structural guard the entity-state chain uses. A plausible neighbouring name
+    // would subscribe successfully and heartbeat on the wrong traffic, which is worse than
+    // not resolving at all: the failure would look like a working bridge.
+    const bool hasState = schemaDeclares(*engineSchema, kEngineStateField);
+    const bool hasFrame = schemaDeclares(*engineSchema, kEngineFrameField);
+    if (!hasState || !hasFrame) {
+        std::string missing;
+        if (!hasState) {
+            missing += std::string(" missing ") + kEngineStateField;
+        }
+        if (!hasFrame) {
+            missing += std::string(" missing ") + kEngineFrameField;
+        }
+        N8RO_LOG_ERROR(std::string("message ") + engineStateMessageName + " resolves to topic " +
+                           engineSchema->topic +
+                           " but does not declare the fields an engine-state heartbeat needs:" +
+                           missing +
+                           ". This is not the engine-state message; refusing to key host-loss "
+                           "detection on a topic that means something else",
+                       kCategory);
+        N8RO_LOG_ERROR(std::string("  declared fields: ") + fieldListToString(*engineSchema),
+                       kCategory);
+        result.exitCode = kExitEngineStateUnresolved;
+        return result;
+    }
+    result.engineState = *engineSchema;
+
+    N8RO_LOG_INFO(std::string("resolved engine-state topic ") + result.engineState.topic +
+                      " from message " + result.engineState.messageName +
+                      " via the registry - the host-loss heartbeat (BTB-CX-3)",
                   kCategory);
 
     result.ok = true;

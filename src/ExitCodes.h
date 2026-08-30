@@ -21,5 +21,8 @@ constexpr int kExitEntityEventUnresolved = 10;   // entity-event topic unresolva
 constexpr int kExitSubscribeFailed = 11;         // subscribeByTopic() returned no subscription
 constexpr int kExitNoMessageBus = 12;            // client exposed no message bus
 constexpr int kExitCaptureWriteFailed = 13;      // the capture file could not be opened or written
+constexpr int kExitScenarioEventUnresolved = 14; // BTB-CX-4: no segment boundaries without it
+constexpr int kExitEngineStateUnresolved = 15;   // BTB-CX-3: no host-loss detection without it
+constexpr int kExitOutDirInvalid = 16;           // --out-dir missing, not a directory, or unwritable
 
 }  // namespace n8ro::bridge

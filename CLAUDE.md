@@ -82,7 +82,7 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
-**M1, M2 and M3 are delivered. M4 is next.**
+**M1 through M5 are delivered. M6 is next.**
 
 **OQ-1 is decided: we own the entity picture permanently** (PRD rev 3, ADR-1). It is not a
 shim. It has tests in `tests/entity-picture/` that need no simulator — keep them passing, and
@@ -91,11 +91,32 @@ owning the layer is a reason to test it, never a reason to start modelling the p
 
 Build only the current milestone. Ask before adding anything outside it.
 
-M4 inherits two things from M3 worth knowing before starting: field order comes from the
-runtime `MessageSchema::fields` (which disagrees with both hand-derivations in `notes.md` —
-the schema wins), and `entity_add` / `entity_remove` / `sample` records each carry an
-`occupancy` ordinal alongside the entity name (PRD ADR-6). In the code that ordinal is
-`Occupancy::generation`; in the capture it is spelled `occupancy`.
+Field order comes from the runtime `MessageSchema::fields` (which disagrees with both
+hand-derivations in `notes.md` — the schema wins), and `entity_add` / `entity_remove` /
+`sample` records each carry an `occupancy` ordinal alongside the entity name (PRD ADR-6). In
+the code that ordinal is `Occupancy::generation`; in the capture it is spelled `occupancy`.
+
+**Every decision taken during M5–M7 is recorded in `docs/decisions-m5-m7.md`** — read it
+before revisiting one, because most of them turned on a measurement rather than a preference.
+
+M6 inherits these from M5, all measured rather than assumed:
+
+- **A single run produces two segments**, because the engine's stop path unloads and reloads.
+  Segment 1 is the teardown reload and holds the re-created roster at occupancy 2. Not a bug.
+- **The `entity_created` burst is published *before* the `scenario_loaded` that announces it**,
+  at first load and at every reload. The writer stages roster records that arrive with no open
+  segment and flushes them into the segment that opens next; deleting that staging area
+  produces a malformed capture.
+- **Host loss is `sim/engine/state` silence for 3.0 s**, derived from a measured 548 ms worst
+  observed gap. Entity-state silence is *not* a host-loss signal — it happens at every unload.
+- **Both backpressure boundaries are already explicit**: `FIFO_DROP` / 1024 at the bus,
+  `drop_newest` / 8192 + 1024 reserved internally. `BLOCK` is rejected at both, and
+  `docs/capture-format-v1.md` §14 promises consumers in writing that this producer never
+  blocks the bus. OQ-4 is still open — M6's overload run is what resolves it.
+- **Handler cost is measured**: p50 ≤ 1 µs, p95 ≤ 5 µs, p99 ≤ 10 µs over 132 150 invocations,
+  against targets of 20 / 100 / 500 µs. `src/HandlerTiming.h` is the instrument.
+- The internal-queue drop counters are the one deliberately scheduler-dependent thing in the
+  file. They are zero whenever a byte comparison is meaningful; §14 says so.
 
 ## Conventions
 

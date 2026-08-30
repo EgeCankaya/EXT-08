@@ -204,13 +204,13 @@ std::string writeSegmentClose(double simTimeS, std::uint64_t segment, const std:
     return out;
 }
 
-std::string writeSample(const CapturedSample& sample, std::uint64_t segment,
+std::string writeSample(const CaptureRecord& sample, std::uint64_t segment,
                         const n8ro::sim::MessageSchema& schema) {
     std::string out;
     openRecord(out, "sample");
-    appendDoubleMember(out, "sim_time_s", sample.simulationTimeS);
+    appendDoubleMember(out, "sim_time_s", sample.simTimeS);
     appendUintMember(out, "segment", segment);
-    appendStringMember(out, "entity", sample.scenarioEntityName);
+    appendStringMember(out, "entity", sample.subject);
     appendUintMember(out, "occupancy", sample.occupancy);
     appendStringMember(out, "message", schema.messageName);
 
@@ -231,6 +231,34 @@ std::string writeSample(const CapturedSample& sample, std::uint64_t segment,
     }
     out.push_back('}');
 
+    out.push_back('}');
+    return out;
+}
+
+std::string writeEntityAdd(double simTimeS, std::uint64_t segment, const std::string& entity,
+                           std::uint64_t occupancy) {
+    std::string out;
+    openRecord(out, "entity_add");
+    appendDoubleMember(out, "sim_time_s", simTimeS);
+    appendUintMember(out, "segment", segment);
+    appendStringMember(out, "entity", entity);
+    appendUintMember(out, "occupancy", occupancy);
+    out.push_back('}');
+    return out;
+}
+
+std::string writeEntityRemove(double simTimeS, std::uint64_t segment, const std::string& entity,
+                              std::uint64_t occupancy, const std::string& reason) {
+    std::string out;
+    openRecord(out, "entity_remove");
+    appendDoubleMember(out, "sim_time_s", simTimeS);
+    appendUintMember(out, "segment", segment);
+    appendStringMember(out, "entity", entity);
+    appendUintMember(out, "occupancy", occupancy);
+    // Verbatim. The format spec calls this vocabulary deliberately open (section 9) - every
+    // other vocabulary in the format is closed, and this one is not, because a reason we have
+    // never seen is exactly the thing worth keeping.
+    appendStringMember(out, "reason", reason);
     out.push_back('}');
     return out;
 }
@@ -257,6 +285,9 @@ std::string writeTrailer(double simTimeS, const std::string& endReason,
     appendKey(out, "drops");
     out.push_back('{');
     appendUintMember(out, "samples_not_recorded", drops.samplesNotRecorded);
+    // Added at producer 0.5.0 alongside the writer queue. Roster and segment records the
+    // queue could not take; see docs/capture-format-v1.md section 11.
+    appendUintMember(out, "events_not_recorded", drops.eventsNotRecorded);
     appendUintMember(out, "samples_orphaned", drops.samplesOrphaned);
     appendUintMember(out, "samples_unnamed", drops.samplesUnnamed);
     appendUintMember(out, "samples_untimed", drops.samplesUntimed);
@@ -282,16 +313,40 @@ std::string writeTrailer(double simTimeS, const std::string& endReason,
     return out;
 }
 
-std::vector<std::string> neverPublishedFields(const n8ro::sim::MessageSchema& schema,
-                                              const std::vector<CapturedSample>& samples) {
-    std::vector<std::string> absent;
+FieldPresence::FieldPresence(const n8ro::sim::MessageSchema& schema) {
+    names_.reserve(schema.fields.size());
     for (const n8ro::sim::FieldSchema& field : schema.fields) {
-        const bool everSeen =
-            std::any_of(samples.begin(), samples.end(), [&field](const CapturedSample& sample) {
-                return sample.values.find(field.name) != sample.values.end();
-            });
-        if (!everSeen) {
-            absent.push_back(field.name);
+        names_.push_back(field.name);   // schema order, so the report reads in schema order
+    }
+    seen_.assign(names_.size(), false);
+    remaining_ = names_.size();
+}
+
+void FieldPresence::note(const n8ro::sim::StreamValueMap& values) {
+    if (remaining_ == 0) {
+        // Every declared field has been seen at least once. Nothing a later sample can carry
+        // changes the answer, so stop paying for the lookups - this runs once per sample on
+        // the writer thread at 818/s and settles within the first frame of a normal run.
+        return;
+    }
+    for (std::size_t i = 0; i < names_.size(); ++i) {
+        if (seen_[i]) {
+            continue;
+        }
+        // A lookup, never an iteration: StreamValueMap is an unordered_map and iterating it
+        // anywhere near the capture path is the determinism leak BTB-CAP-3 names.
+        if (values.find(names_[i]) != values.end()) {
+            seen_[i] = true;
+            --remaining_;
+        }
+    }
+}
+
+std::vector<std::string> FieldPresence::neverPublished() const {
+    std::vector<std::string> absent;
+    for (std::size_t i = 0; i < names_.size(); ++i) {
+        if (!seen_[i]) {
+            absent.push_back(names_[i]);
         }
     }
     return absent;

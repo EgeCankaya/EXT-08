@@ -1143,3 +1143,238 @@ header; it needs the capture format, which it has.
   anything you saw that you could not explain. The last part is the one to write carefully."*
   The M4 follow-up section above is that page, and the 19 unexplained samples (R7) are that
   last part.
+
+## M5 — The output path and the lifecycle
+
+The milestone where the capture stops being a snapshot dumped at the end and becomes a stream
+written as it happens. Almost everything below came from watching the bus with a throwaway
+probe *before* writing any of it, which was the right order: two of these findings would have
+produced a malformed capture if they had been discovered afterwards.
+
+### The finding that shaped the whole design: creation precedes the load event
+
+The PRD flagged "scenario reload timing" as a rabbit hole and said what to do if the ordering
+was unreliable — key the boundary on the load event. The ordering turned out to be perfectly
+reliable, and *still* wrong for the obvious design, in a way nobody had predicted.
+
+A probe subscribed to all four topics with one global arrival counter, so the numbers below
+are true interleaving as delivered to a subscriber, not inference from timestamps.
+
+**Bring-up:**
+
+```
+seq 1        engine_initialized   uninitialized->initialized
+seq 6        scenario_unloaded    ""                          <- empty name: bring-up noise
+seq 7..48    entity_created x 42                              <- the burst
+seq 49       scenario_loaded      "Atacama Air Defense"
+seq 62       engine_started       idle->running               (11 samples already through)
+```
+
+**Teardown, at the end of the same run:**
+
+```
+seq 136033   engine_stopped       running->idle    simT=200.05
+seq 136034..136052  entity_deleted x 19   reason=scenario_unload   simT=0.0
+seq 136053   scenario_unloaded    "Atacama Air Defense"            simT=0.0
+seq 136054..136095  entity_created x 42                            simT=0.0
+seq 136096   scenario_loaded      "Atacama Air Defense"            simT=0.0
+             then 378 entity-state samples, all simT=0.0
+```
+
+**`scenario_loaded` is a completion announcement, not a start.** The engine materialises the
+entities first and says so afterwards. That is uniform — first load and every reload.
+
+The consequence is sharp. Close a segment on the unload and open one on the load, with nothing
+in between, and 42 `entity_add` records fall outside any segment — a file the format spec's own
+§7 calls malformed, produced by a producer that was following the requirement literally.
+
+**Resolved with a staging area.** The close still keys on `scenario_unloaded`; the open still
+keys on `scenario_loaded`; roster records arriving between them wait and flush into the segment
+that opens next. A `sample` never waits — one arriving with no segment open forces the segment
+open immediately, which is also what bounds the staging area in practice: it can only ever hold
+one creation burst, which is entity-count sized. The measured high-water mark on the reference
+run was **42**, against a bound of 8192.
+
+The half of the question the PRD actually asked has a clean answer too: **no sample of an
+outgoing run ever arrives after that run's `scenario_unloaded`.** The sample count was
+identical at `engine_stopped`, at `scenario_unloaded` and at `scenario_loaded` — 131 861 in
+all three. That direction of the boundary is exact.
+
+### An ordinary run contains two segments
+
+Because the engine's stop path unloads *and reloads*, a single run of one scenario produces:
+
+| segment | what it is | samples | `sim_time_s` range | closed by |
+|---:|---|---:|---|---|
+| 0 | the run | 131 772 | 0.05 → 200.05 | `scenario_unloaded` |
+| 1 | the teardown reload | 378 | 0.0 → 0.0 | `host_lost` |
+
+This is not a producer artifact and it is not a defect — it is what the bus published. It is
+recorded faithfully and `docs/capture-format-v1.md` §16 now warns a reader about it, because
+"one run, one segment" is the natural assumption and it is wrong here.
+
+It also means the reload acceptance criterion is met by an ordinary run. No operator reload,
+and no scenario-command harness, was needed to demonstrate two segments — which was a real
+saving, because driving a reload would have meant publishing on `sim/scenario/command`, and the
+control direction is out of scope for v1.
+
+### ADR-6 proved end-to-end, in a real file, at last
+
+M4 could not show a second occupancy: its budget stopped recording at t ≈ 130 s and the
+teardown burst is at t ≈ 200 s, and there were no `entity_add` records to bracket it with
+anyway. Both gaps are closed. From the reference capture:
+
+```
+line 15       entity_add     RedUAV_N_01  occupancy=1  sim_time_s=0                    segment=0
+              ... 2956 samples at occupancy 1 ...
+line 110475   entity_remove  RedUAV_N_01  occupancy=1  sim_time_s=149.44999999999973   segment=0
+                                                       reason="destroyed"
+line 131969   entity_add     RedUAV_N_01  occupancy=2  sim_time_s=0                    segment=1
+              ... 9 samples at occupancy 2 ...
+```
+
+A name **killed** mid-run and re-created at teardown, each tenure bracketed by its own records,
+with samples under both. Across the file: 90 distinct names, **132 distinct (name, occupancy)
+pairs**, 42 names reaching occupancy 2, 378 samples carried under a second occupancy. The
+conformance reader — which enforces "no sample after its own occupancy's `entity_remove`"
+independently, from the spec alone — reports CONFORMS.
+
+### The heartbeat, and a guess that measurement corrected
+
+BTB-CX-3 wanted a "bounded, documented" host-loss window and the PRD deferred the number to
+M5. It is **3.0 s**, and it is derived rather than picked.
+
+`sim/engine/state` is the signal, not `sim/entity/state`. Entity state goes silent legitimately
+at every unload, so its silence means nothing; engine state publishes **through idle frames** —
+4 017 messages across a 200 s run that was only running for part of it — so *its* silence is
+evidence.
+
+| | `Atacama Air Defense` (42 entities) | `Outback Kamikaze Swarm` (126) |
+|---|---:|---:|
+| engine-state messages | 4 017 | 617 |
+| nominal period | ~51 ms (19.5/s) | ~51 ms |
+| **largest inter-arrival gap** | **548 ms** at scenario load | 408 ms at scenario load |
+| gaps over 150 ms, whole run | 2 | 7 (mid-run jitter to 305 ms) |
+
+**The load stall does not scale with entity count.** The 126-entity scenario stalled *less* at
+load than the 42-entity one. That was worth measuring rather than reasoning about: a window
+derived by scaling the reference stall by entity count would have been three times too
+generous for no reason. 3.0 s is 5.5× the largest gap seen anywhere and ~59 heartbeat periods.
+
+Also worth recording: `SubscriptionOptions` carries an `activityThresholdS` that defaults to
+**30 s**, and `Statistics::SubscriberActivity` exposes `timeSinceLastActivityS` and `isActive`
+per subscription. That is the platform's own liveness notion and it was tempting to just use
+it — but 30 s is two orders of magnitude too slow for a campaign that runs 20+ times
+unattended, and the counter is per-subscription rather than per-host. Counting arrivals
+ourselves is three lines and answers the actual question.
+
+**Measured in the acceptance run:** the simulator was hard-killed with `taskkill /F` mid-run,
+and the bridge declared host loss at **3.0075 s**, closed segment 0 with `reason: "host_lost"`
+at the last real simulation time (33.4 s — no clock reset involved, because the engine never
+got to publish one), wrote the trailer, closed the file and exited 0. The capture conforms.
+
+### The handler cost, finally measured
+
+BTB-BP-1 has always required handler time to be "bounded and **measured**", and the PRD's own
+quality-gate notes flagged the p95 target as an unvalidated guess with the suggestion to
+instrument it at M5 — "when the handler finally has a writer to hand off to and the number
+means something". It does now:
+
+```
+entity-state  n=132150  p50<=1us  p95<=5us  p99<=10us  max=160us
+entity-event  n=222     p50<=5us  p95<=10us p99<=20us  max=22us
+```
+
+against targets of p50 < 20 µs, p95 < 100 µs, p99 < 500 µs. **Roughly twenty times inside the
+p95 target.** The handler does a map lookup, a roster update, a `StreamValueMap` copy and a
+deque push, and that is genuinely all it does. The 160 µs maximum is a single outlier and is
+still comfortably inside the p99 target.
+
+Reported from a log-spaced histogram of two `steady_clock` reads per message, so percentiles
+are upper bounds of a bucket rather than interpolated values — a histogram does not hold the
+precision that interpolating would imply.
+
+### Overload, and the reserve earning its keep
+
+`--queue-size 4` on the reference scenario, deliberately absurd:
+
+```
+writer queue samplesDropped=2520 eventsDropped=0  (capacity 4+1024, policy drop_newest)
+records 32149 written (segments=2 samples=32009 entity_add=88 entity_remove=46)
+trailer drops {"samples_not_recorded":2520,"events_not_recorded":0,...}
+```
+
+**2 520 samples lost and not one roster or segment record.** The queue reserves 1024 slots that
+only structural records may use, precisely so overload costs data and never structure — the
+reasoning being that a lost sample loses a data point, while a lost `entity_created` orphans
+every subsequent sample for that name and turns a bounded loss into an unbounded one. It was
+an argument when it was written; it is a measurement now. The capture still contains two
+correct segments and conforms.
+
+This is also the first capture in which `drops.samples_not_recorded` carries a real number.
+M4 made it structurally `0` on purpose — the buffer filling *was* the end of recording — and
+reserved the field for exactly this. The name and meaning carried over unchanged.
+
+### Attaching late, and a consequence that was not obvious
+
+Bridge started **19 s after** the simulator, 60 s run:
+
+```
+attached_mid_run  true
+picture  orphaned=33971  deleteOfUnknown=42
+records  1138 written (segments=2 samples=1084 entity_add=45 entity_remove=3)
+```
+
+`attached_mid_run` is `true` and the orphan count is enormous, which is the signature M3
+measured and M4 made causal rather than clock-derived. Started before the simulator, the same
+build reports `false` and `samples_orphaned: 0`. Both orders work with no operator
+intervention (BTB-CX-2).
+
+The consequence worth writing down: **45 `entity_add` records but only 3 `entity_remove`.** The
+teardown publishes `entity_deleted` for all 42 entities the late bridge never saw created, and
+those land in `deleteOfUnknownEntity` rather than becoming records. That is correct — emitting
+an `entity_remove` for an occupancy no `entity_add` ever opened would produce exactly the
+malformed file the conformance reader rejects — but it means **`entities_added` and
+`entities_removed` in a late-attached capture do not balance, and should not be expected to.**
+A reader that treats an imbalance as corruption would be wrong.
+
+### The clock-reset trap, now visible in a real file
+
+M1 predicted it, M3 quantified it, and M5 is where it lands in an artifact somebody else will
+read. In the reference capture:
+
+```
+segment_open   segment=0  sim_time_s=0                      <- correct, the clock IS zero at load
+   ... 131 772 samples, sim_time_s 0.05 .. 200.05000000001124 ...
+segment_close  segment=0  sim_time_s=0  reason=scenario_unloaded
+```
+
+**A segment whose samples ran to t = 200.05 is closed by a record stamped 0.0.** That is
+faithful — the engine reset the clock before publishing the unload, and ADR-3 says a record
+carries the time its cause carried, not a time the producer computed. Synthesising a
+plausible-looking value here would have been the recorder inventing data to spare the reader a
+surprise, which is the one thing a recorder must not do.
+
+So the surprise is documented instead. §5.1 of the format spec now states it for
+`segment_close` as well as `entity_remove`, and adds the rule that saves the reader an
+afternoon: **a segment's time extent is `[first sample, last sample]`, never
+`[segment_open, segment_close]`.** On a reloaded scenario both boundary records read `0.0`, so
+computing a duration from them gives zero for a run of any length.
+
+### Smaller things
+
+- **`FIFO_DROP` with queue 1024 lost nothing**, exactly as `KEEP_LATEST` with queue 100 lost
+  nothing at M3. Another OQ-4 data point at the reference load, and still not a resolution —
+  it is a measurement of headroom, and M6's overload is what will actually discriminate.
+- **The bring-up `scenario_unloaded` with an empty scenario name is real and arrives on every
+  run** — `unload noise ignored=1` in every summary. M1 predicted a naive implementation would
+  emit an unnamed segment from it; the producer ignores an unload with an empty name outright.
+- **`sim_time_s` is written as the JSON token `0`, not `0.0`,** for every teardown record.
+  Consistent with §8.3's warning that a `double` may be written without a fractional part, and
+  worth seeing on a boundary record rather than only on a round altitude.
+- **132 150 samples this run against M3's 132 188** for the same scenario and duration. Normal
+  run-to-run variation of a wall-clock-paced host, and exactly the effect §14 tells EXT-17 to
+  expect (and PRD rev 6 correctly attributes to `n8ro-sim-local` rather than to the platform).
+- **The staging area's high-water mark was 42 and the queue's was 42**, on a queue of 8192.
+  At the reference rate the writer keeps up completely; the queue is sized for a burst that
+  did not happen. That is the right way round, and M6's overload is where it gets tested.

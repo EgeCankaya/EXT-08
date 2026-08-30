@@ -90,7 +90,7 @@ SampleOutcome EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
     return SampleOutcome{true, *name, entry.generation, *simTime};
 }
 
-void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
+EventOutcome EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
     const std::optional<std::string> eventName = tryReadString(values, "eventName");
     const std::optional<std::string> name = tryReadString(values, "scenarioEntityName");
     const std::optional<std::string> reason = tryReadString(values, "reason");
@@ -102,14 +102,14 @@ void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
 
     if (!eventName) {
         ++counters_.eventsUnnamed;
-        return;
+        return EventOutcome{};
     }
     if (!name) {
         // An event on the entity-event topic that names no entity. Counted on its own
         // rather than folded into the unhandled-name tally, which would misreport a
         // known event with a missing field as an unknown event.
         ++counters_.eventsWithoutEntity;
-        return;
+        return EventOutcome{};
     }
 
     const double eventTime = simTime.value_or(0.0);
@@ -133,14 +133,15 @@ void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
         latest_.erase(*name);
 
         pushEventLocked(RosterEvent{*eventName, *name, std::string{}, eventTime, entry.generation});
-        return;
+        return EventOutcome{EventOutcome::Kind::Added, *name, entry.generation, eventTime,
+                            std::string{}};
     }
 
     if (*eventName == n8ro::sim::kEventEntityDeleted) {
         const auto entry = roster_.find(*name);
         if (entry == roster_.end()) {
             ++counters_.deleteOfUnknownEntity;
-            return;
+            return EventOutcome{};
         }
         entry->second.open = false;
         // Verbatim, including a supplier-specific value outside the engine's own set. The
@@ -152,13 +153,15 @@ void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {
 
         pushEventLocked(RosterEvent{*eventName, *name, entry->second.lastRemovalReason,
                                     eventTime, entry->second.generation});
-        return;
+        return EventOutcome{EventOutcome::Kind::Removed, *name, entry->second.generation,
+                            eventTime, entry->second.lastRemovalReason};
     }
 
     // entity_updated, and anything a scenario or plugin author added to the vocabulary
     // without this build knowing about it. Counted by name so the notes deliverable can
     // say what the stream carried that we did not expect.
     ++unhandledEventNames_[*eventName];
+    return EventOutcome{};
 }
 
 bool PictureSnapshot::isLive(const std::string& name) const {

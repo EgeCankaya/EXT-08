@@ -4,11 +4,14 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 + M2 + M3 + M4.** The bridge registers the packed schemas, resolves the
-entity-state and entity-event topics *from the registry*, subscribes decoded to both,
-maintains a roster and a latest-sample map of its own, and — new at M4 — records a run into
-a self-describing `n8ro-capture/1` capture file. Once a second it prints the engine state
-plus the entity picture and the bus decoder's drop counters.
+**Status: M1 through M5.** The bridge registers the packed schemas, resolves **four** topics
+*from the registry* — entity state, entity events, scenario events and engine state —
+subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
+streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
+queue. It splits a scenario reload into separate segments, writes the roster's transitions out
+as `entity_add` / `entity_remove` records, detects the simulator disappearing and closes the
+capture cleanly, and works whichever of the two processes starts first. Once a second it prints
+the engine state, the entity picture, the capture's progress and both bus loss surfaces.
 
 The capture format is specified in [`docs/capture-format-v1.md`](docs/capture-format-v1.md).
 That document is a **cross-repo contract**: EXT-17 gets it and nothing else, and the
@@ -16,12 +19,13 @@ conformance reader in `tests/capture-reader/` was written from it alone — it l
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
-It does not yet split scenario reloads into separate segments, does not write roster
-transitions out as `entity_add` / `entity_remove` records, and does not judge anything —
-those are M5 onward, and §16 of the format spec states exactly which of them a current
-capture is missing. The bus-side subscription still runs on the lossy `KEEP_LATEST`
-default; M6 sets both backpressure boundaries explicitly. The bridge says so in a warning
-at startup, and the policy it recorded under goes into every capture's header.
+It does not judge anything yet — the referee, the condition file, `verdict` records and
+`--replay` are M6, and §16 of the format spec states exactly what a current capture is missing.
+There is no signal handling yet either: an M5 run ends when the simulation host stops
+publishing, or on a record budget if you set one. Ctrl-C with a clean drain is M7.
+
+Both backpressure boundaries are now set explicitly (BTB-BP-3, BTB-BP-4) — see
+[Backpressure](#backpressure) below for the values and why they are those values.
 
 ### Two things to know before you compare or trust a capture
 
@@ -77,30 +81,39 @@ includes.
 ## Run
 
 The bridge is a passive client. Something has to be hosting an engine for it to attach to;
-the shipped `n8ro-sim-local.exe` will host one and run a scenario:
+the shipped `n8ro-sim-local.exe` will host one and run a scenario.
 
-```cmd
-n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 300000
-```
-
-Then, in a second prompt that has also run `setup.cmd`:
+Start the **bridge first** — it waits for a host, and the `entity_created` burst that fills the
+roster is published once, at scenario load:
 
 ```cmd
 build\x64\Release\n8ro-bridge.exe ^
     --config      SimEngineClient_SharedMemory ^
     --model-path  C:\N8RO\data\db ^
-    --schema-file N8roSimSchema
+    --schema-file N8roSimSchema ^
+    --out-dir     captures
+```
+
+Then, in a second prompt that has also run `setup.cmd`, and **from a scratch directory** —
+`n8ro-sim-local` drops a `test_artifacts\` tree into whatever directory it is launched from:
+
+```cmd
+n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 200000
 ```
 
 ```
-[INFO] (n8ro-bridge) creating client: config=SimEngineClient_SharedMemory modelPath=C:\N8RO\data\db schemaFile=N8roSimSchema
-[INFO] (n8ro-bridge) message pump started; reporting engine state once a second from the local getters (Ctrl-C to stop)
-engine=running      frame=249        simTime=    12.450 scenario=Atacama Air Defense
-engine=running      frame=269        simTime=    13.450 scenario=Atacama Air Defense
+[INFO] (n8ro-bridge) message pump and writer thread started. Waiting for the simulation host; no start order is required (BTB-CX-2). Host loss is declared after 3.000000 s without an engine-state message (BTB-CX-3)
+[INFO] (n8ro-bridge) waiting for a simulation host on sim/engine/state; the bridge is subscribed and will begin capturing the moment one publishes
+[INFO] (n8ro-bridge) attached: the simulation host is publishing engine state
+[INFO] (n8ro-bridge) capture opened: captures\capture-atacama-air-defense-000.n8rocap.jsonl format n8ro-capture/1 producer 0.5.0 attached_mid_run=false
+engine=running    frame=249    simTime=  12.450 scenario=Atacama Air Defense live=42  names=45  samples=10098 orphaned=0
+    capture=10145 records (seg=1 samples=10098 add=45 rm=2) queue=0/9216 drops=0/0
+    busLoss=0(bp=0 qo=0 rl=0) decode=0(hash=0 fail=0 noschema=0)
 ```
 
-Every printed value is a local read on the client. Nothing on the print path touches the
-bus.
+Every value on the engine line is a local read on the client; nothing on the print path
+touches the bus. When the simulator exits, the bridge notices within 3 s, closes the capture
+with `end_reason: host_lost`, prints a run summary and exits 0.
 
 ### Options
 
@@ -109,11 +122,74 @@ bus.
 | `--config` | client-side engine config entry, e.g. `SimEngineClient_SharedMemory`. Must be a `SimEngineClient_*` entry — a `SimEngineHost_*` one names the wrong side and will not connect |
 | `--model-path` | directory holding the schema and instance database, e.g. `C:\N8RO\data\db` |
 | `--schema-file` | schema name inside that database, e.g. `N8roSimSchema` |
+| `--out-dir` | existing, writable directory for the capture. Validated at startup — the bridge never creates it, because a mistyped path would then look like success |
+| `--run-label` | label for this run. Defaults to the next unused zero-padded ordinal in `--out-dir`. Optional |
 | `--entity-state-message` | message instance name the entity-state topic is resolved *from*. Default `simEntityStateUpdate`. Optional |
-| `--capture-out` | write a capture to this path. Without it the bridge only reports. **M4 only** — M5 replaces it with `--out-dir` / `--run-label` and the naming convention in the PRD |
-| `--capture-max-samples` | stop recording after this many accepted samples, then write the file and exit 0. Default `100000`. Optional |
+| `--engine-state-message` | message instance name the host-loss heartbeat is resolved *from*. Default `simEngineState`. Optional |
+| `--queue-size` | handler-to-writer queue bound, in sample records. Default `8192`. Optional |
+| `--overflow-policy` | `drop_newest` (default) or `drop_oldest`. Optional |
+| `--capture-max-samples` | stop after this many `sample` records and close with `end_reason: size_limit`. Default `0`, meaning no bound — an M5 run ends on host loss. Optional |
 
-The first three are required; none are compiled in.
+`--config`, `--model-path`, `--schema-file` and `--out-dir` are required; none are compiled in.
+
+### The capture file's name
+
+```
+<out-dir>/capture-<scenario>-<run-label>.n8rocap.jsonl
+```
+
+`<scenario>` is the scenario name **as the platform reported it**, lowercased with runs of
+anything outside `[a-z0-9]` collapsed to a single hyphen — so `Atacama Air Defense` gives
+`capture-atacama-air-defense-000.n8rocap.jsonl`.
+
+`<run-label>` defaults to the lowest zero-padded ordinal not already present in `--out-dir` for
+that scenario. **It is never a timestamp.** Campaign tooling addresses runs by path, and a
+wall-clock name makes two runs of the same configuration unaddressable as a pair — the same
+reasoning that keeps wall-clock out of the capture itself (ADR-3).
+
+The file is opened when the scenario name becomes known rather than at startup, since the name
+is part of it. A bridge started before the simulator therefore creates nothing until a host
+appears, which is also the honest behaviour: no host, no run, no artifact.
+
+### Backpressure
+
+There are **two** boundaries, and the PRD requires both to be an explicit decision rather than
+an inherited default. Neither uses `BLOCK`.
+
+| boundary | value | why |
+|---|---|---|
+| bus → handler | `FIFO_DROP`, queue **1024** | The `SubscriptionOptions` default is `KEEP_LATEST` with queue 100. For a recorder that is precisely wrong: it discards the *older* of two messages, which is the one already part of the run's history. 1024 is ~1.25 s of headroom at the reference scenario's 818 packets/s, against ~120 ms for the default. Provisional — M6 confirms it under overload (OQ-4) |
+| handler → writer | `drop_newest`, **8192** sample records **+ 1024 reserved** | Drop-oldest is `KEEP_LATEST`'s mistake one thread later. 8192 records is ~16 MB and 10 s of headroom at the reference rate. The reserve is only usable by roster and segment records, so overload costs data and never structure — measured: at `--queue-size 4` a reference run dropped 2 520 samples and **zero** events, and the capture still contained two correct segments |
+
+**`block` is not offered at either boundary.** Blocking the bus stalls the publisher and changes
+the run being recorded; blocking the internal queue blocks the handler, which stalls the bus
+delivery thread — the same perturbation by a longer route. §14 of the format spec states to
+consumers, in writing, that this producer never blocks. Asking for `--overflow-policy block`
+prints that reasoning rather than a bare rejection.
+
+Overflow at the internal boundary is counted into `trailer.drops.samples_not_recorded` and
+`trailer.drops.events_not_recorded`. Loss is counted, never silent.
+
+### Host loss
+
+The bridge treats the simulator appearing, disappearing and dying as ordinary states rather
+than errors (BTB-CX-2, BTB-CX-3).
+
+Host loss is **no `sim/engine/state` message for 3.0 s**. That topic is the heartbeat rather
+than `sim/entity/state`, because entity state goes silent legitimately at every scenario unload
+while engine state publishes through idle frames — 4 017 messages across a 200 s run that was
+only running for part of it.
+
+The 3.0 s is derived, not picked: the largest inter-arrival gap measured across two full
+bring-up/load/run/teardown cycles on two scenarios was **548 ms**, at scenario load, so the
+window is 5.5× the worst observed stall and about 59 heartbeat periods. It is deliberately far
+below `SubscriptionOptions::activityThresholdS`, whose 30 s default is the bus's own
+idle-subscription notion and is far too slow for a campaign runner. Measured end to end:
+hard-killing the simulator mid-run, the bridge declared loss at 3.0075 s and left a conformant
+capture ending in a `host_lost` trailer.
+
+On host loss the bridge closes the capture and exits 0 — the capture is complete, and host loss
+is a handled state rather than a failure.
 
 **No topic string is hand-written anywhere in this program.** `--entity-state-message`
 names a *message instance*, and the topic is read off the schema that name resolves to, so
@@ -140,11 +216,21 @@ bridge never proceeds to silent operation (BTB-EP-1).
 
 ### Start order
 
+**Either order works with no operator intervention** (BTB-CX-2). But they do not produce the
+same capture, and the file says which you got.
+
 Start the bridge **before** the simulator when you want the roster from scenario load. The
-`entity_created` burst is published once, at load; a bridge that attaches after it sees
-samples for entities it never saw created, counts them as `orphaned`, and reports a live
-count of zero. That is the counter working, not a fault — but it is not the picture you
-wanted. Surviving either start order without operator intervention is BTB-CX-2, in M5.
+`entity_created` burst is published once, at load; a bridge that attaches after it sees samples
+for entities it never saw created and counts them as `orphaned`. The capture records that
+causally rather than by a clock: `header.attached_mid_run` is `true` and
+`trailer.drops.samples_orphaned` is large. Measured — bridge 19 s late on a 60 s run:
+`attached_mid_run: true`, 33 971 orphans. Bridge first: `false`, zero.
+
+One consequence of a late attach that is easy to misread: **`entities_added` and
+`entities_removed` will not balance.** The teardown publishes `entity_deleted` for entities the
+bridge never saw created, and those cannot become `entity_remove` records without producing a
+file the format calls malformed, so they are counted as `deleteOfUnknownEntity` instead. An
+imbalance in a capture with `attached_mid_run: true` is expected, not corruption.
 
 Note also that `n8ro-sim-local.exe` resolves its plugin directory from `N8RO_RELEASE`. Run
 it from a shell that has run `setup.cmd`, or the physics plugin will not be found and the
@@ -167,6 +253,9 @@ scenario load is *refused* — `Component type 'componentPhysics' has no registe
 | 11 | `subscribeByTopic` returned no subscription |
 | 12 | the client was created but exposes no message bus |
 | 13 | the capture file could not be opened or written |
+| 14 | the scenario-event topic could not be resolved, so reloads could not be told apart (BTB-CX-4) |
+| 15 | the engine-state topic could not be resolved, so host loss could not be detected. The bridge refuses to run rather than block indefinitely on a dead bus (BTB-CX-3) |
+| 16 | `--out-dir` is missing, is not a directory, or is not writable |
 
 ### Loss reporting
 
@@ -234,14 +323,14 @@ Every rule it enforces cites the spec section it came from.
 ```cmd
 cl /std:c++17 /EHsc /W4 /O2 /Fe:capture_reader.exe tests\capture-reader\capture_reader.cpp
 
-capture_reader.exe captures\capture-atacama-000.n8rocap.jsonl --spec docs\capture-format-v1.md
+capture_reader.exe captures\capture-atacama-air-defense-000.n8rocap.jsonl ^
+    --spec docs\capture-format-v1.md
 ```
 
 ```
   format n8ro-capture/1
-  records  header=1 segment_open=1 segment_close=1 entity_add=0 entity_remove=0 sample=100000 verdict=0 trailer=1
-  sim_time 0.05 -> 129.9 s
-  entities 77 distinct names, 77 distinct (name, occupancy) pairs
+  records  header=1 segment_open=2 segment_close=2 entity_add=132 entity_remove=90 sample=132150 verdict=0 trailer=1
+  entities 90 distinct names, 132 distinct (name, occupancy) pairs
   schema   simEntityStateUpdate (sim/entity/state): 12 declared, 11 ever published
            declared and NEVER published: activeAnimation  (absent from every sample, present in header.schemas - spec 8.2)
   clock    no wall-clock-shaped value found (spec 1, 14)
@@ -249,6 +338,10 @@ capture_reader.exe captures\capture-atacama-000.n8rocap.jsonl --spec docs\captur
 
 RESULT: CONFORMS to n8ro-capture/1
 ```
+
+**90 names but 132 (name, occupancy) pairs** is the line to look at. Those 42 extra pairs are
+names that lived twice — the engine's teardown reload re-creating the roster — and they are
+what makes the capture a test of ADR-6 rather than an assertion of it.
 
 Exit 0 if the capture conforms, 1 if it does not with every failure named by line and spec
 section, 2 on a usage or IO error.
@@ -291,14 +384,19 @@ the capture format are in [`notes.md`](notes.md).
 
 ```
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
+docs/capture-format-v1.md                the cross-repo contract EXT-17 is handed
+docs/decisions-m5-m7.md                  every judgment call made in M5–M7, and why
 notes.md                                 what the bus actually carries (graded deliverable)
-src/main.cpp                             CLI, wiring, the once-a-second report
-src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and both topics from the registry
+src/main.cpp                             CLI, wiring, the lifecycle loop, the run summary
+src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and all four topics from the registry
 src/EntityPicture.{h,cpp}                BTB-EP-3/EP-4 — the roster and the latest-sample map
-src/ExitCodes.h                          one table of process exit codes
+src/CaptureRecord.h                      what crosses the handler-to-writer boundary
+src/RecordQueue.{h,cpp}                  BTB-BP-1/BP-2/BP-4 — the bounded queue, counted overflow
+src/CaptureWriter.{h,cpp}                BTB-CX-3/CX-4 — the writer thread and the segment machine
 src/CaptureFormat.{h,cpp}                BTB-CAP-1/CAP-4 — the `n8ro-capture/1` serialiser
+src/HandlerTiming.{h,cpp}                BTB-BP-1 — how long a handler actually takes
 src/Json.{h,cpp}                         JSON escaping and the round-trip-exact float format
-src/SampleBuffer.{h,cpp}                 M4's bounded record buffer — M5 replaces it
+src/ExitCodes.h                          one table of process exit codes
 tests/entity-picture/                    unit tests for the picture — no simulator needed
 tests/capture-reader/                    conformance reader, written from the format spec alone
 tests/float-format/                      the OQ-5 determinism probe
@@ -313,25 +411,69 @@ build\x64\Release\n8ro-bridge.exe ^
     --config      SimEngineClient_SharedMemory ^
     --model-path  C:\N8RO\data\db ^
     --schema-file N8roSimSchema ^
-    --capture-out captures\capture-atacama-000.n8rocap.jsonl ^
-    --capture-max-samples 100000
+    --out-dir     captures
 
-:: then, in a prompt that has also run setup.cmd
+:: then, from a scratch directory, in a prompt that has also run setup.cmd
 n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 200000
 ```
 
-The bridge records until the sample budget is reached, then unsubscribes, stops the pump,
-writes the whole file from its own thread, and exits 0. **The budget is what ends the run** —
-there is no signal handling until M7, so a bridge interrupted before the budget writes no
-file. 100 000 samples is about 130 s of the reference scenario and about 48 MB of JSON Lines.
+The bridge records until the simulation host stops publishing, then closes the capture with
+`end_reason: host_lost` and exits 0. There is no signal handling until M7, so **let the host
+end the run** rather than interrupting the bridge; `--capture-max-samples` gives you a record
+budget if you want a bounded file instead, and closes it with `end_reason: size_limit`.
 
-Two things about the current recording strategy, both deliberate and both temporary. The
-subscription handler stays a courier: it copies each accepted sample into a bounded buffer
-and returns, and nothing reads that buffer until recording has stopped, so all IO, formatting
-and float conversion happen on our own thread. That trades memory for not yet having M5's
-writer thread and bounded queue, which is where BTB-BP-1 and BTB-BP-4 actually land. And
-`--capture-out` names a file directly; M5 replaces it with `--out-dir` / `--run-label` and
-the naming convention in the PRD.
+A 200-second run of the reference scenario produces about **132 000 sample records and 64 MB**
+of JSON Lines, at roughly 484 bytes per sample record.
+
+### What you get, and what to check
+
+```
+records     132378 written (segments=2 samples=132150 entity_add=132 entity_remove=90 verdicts=0)
+writer queue samplesDropped=0 eventsDropped=0  (capacity 8192+1024, policy drop_newest, highWater=42)
+entity-state n=132150 p50<=1us p95<=5us p99<=10us max=160us
+```
+
+**Two segments from one run is correct**, and it is the first thing to understand about a real
+capture. The engine's stop path unloads the scenario and immediately reloads it, re-creating
+the whole roster under the same names — so segment 0 is the run, and segment 1 is the teardown
+reload, holding the re-created entities at **occupancy 2** and a short tail of samples stamped
+`sim_time_s = 0.0`. §16 of the format spec says the same thing to a reader who has never seen
+this repository.
+
+That second segment is also where a capture finally demonstrates ADR-6 end to end. In the
+reference capture `RedUAV_N_01` is created at occupancy 1, publishes 2 956 samples, is
+`destroyed` at `t = 149.45`, and returns at occupancy 2 with 9 more — each tenure bracketed by
+its own `entity_add` / `entity_remove`.
+
+### Checking a capture
+
+```cmd
+build\tests\capture_reader.exe captures\capture-atacama-air-defense-000.n8rocap.jsonl ^
+    --spec docs\capture-format-v1.md
+```
+
+Exit 0 and `RESULT: CONFORMS` means the file satisfies every rule the specification states —
+including the ones a producer bug would most plausibly break: no `sample` outside an open
+segment, no `sample` after its own occupancy's `entity_remove`, `sample.fields` in schema
+order, trailer counts agreeing with the records present, and no wall-clock-shaped value
+anywhere.
+
+### Demonstrating counted backpressure
+
+Shrink the internal queue until it cannot keep up:
+
+```cmd
+build\x64\Release\n8ro-bridge.exe ... --out-dir captures --queue-size 4
+```
+
+```
+writer queue samplesDropped=2520 eventsDropped=0
+trailer drops {"samples_not_recorded":2520,"events_not_recorded":0,...}
+```
+
+Samples are lost and counted; **roster and segment records are not**, because the queue
+reserves headroom only they may use. The capture still contains two correct segments and still
+conforms — overload costs data, never structure.
 
 ## Notes on handling captures
 

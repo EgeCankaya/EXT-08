@@ -77,6 +77,24 @@ struct SampleOutcome {
     double simulationTimeS = 0.0;
 };
 
+// What onEntityEvent() decided, handed back so the caller can write the matching
+// entity_add / entity_remove record without re-deriving the roster lookup the picture just
+// did - the same coupling shape as SampleOutcome, and for the same reason.
+//
+// It has to be a return value rather than something our own thread drains later. The
+// capture's records must be in true arrival order relative to the sample stream (BTB-BP-2):
+// an entity_add that reached the file after the samples it opens would produce a file the
+// format spec calls malformed. Draining a log on another thread cannot preserve that.
+struct EventOutcome {
+    enum class Kind { Ignored, Added, Removed };
+
+    Kind kind = Kind::Ignored;
+    std::string scenarioEntityName;
+    std::uint64_t generation = 0;
+    double simulationTimeS = 0.0;
+    std::string reason;   // Removed only; verbatim, including a value outside the engine's set
+};
+
 // A roster transition, queued for our own thread to log. The handler must not format or
 // write, so it pushes one of these and returns.
 struct RosterEvent {
@@ -158,7 +176,10 @@ public:
     // The return value is not [[nodiscard]] on purpose: a caller that only wants the
     // picture maintained, which is every caller before M4, ignores it and reads correctly.
     SampleOutcome onSample(const n8ro::sim::StreamValueMap& values);
-    void onEntityEvent(const n8ro::sim::StreamValueMap& values);
+
+    // Like onSample, the return value is not [[nodiscard]]: a caller that only wants the
+    // roster maintained ignores it and is still correct.
+    EventOutcome onEntityEvent(const n8ro::sim::StreamValueMap& values);
 
     // Called from our own thread.
     [[nodiscard]] PictureSnapshot snapshot() const;

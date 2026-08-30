@@ -26,7 +26,7 @@
 
 #pragma once
 
-#include "SampleBuffer.h"
+#include "CaptureRecord.h"
 
 #include <messaging/packed/MessageSchema.h>
 #include <messaging/packed/StreamValue.h>
@@ -49,7 +49,14 @@ constexpr const char* kProducerName = "n8ro-bridge";
 // Both were run-to-run variable at 0.4.0 (see docs/capture-format-v1.md §16). 0.4.2 adds the
 // bus's four delivery-side drop counters to `bus_metrics`, which nothing in this program had
 // ever read - adding keys is non-breaking, so the format version does not move.
-constexpr const char* kProducerVersion = "0.4.2";
+// 0.5.0 is M5: the buffer-then-dump recorder is gone, replaced by a writer thread behind a
+// bounded queue, and the producer now emits the record types M4 left unwritten -
+// segment_open / segment_close driven by scenario events, and entity_add / entity_remove
+// from the roster. `drops.samples_not_recorded` carries a real overflow count for the first
+// time, and `drops.events_not_recorded` joins it. Adding keys is non-breaking (spec section
+// 13), and every record type emitted was already specified, so the format version does not
+// move.
+constexpr const char* kProducerVersion = "0.5.0";
 
 // Every value here is observed, not asserted. `runtimeVersion` comes from the SDK's own
 // getN8roVersion(), which reports "unknown" when the release headers were compiled without
@@ -90,10 +97,18 @@ struct TrailerCounts {
     std::uint64_t verdicts = 0;
 };
 
-// Losses on our side of the bus. `samplesNotRecorded` is M4's budget stop; M5 replaces it
-// with the internal queue's overflow count and the field keeps its meaning.
+// Losses on our side of the bus. `samplesNotRecorded` was structurally 0 at M4, where the
+// buffer filling *was* the end of recording; from M5 it carries the handler-to-writer
+// queue's genuine overflow count, which is the meaning the field was reserved for.
+//
+// `eventsNotRecorded` is new at 0.5.0 and counts roster and segment records the queue could
+// not take. It is expected to be zero - the queue reserves headroom for exactly these
+// (RecordQueue, D-8) - but a counter that can only be zero by design should say so rather
+// than not exist, because a non-zero value here means the file's structure is incomplete
+// and not merely its data.
 struct TrailerDrops {
     std::uint64_t samplesNotRecorded = 0;
+    std::uint64_t eventsNotRecorded = 0;
     std::uint64_t samplesOrphaned = 0;
     std::uint64_t samplesUnnamed = 0;
     std::uint64_t samplesUntimed = 0;
@@ -145,15 +160,46 @@ struct TrailerBusMetrics {
 // whose wire type differs from its declaration is recorded as it arrived rather than
 // coerced to the declaration.
 [[nodiscard]] std::string writeSample(
-    const CapturedSample& sample, std::uint64_t segment, const n8ro::sim::MessageSchema& schema);
+    const CaptureRecord& sample, std::uint64_t segment, const n8ro::sim::MessageSchema& schema);
+
+// The roster's transitions (BTB-EP-3). `occupancy` is the tenure the record opens or closes,
+// and on entity_remove `reason` is whatever the platform sent - including a supplier-specific
+// value this build has never seen, because coercing an unrecognised reason destroys the only
+// evidence that something new happened.
+[[nodiscard]] std::string writeEntityAdd(
+    double simTimeS, std::uint64_t segment, const std::string& entity, std::uint64_t occupancy);
+
+[[nodiscard]] std::string writeEntityRemove(
+    double simTimeS, std::uint64_t segment, const std::string& entity, std::uint64_t occupancy,
+    const std::string& reason);
 
 [[nodiscard]] std::string writeTrailer(
     double simTimeS, const std::string& endReason, const TrailerCounts& counts,
     const TrailerDrops& drops, const TrailerBusMetrics& busMetrics);
 
-// Counts the fields of `schema` that no record in `samples` ever carried. Reported at the
-// end of a run so a never-published field is stated rather than left to be noticed.
-[[nodiscard]] std::vector<std::string> neverPublishedFields(
-    const n8ro::sim::MessageSchema& schema, const std::vector<CapturedSample>& samples);
+// Which of a schema's declared fields the run ever actually published.
+//
+// M4 answered this by scanning the whole buffer at the end. M5 streams, so there is no
+// buffer to scan - presence is accumulated as records go past instead. The answer matters:
+// the entity-state schema declares twelve fields and `activeAnimation` appeared zero times
+// in 132 188 samples (notes.md, M3), which is the case BTB-CAP-4's absent-not-defaulted rule
+// exists for. Reported at the end of a run so a never-published field is stated rather than
+// left to be noticed.
+//
+// Called from the writer thread only.
+class FieldPresence {
+public:
+    explicit FieldPresence(const n8ro::sim::MessageSchema& schema);
+
+    void note(const n8ro::sim::StreamValueMap& values);
+
+    // Declared field names, in schema order, that `note` never saw.
+    [[nodiscard]] std::vector<std::string> neverPublished() const;
+
+private:
+    std::vector<std::string> names_;   // schema order
+    std::vector<bool> seen_;
+    std::size_t remaining_ = 0;        // unseen count, so a settled run stops looking
+};
 
 }  // namespace n8ro::bridge::capture

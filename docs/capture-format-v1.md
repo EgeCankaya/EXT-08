@@ -27,11 +27,14 @@ identity hashes. A reader never needs a compiled-in field list, and a field the 
 adds tomorrow appears in tomorrow's captures with no reader change.
 
 **Its only clock is simulation time.** No wall-clock value appears anywhere in a capture, in
-any record, for any reason. This is what makes two runs of the same scenario under the same
-configuration produce byte-identical files, and byte-identical files are what let a consumer
-prove that a difference between two runs came from the simulation rather than from the
-recorder. If you are looking for the wall-clock time at which something happened, it is in
-the producer's log, not here, and that is deliberate.
+any record, for any reason. That is what lets a consumer attribute a difference between two
+captures to the simulation rather than to the recorder: given the same published messages,
+the producer emits the same bytes. Note the shape of that guarantee — it binds the recorder,
+not the publisher, and whether *your* host publishes the same thing twice is a separate
+question you have to answer for yourself. **§14 is where that distinction is spelled out, and
+you should read it before building anything that compares two captures.** If you are looking
+for the wall-clock time at which something happened, it is in the producer's log, not here,
+and that is deliberate.
 
 ---
 
@@ -124,10 +127,29 @@ Three properties of it will surprise a reader who assumes otherwise, and all thr
 observed platform behaviour rather than format choices:
 
 - **It is not monotonic across a segment boundary.** The engine's stop path resets the
-  simulation clock *before* it publishes the teardown events, so the `entity_remove` records
-  that end a run can carry `sim_time_s = 0.0` — sorting *before* every sample in the run they
-  end. **Never sort a capture by `sim_time_s` globally.** Sort within a segment if you must
-  sort at all; the file's own record order is the authoritative ordering.
+  simulation clock *before* it publishes the teardown events, so the records that end a run
+  carry `sim_time_s = 0.0` — sorting *before* every sample in the run they end. This affects
+  `entity_remove`, and it equally affects **`segment_close`**: the record closing a segment
+  whose samples ran to `t = 200.05` is itself stamped `0.0`. **Never sort a capture by
+  `sim_time_s` globally.** Sort within a segment if you must sort at all; the file's own
+  record order is the authoritative ordering.
+
+  The practical consequence, stated directly because it is the thing a reader gets wrong
+  first: **a segment's time extent is `[first sample, last sample]`, never
+  `[segment_open.sim_time_s, segment_close.sim_time_s]`.** On a reloaded scenario *both*
+  boundary records read `0.0` — the open legitimately, because the clock really is zero at
+  load, and the close because of the reset above. Computing a segment's duration from its
+  boundary records yields zero for a run of any length.
+
+- **Within a segment, `sample` records are non-decreasing in `sim_time_s`.** That is the
+  positive rule the three cautions above are exceptions to, and it is what makes a segment a
+  usable unit of analysis. The boundary records — `segment_open`, `segment_close`, and the
+  `entity_add` / `entity_remove` records published during a teardown burst — are the stated
+  exceptions, and they are exceptions because the platform reset its clock before publishing
+  them, not because the producer chose a time for them. The producer never computes a time
+  for any record; where a record has no causing message at all (a `segment_close` for
+  `host_lost` or `shutdown`, and the `trailer`) it carries the simulation time of the last
+  record before it, which is the same rule §11 states for the trailer.
 - **It is not unique.** Every entity publishes on the same simulation frame, so a 42-entity
   scenario produces 42 records sharing one `sim_time_s` value.
 - **It carries accumulated floating-point error, and the capture preserves it exactly.**
@@ -525,6 +547,7 @@ truncated, or the producer is defective; either way it is worth reporting.
 | Key | Type | Meaning |
 |---|---|---|
 | `samples_not_recorded` | number (integer) | Samples dropped because the producer's own buffer or queue was full |
+| `events_not_recorded` | number (integer) | Roster and segment records (`entity_add`, `entity_remove`, and the scenario events behind `segment_open` / `segment_close`) the producer could not take, for the same reason. **Added at producer 0.5.0**; a reader must treat it as optional and absent-means-unknown, like the delivery-side `bus_metrics` keys. **A non-zero value here is much more serious than a non-zero `samples_not_recorded`** — it means the file's *structure* is incomplete, not merely its data, so an occupancy may be missing the record that opened or closed it and a segment boundary may be missing entirely. Treat such a file as structurally unreliable rather than merely sampled |
 | `samples_orphaned` | number (integer) | Samples for an entity name with no open occupancy — see below |
 | `samples_unnamed` | number (integer) | Samples carrying no entity-name field, so unkeyable |
 | `samples_untimed` | number (integer) | Samples carrying no simulation-time field, so unstampable |
@@ -680,12 +703,28 @@ published messages, it produces the same bytes — on every host, every build, e
 | Float formatting | Shortest round-trip, locale-independent, uniquely determined per double |
 | Line endings | LF, written in binary mode, on every platform |
 | Container iteration | No container with unspecified iteration order is iterated anywhere on the writing path |
-| Scheduler-dependent counters | No count whose value depends on thread timing is written into the file. Where such a number exists it goes to the producer's log — see §16 on `drops.samples_not_recorded` |
+| Scheduler-dependent counters | With one deliberate exception, no count whose value depends on thread timing is written into the file; where such a number exists it goes to the producer's log instead. **The exception is `drops.samples_not_recorded` / `drops.events_not_recorded` from producer 0.5.0 on** — see immediately below |
 | Timing-dependent flags | `attached_mid_run` is derived from what the message stream contained, never from what a status tick happened to observe |
 
 **The one host-dependent field** is `platform.model_path`, a filesystem path. Two captures of
 the same run recorded on hosts with different install locations differ there and nowhere
 else; compare with that field excluded.
+
+**The one deliberately scheduler-dependent field** is the pair of internal-queue drop counters
+in `trailer.drops`. From producer 0.5.0 the producer streams through a bounded queue, and how
+much of it fills depends on how the writer thread was scheduled — so two captures of the same
+published stream can differ on those two numbers. That is a knowing trade, not an oversight:
+a recorder that lost data and did not say so in the artifact would be worse than one whose
+byte comparison needs one caveat. **The caveat is small and self-announcing**: both counters
+read `0` on any run where nothing was lost, which is every run that a byte comparison is
+meaningful for in the first place. A capture with a non-zero value there is already an
+incomplete record of its run, and a determinism test should say so rather than diff it.
+
+Note what stays out of the file. The samples that arrive in the *shutdown window* — between
+the producer cancelling its subscriptions and the bus actually stopping delivery — are also
+scheduler-dependent, can never be zero, and are **not** counted here. They are not losses;
+they are arrivals after the end of recording, which is what the `end_reason` already records.
+They go to the producer's log. §16 has the detail.
 
 ### What the producer cannot guarantee: the publisher's own repeatability
 
@@ -793,40 +832,69 @@ This section describes **what the current producer emits**, as distinct from wha
 specification requires. It exists so that a reader author is never surprised by a real file,
 and it shrinks as the producer is completed.
 
-`n8ro-bridge` **0.4.2** (EXT-08 milestone M4) emits:
+`n8ro-bridge` **0.5.0** (EXT-08 milestone M5) emits:
 
 | Record | Status |
 |---|---|
 | `header` | Complete |
-| `segment_open` / `segment_close` | **Partial.** Exactly one segment, ordinal 0, opened on the first sample and closed when recording stops. The producer does not yet watch scenario load/unload events, so a scenario reload during recording is **not** yet split into two segments |
+| `segment_open` / `segment_close` | **Complete.** The producer follows `sim/scenario/event` and splits a scenario reload into separate segments with distinct ordinals. See the note below on what a segment boundary looks like in practice |
 | `sample` | Complete |
-| `entity_add` / `entity_remove` | **Not yet emitted.** The producer maintains the roster internally and stamps every sample with its correct `occupancy`, but does not yet write the roster transitions out. `trailer.counts.entities_added` and `entities_removed` are therefore `0` |
-| `verdict` | **Not yet emitted.** `trailer.counts.verdicts` is `0` |
-| `trailer` | Complete. `end_reason` is always `size_limit` at this version, because the record budget is what ends a run |
+| `entity_add` / `entity_remove` | **Complete.** Every occupancy the producer witnessed opening is bracketed by its own pair, and `trailer.counts.entities_added` / `entities_removed` carry real values |
+| `verdict` | **Not yet emitted.** `trailer.counts.verdicts` is `0`. Arrives at M6 |
+| `trailer` | Complete. `end_reason` is `host_lost` for an ordinary run — the producer follows the run rather than deciding when it ends, so the run ends when the host stops publishing — or `size_limit` if a record budget was configured and reached. `shutdown` arrives at M7 with signal handling |
 
-A reader written from this specification reads a 0.4.2 capture correctly without special
-casing — every record it contains is fully conformant, and the gaps are absences rather than
-deviations. The two things such a reader cannot do on a 0.4.2 file are reconstruct the roster
-independently of the samples, and distinguish two scenario runs within one file.
+A reader written from this specification reads a 0.5.0 capture with no special casing.
 
-### `drops.samples_not_recorded` at this version
+### What a real run's segments look like
 
-**Always `0`, structurally**, and that is the accurate value rather than a convenient one.
+Worth stating, because it surprises people and it is not a producer artifact: **an ordinary
+single run of a scenario produces two segments, not one.** The engine's stop path unloads the
+scenario and then immediately reloads it, re-creating the whole roster under the same names.
+So a capture of one run typically contains:
 
-This producer records into a buffer sized to exactly its record budget, so it never rejects a
-sample *while recording* — the buffer filling **is** the end of recording. Samples the
-simulation publishes after that point are not dropped; they are after the end, which is what
-`end_reason: "size_limit"` records.
+- **segment 0** — the run. Samples from `t = 0.05` to wherever the run ended, the roster's
+  `entity_add` records at the front, and any mid-run `entity_remove` records in place. Closed
+  with `reason: "scenario_unloaded"`.
+- **segment 1** — the teardown reload. The 42 re-created entities' `entity_add` records at
+  **occupancy 2**, and a short tail of samples, all stamped `sim_time_s = 0.0` because the
+  clock has already been reset. Closed with `reason: "host_lost"` when the host exits.
 
-A handful of samples do arrive between the budget being reached and the subscription actually
-being cancelled — a bus subscription cannot be stopped atomically. That count is
-scheduler-dependent, so writing it here would make two captures of the same run differ on a
-number that has nothing to do with the run (§14). It goes to the producer's log instead. It is
-also not a meaningful loss total: it counts the few samples that landed in the shutdown window
-and not the tens of thousands published afterwards.
+That second segment is where a reader first meets a real second occupancy, and it is why §8.1
+insists that identity is `(entity, occupancy)` and not `entity`.
 
-From M5, when the producer gains a real writer queue, this field carries that queue's genuine
-overflow count. The name and meaning do not change.
+Two ordering facts a reader may rely on, both measured on runtime 2.1.328 rather than assumed:
+
+- **The `entity_created` burst that materialises a scenario is published *before* the
+  `scenario_loaded` that announces it**, at first load and at every reload. The producer holds
+  those records and writes them inside the segment the load opens, which is where they belong;
+  a reader simply sees `segment_open` followed by the `entity_add` records.
+- **No sample of an outgoing run arrives after that run's `scenario_unloaded`.** The boundary
+  is clean in that direction, so no sample is ever attributed to the wrong segment.
+
+### `drops.samples_not_recorded` and `drops.events_not_recorded` at this version
+
+**These now carry real values.** At 0.4.x `samples_not_recorded` was structurally `0`, because
+the producer recorded into a buffer sized to its own budget and the buffer filling *was* the
+end of recording. From 0.5.0 the producer streams through a bounded handler-to-writer queue,
+and these two fields are that queue's genuine overflow count — which is what the field was
+always reserved for.
+
+Both are `0` on an unloaded run. Under deliberate overload they are not: with the queue
+shrunk to four records, a reference-scenario run recorded `samples_not_recorded: 2520` and
+**`events_not_recorded: 0`** — the producer reserves queue headroom for roster and segment
+records specifically so that overload costs data and never structure. That asymmetry is
+deliberate and a reader can lean on it: a capture with dropped samples is a sampled but
+structurally sound record of its run.
+
+See §14 for what these two counters mean for a byte comparison. In short: they are the one
+deliberately scheduler-dependent thing in the file, they are zero whenever a byte comparison
+is meaningful, and a non-zero value is itself the reason not to run one.
+
+**Not counted here, and deliberately:** samples that arrive after the producer has cancelled
+its subscriptions but before the bus has stopped delivering. That number can never be zero — a
+bus subscription cannot be stopped atomically — and it is scheduler-dependent. It is also not
+a loss: those samples are after the end of recording, which the `end_reason` already states.
+It goes to the producer's log.
 
 ### Producer version history
 
@@ -835,6 +903,7 @@ overflow count. The name and meaning do not change.
 | 0.4.0 | First producer. `drops.samples_not_recorded` carried a scheduler-dependent count and `attached_mid_run` was decided by a timing observation, so both could differ between two identical runs |
 | 0.4.1 | Both made deterministic: the field above became structurally `0`, and `attached_mid_run` is now derived from what the message stream contained |
 | 0.4.2 | `bus_metrics` gained the four delivery-side counters. Nothing had been reading them, so a capture could report all-zero drops while the bus was discarding messages. Adding keys is non-breaking (§13), so the format version is unchanged |
+| 0.5.0 | The writer thread and the bounded queue. `segment_open` / `segment_close` are driven by scenario events, `entity_add` / `entity_remove` are emitted, `drops.samples_not_recorded` carries a real overflow count, and `drops.events_not_recorded` joins it. `end_reason: "host_lost"` is reachable. The bus subscription moved off the `KEEP_LATEST` default to `FIFO_DROP` with a queue of 1024, which `header.subscription` records. Every record type emitted was already specified and only keys were added, so the format version does not move |
 
 ---
 
