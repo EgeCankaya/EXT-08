@@ -56,7 +56,22 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
   This is the most common configuration trap.
 - `C:\N8RO\docs\modules\n8ro-shark\dev\README.md` documents the exact passive-observer
   recipe the shipped bus monitor itself uses. Read it. Do not link against shark.
-- The entity-state topic is `sim/entity/state` (per shark's docs — confirm at runtime).
+- The entity-state topic is `sim/entity/state` — **confirmed at runtime in M1 and M3.** Still
+  resolve it from the registry, never from that literal (BTB-EP-1).
+- **`SimulationEngineClient` exposes no registry and no `MessageBusPacked`** — only
+  `messageBus()`. Build your own `MessageBusPackedSchemaRegistry` over your own `DbModel` and
+  construct `MessageBusPacked(*client->messageBus(), registry)`. That is the whole recipe.
+- **`EventConfigData::topic` is a *message instance name*, not a topic string.** Resolving an
+  event to its topic is two hops: `EventConfigReader` → message name → `registry.getByName()`
+  → `MessageSchema::topic`. The field name works against you here.
+- **The entity-state schema declares twelve fields; only eleven are ever published.**
+  `activeAnimation` appeared zero times in 132 188 samples. Read field *presence* per message;
+  never assume a declared field arrives. This is why BTB-CAP-4's verbatim rule is not optional.
+- **`n8ro-sim-local.exe` needs `N8RO_RELEASE` set**, or it resolves plugins to the working
+  directory and *refuses* the scenario load (`componentPhysics has no registered factory`).
+  The bridge then reports `engine=running scenario=(none)`, which looks like a bridge fault.
+- **Start the bridge before the simulator.** The `entity_created` burst fires once at scenario
+  load; attach late and every sample is orphaned with zero drops and no error anywhere.
 - `n8ro-shark` records JSONL and is the fastest way to watch the bus. Its format is
   wall-clock stamped, which is exactly why we need our own.
 - `MessageBusPacked::metricsSnapshot()` exposes `schemaHashDrops`, `decodeFailures`,
@@ -67,7 +82,15 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
+**M1, M2 and M3 are delivered. M4 is next.**
+
 Build only the current milestone. Ask before adding anything outside it.
+
+M4 inherits two things from M3 worth knowing before starting: field order comes from the
+runtime `MessageSchema::fields` (which disagrees with both hand-derivations in `notes.md` —
+the schema wins), and `entity_add` / `entity_remove` / `sample` records each carry an
+`occupancy` ordinal alongside the entity name (PRD ADR-6). In the code that ordinal is
+`Occupancy::generation`; in the capture it is spelled `occupancy`.
 
 ## Conventions
 

@@ -3,12 +3,24 @@
 > **One-liner:** A standalone C++17 console program that connects to a running N8RO simulation over the message bus and turns the published stream into a durable, versioned, self-describing capture file plus a pass/fail verdict — so a run can be analysed, and re-judged, long after it has ended.
 
 **Date:** 2026-08-30
+**Revision:** 2 — reconciled with what M1 and M3 measured. See §"Revision history".
 **Status:** Draft
 **Owner:** EXT-08 implementer
 **DRI:** egemencankaya14@gmail.com
 **Audience:** Engineering (implementer), Mentor (reviewer), EXT-17 author (downstream consumer)
 **Target release:** EXT-08 v1.0 — capture format `n8ro-capture/1`
 **Platform baseline:** N8RO runtime 2.1.328, SDK component `com.n8ro.dev` 2.1.328
+
+## Revision history
+
+| Rev | Date | Change |
+|----:|------|--------|
+| 1 | 2026-08-30 | Initial PRD. |
+| 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was unsatisfiable as written** and is now scoped to an entity occupancy; `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so the criterion is checkable in the capture itself (ADR-6). BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
+
+> Rev 2 changes the **logical capture shape** (a new field on three record types). This is
+> pre-freeze, so no format version bump is required — `n8ro-capture/1` is not frozen until M7
+> and no EXT-17 reader exists yet. After the M7 freeze the same change would be a version bump.
 
 ## Purpose and scope
 
@@ -48,6 +60,7 @@ Nothing of this shape has been built against this release. What we have instead 
 - **The bus's own subscription default is lossy, and the brief does not mention it.** `SubscriptionOptions` in `IMessageBus.h` carries `queueSize = 100` and `backpressurePolicy = BackpressurePolicy::KEEP_LATEST` by default, with `FIFO_DROP` and `BLOCK` as the alternatives. That means there are **two** backpressure boundaries in this program, not one: bus→handler and handler→writer. Accepting the default would silently discard entity samples and produce a capture that looks complete and is not. [S1]'s rule that backpressure must be an explicit decision applies to both boundaries.
 - **The decoded payload arrives in an `std::unordered_map`.** `MessageBusPacked::DecodedHandler` receives a `StreamValueMap`, which is `std::unordered_map<std::string, StreamValue>`. Writing fields in that map's iteration order would make the capture vary between runs and between builds — which breaks EXT-17's byte-for-byte determinism self-test before EXT-17 is even written. Field order must come from the `MessageSchema`'s declared `fields` vector, never from the map.
 - **The decoded handler is also handed the schema, and that is the format's best asset.** `DecodedHandler` signature is `void(const Message&, const MessageSchema&, const StreamValueMap&)`. `MessageSchema` carries `messageName`, `topic`, an ordered `fields` vector of `{name, type, size}`, `schemaHash`, `messageId`, and `wireVersion`. Embedding that verbatim in the capture header is what makes the file **self-describing** — the single design decision that lets EXT-17 read a capture with no access to EXT-08's source.
+- **A schema field can be declared and never published, and M3 found one.** The entity-state schema declares **twelve** fields; `activeAnimation` was published **zero times** in 132 188 samples of the reference scenario. Two independent hand-derivations at M1 — decoding the packed bytes, and reading the platform's own JSON serialiser — both concluded eleven, because both were looking at the wire rather than at the schema. This is the concrete case BTB-CAP-4's verbatim rule exists for: a curated struct built from those observations would have been born a field short, with nothing in the system able to say so. It also fixes the reading rule — *a packed payload carries only the fields the publisher wrote*, so field presence is read per message and never assumed.
 
 ## Goals and success metrics
 
@@ -66,7 +79,7 @@ Nothing of this shape has been built against this release. What we have instead 
 | Published entity samples captured, as a fraction of samples delivered to the handler | 0% (no capability exists) | 100%, with zero internal-queue drops on the reference scenario at nominal rate | Capture trailer counters cross-checked against `MessageBusPacked::metricsSnapshot()` | M6 |
 | Determinism: byte-identical capture pairs from identical configurations | n/a (no capture exists) | 10 of 10 consecutive pairs | Local `fc /b` (or SHA-256) over paired capture files | M7 |
 | Offline re-judge of a stored capture without re-running | Impossible | Referee replays a 10-minute capture and emits verdicts in < 60 s | `--replay` mode timed on the reference capture | M6 |
-| Schema-decode drops on the reference scenario | Unknown (never measured) | 0; any non-zero value surfaced in the log and the trailer, never silent | `metricsSnapshot().schemaHashDrops + decodeFailures + missingSchemaPassthrough` | M3 |
+| Schema-decode drops on the reference scenario | **0, measured at M3** (was: never measured) | 0; any non-zero value surfaced in the log and the trailer, never silent | `metricsSnapshot().schemaHashDrops + decodeFailures + missingSchemaPassthrough` | M3 — **met**: 0 across 132 188 samples of a full load-run-teardown cycle |
 | Clean Ctrl-C shutdown with no lost tail | n/a | 20 of 20 runs: final enqueued record present in the file, exit code 0 | Scripted signal-and-verify loop | M7 |
 | Independent reader written from the format spec alone | n/a | 1 reader (the sample notebook/script) written without reading EXT-08 source | Deliverable review with the mentor | M6 |
 
@@ -252,6 +265,7 @@ The system SHALL load the packed-message schemas from the model database into a 
 - Registry size and the resolved entity-state topic are logged at startup.
 - An empty registry produces a non-zero exit with a message naming the model path and schema file.
 - The entity-state topic string is obtained from the registry, never hand-written.
+- Resolution is anchored on a **message-instance name** or an `EventNames.h` constant — never on a topic string — and the schema the anchor resolves to is checked to declare the fields the picture keys on before any subscription is made. A name that resolves to a plausible neighbour (`simEntityTrackUpdate`, `simEntityPoseUpdate`) must fail loudly rather than subscribe successfully and roster nothing.
 
 **Trace:** UAC-BTB-EP-1
 
@@ -271,12 +285,15 @@ The system SHALL subscribe to entity-state traffic via `MessageBusPacked::subscr
 #### BTB-EP-3 (P1): Roster lifecycle from entity events
 The system SHALL maintain a roster of live entities driven by `sim/entity/event`, adding on `entity_created`, and removing on `entity_deleted` while preserving the event's `reason` value (`destroyed`, `expended`, `commanded`, `despawned`, `scenario_unload`, or a supplier-specific string).
 
+A scenario entity name is **not** a unique identity across a run. The engine's stop path deletes every entity with `reason="scenario_unload"` and immediately re-creates the whole roster under the same names, and a *destroyed* entity returns the same way. The system SHALL therefore track an **occupancy**: a monotonically increasing generation per name, opened by `entity_created` and closed by `entity_deleted`. A sample belongs to the occupancy open when it arrives, and a sample arriving for a name with **no** open occupancy SHALL be counted and excluded rather than attributed to a closed one. See ADR-6.
+
 **Customer scenario:** The analyst asks why an entity stopped appearing and gets "destroyed at t=412.5" rather than having to infer it from an absence.
 **Pain removed:** [S1] requires that entity removal be reflected and that nothing linger after a body is gone. Inferring removal from silence is unreliable — a quiet entity and a dead one look identical in a sample stream.
 
 **Acceptance criteria:**
 - An entity removed mid-run produces exactly one `entity_remove` record carrying the reason string verbatim.
-- No `sample` record for that entity appears after its `entity_remove`.
+- **No `sample` record for that entity's occupancy appears after that occupancy's `entity_remove`.** A later `sample` under the same name is permitted only after a new `entity_add` has opened the next occupancy, and carries that occupancy's ordinal. *(Rev 2: the previous wording — "no `sample` record for that entity appears after its `entity_remove`" — is unsatisfiable on this platform, because samples demonstrably resume under a re-created name. See ADR-6.)*
+- A sample for a name with no open occupancy is counted as a named diagnostic and never enters the latest-sample map.
 - A removal reason not in the engine's own set is recorded verbatim rather than coerced or dropped.
 
 **Trace:** UAC-BTB-EP-3
@@ -291,6 +308,7 @@ The system SHALL maintain a latest-published-sample map keyed by scenario entity
 - The container is ordered (`std::map` or equivalent); no `unordered_*` container is iterated anywhere in the capture or verdict path.
 - A snapshot is internally consistent — it is not read while a write is in progress.
 - Sample staleness is visible: each entry carries the simulation time of its last published sample.
+- Each entry identifies the occupancy its sample belongs to, so a stale entry from a previous tenure of the same name can never be read as current.
 
 **Trace:** UAC-BTB-EP-4
 
@@ -597,6 +615,7 @@ Conversely, **this PRD must not specify implementation detail beyond FR shape.**
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `entity` | string | Yes | Scenario entity name — the key of the latest-sample map |
+| `occupancy` | int | Yes | Which tenure of this name the record belongs to, from 1. `entity_add` opens it; the matching `entity_remove` carries the same value. A name re-created after removal gets the next ordinal (BTB-EP-3) |
 | `reason` | string | `entity_remove` only | Verbatim from the event: `destroyed`, `expended`, `commanded`, `despawned`, `scenario_unload`, or a supplier-specific value |
 
 ### Record: `sample`
@@ -604,8 +623,9 @@ Conversely, **this PRD must not specify implementation detail beyond FR shape.**
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `entity` | string | Yes | Scenario entity name |
+| `occupancy` | int | Yes | The tenure of `entity` this sample belongs to. Always matches an `entity_add` that precedes it and has not been closed. This is what lets a reader tell two tenures of one name apart (BTB-EP-3) |
 | `message` | string | Yes | `MessageSchema::messageName`, resolving this record's fields against `header.schemas` |
-| `fields` | object | Yes | Every field the schema declares, **in schema order**, values as published — no curation, no unit conversion |
+| `fields` | object | Yes | Every field the schema declares **that the message actually carried**, in schema order, values as published — no curation, no unit conversion. A schema-declared field the publisher omitted is absent from the object rather than defaulted; `header.schemas` remains the full declaration |
 
 ### Record: `verdict`
 
@@ -663,7 +683,16 @@ Not applicable in v1 — there is no prior format. If `n8ro-capture/2` ever ship
 
 ## Performance requirements
 
-Baselines are unknown by construction: nobody has measured this stream. **Milestone 1 — watching the traffic before writing code — exists to produce them**, and the targets below are re-confirmed against the observed rate at M1 rather than assumed now.
+~~Baselines are unknown by construction~~ — **M1 measured them**, and the figures below are observation rather than assumption.
+
+**Observed on release 2.1.328, one host.** Every entity publishes once per frame at **20 Hz**, locked to the frame (`deltaTimeS` = 0.05), so the aggregate entity-state rate is `entity count × 20 /s` at roughly 210 packed bytes per sample:
+
+| Scenario | Entities | `sim/entity/state` rate | Packed payload |
+|---|---:|---:|---:|
+| `Atacama Air Defense` — the **reference** | 42 at load, 46 distinct in-window | 818 /s | ~170 KB/s |
+| `Outback Kamikaze Swarm` — the **overload** case for M6 | 126 | 2487 /s | ~520 KB/s |
+
+A 10-minute reference run is therefore on the order of **100 MB of payload** before any text encoding. Everything else on the bus is comparatively negligible: `sim/engine/state` runs one per frame (~20 /s), and `sim/entity/event` — the roster source — produced 134 messages across a whole run.
 
 ### Latency targets
 
@@ -675,8 +704,8 @@ Baselines are unknown by construction: nobody has measured this stream. **Milest
 | Replay of a 10-minute capture | < 30 s | < 60 s | — | **Yes** — BTB-REF-4's acceptance criterion |
 
 ### Throughput
-- **Sustained:** the full published entity-update rate of the reference scenario with zero internal-queue drops. The absolute number is set at M1 from observation; the requirement is "all of it," not a figure invented here.
-- **Peak:** at least 3× the observed sustained rate absorbed for 10 s without drops, using the configured queue size.
+- **Sustained:** the full published entity-update rate of the reference scenario with zero internal-queue drops — **818 samples/s**, and the requirement is "all of it". Demonstrated at M3: 132 188 samples through a full load-run-teardown cycle with zero decoder drops and zero orphans.
+- **Peak:** at least 3× the observed sustained rate — **≥ 2500 samples/s**, which is also the natural rate of the `Outback Kamikaze Swarm` overload case — absorbed for 10 s without drops, using the configured queue size.
 - **Concurrency:** one simulator, one bridge. Two bridges against one simulator is a stretch goal, not a v1 target.
 
 ### Resource constraints
@@ -822,20 +851,20 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 |------|--------|------------|------------|
 | **R1 — Host teardown reliability.** A `0xC0000005` host-side teardown access violation has been observed on this platform, with a `userPlugins/sim` plugin loaded. These projects load no plugins, so it may not apply | High for EXT-17: it requires 20+ unattended runs with clean teardown and demands surviving a mid-campaign host crash | Medium — unconfirmed in a plugin-free configuration | **Spike it during M7**, before EXT-17's acceptance criteria are locked: 20 consecutive load-run-teardown cycles with no plugins, exit codes recorded. Whatever the result, it goes in the notes and to the mentor. BTB-CX-3 already makes host loss a handled state rather than a crash |
 | **R2 — Schema mismatch produces a plausible empty capture** | High — a silent wrong answer is the worst failure mode a recorder has | Medium — it is the most common configuration error [S1] | BTB-EP-1 (loud empty registry), BTB-OBS-1 (drop counters), BTB-OBS-2 (silent-topic warning). Three independent detections for one fault |
-| **R3 — The entity-picture work overruns its 2–3 day budget** | Medium — pushes past the 1–2 week target | Medium — it is unbudgeted in [S1] and therefore unvalidated as an estimate | Containment is BTB-CAP-4's verbatim rule: record what the schema declares, do not model it. If M3 exceeds three days, the referee's condition vocabulary (BTB-REF-3) drops to proximity-only and the rest moves to MVP+1 |
+| **R3 — The entity-picture work overruns its 2–3 day budget** — **CLOSED at M3, did not materialise.** Delivered inside budget; H3 validated. Containment was not invoked and BTB-REF-3 keeps its full three-kind vocabulary | Medium — pushes past the 1–2 week target | Medium — it is unbudgeted in [S1] and therefore unvalidated as an estimate | Containment is BTB-CAP-4's verbatim rule: record what the schema declares, do not model it. If M3 exceeds three days, the referee's condition vocabulary (BTB-REF-3) drops to proximity-only and the rest moves to MVP+1 |
 | **R4 — A determinism leak in our own emission path** | High — silently invalidates EXT-17's foundational self-test | Medium-high — three known sources exist (unordered map, float formatting, container iteration) and all three are easy to reintroduce | BTB-CAP-3 names all three; the M7 harness is the standing check, run on every change, not once |
 | **R5 — Format churn after EXT-17 starts consuming it** | Medium — breaks a downstream repo | Medium | Freeze at end of M7; version-bump discipline in §"Migration plan"; the reader's version check makes a mismatch loud |
-| **R6 — The reference scenario turns out to be unrepresentative** (too few entities, too short, no removals) | Medium — acceptance demos prove less than they appear to | Medium — no scenario has been chosen yet | Choose it in M1 against explicit criteria: multiple entities, at least one removal, a natural end, and a duration that makes the rate measurable |
+| **R6 — The reference scenario turns out to be unrepresentative** (too few entities, too short, no removals) — **CLOSED at M1.** `Atacama Air Defense`: 42 entities at load, two distinct removal reasons (`destroyed`, `expended`), a natural quiescent end at t ≈ 180 s. `Outback Kamikaze Swarm` (126 entities) is retained as the M6 overload case | Medium — acceptance demos prove less than they appear to | ~~Medium — no scenario has been chosen yet~~ | Choose it in M1 against explicit criteria: multiple entities, at least one removal, a natural end, and a duration that makes the rate measurable |
 
 ### Open questions
 
 | # | Question | Status | Decision target | Rationale (why open / what would resolve it) |
 |---|----------|--------|-----------------|----------------------------------------------|
-| OQ-1 | Is a newer release expected to ship the `EntityStateSample` / entity-picture layer, or do we own it permanently? | Needs input | Before M3 begins | [S1] describes the layer as shipped; 2.1.328 does not have it. The answer changes whether the built layer is a permanent component or a shim to be deleted, and therefore how much abstraction it deserves. **This is a mentor question** — ask it explicitly, do not infer it from release notes |
+| OQ-1 | Is a newer release expected to ship the `EntityStateSample` / entity-picture layer, or do we own it permanently? | **Needs input — still open; M3 shipped without it** | Was "before M3 begins"; now **before M4 hardens the capture format around the layer** | [S1] describes the layer as shipped; 2.1.328 does not have it. The answer changes whether the built layer is a permanent component or a shim to be deleted, and therefore how much abstraction it deserves. **This is a mentor question** — ask it explicitly, do not infer it from release notes |
 | OQ-2 | What is the exact `n8ro-sim-app.exe` headless invocation? | Needs input | Before the controller stretch goal; **before EXT-17 starts** | [S2] itself says "confirm the invocation with your mentor." EXT-17 depends on it outright. Raised here because EXT-08's controller stretch goal touches the same surface, and because raising it now buys EXT-17 lead time it would otherwise lose |
-| OQ-3 | What is the entity-state topic string, and what fields does its schema actually declare? | Open | M1 (observe the bus) | Deliberately unanswered here. Per [S5]'s golden rule these are read from the registry at runtime, not written from memory. M1 exists to observe them; the answer belongs in the notes deliverable, not in this PRD as a guess |
-| OQ-4 | Which bus-side backpressure policy is correct for a recorder — `FIFO_DROP` with a large queue, or `BLOCK`? | Provisional | M6 (backpressure) | `KEEP_LATEST` is ruled out: it discards the older of two samples, which is the one already part of the run's history. Between the remaining two, `BLOCK` risks perturbing the observed simulation and `FIFO_DROP` risks losing data. Provisional answer: `FIFO_DROP` with a queue sized from the M1 rate, because a recorder that changes the run it records is worse than one that admits a gap. Confirm under the M6 overload |
-| OQ-5 | What float formatting guarantees round-trip-exact, locale-independent output on this toolchain? | Open | M5 (output path) | 17 significant digits is the textbook answer; `to_chars` versus `printf` under a non-invariant locale is the practical question, and it is a determinism issue, not a cosmetic one. Resolve by test, and record the result in the determinism notes |
+| OQ-3 | What is the entity-state topic string, and what fields does its schema actually declare? | **Resolved (M1, corrected at M3)** | M1 (observe the bus) | `sim/entity/state`, message `simEntityStateUpdate`, **twelve** declared fields — eleven of which are ever published. Recorded in the notes deliverable, not restated here as a constant: the code still resolves both at runtime (BTB-EP-1), and this PRD deliberately does not become the second copy that drifts |
+| OQ-4 | Which bus-side backpressure policy is correct for a recorder — `FIFO_DROP` with a large queue, or `BLOCK`? | Provisional | M6 (backpressure) | `KEEP_LATEST` is ruled out: it discards the older of two samples, which is the one already part of the run's history. Between the remaining two, `BLOCK` risks perturbing the observed simulation and `FIFO_DROP` risks losing data. Provisional answer: `FIFO_DROP` with a queue sized from the M1 rate, because a recorder that changes the run it records is worse than one that admits a gap. Confirm under the M6 overload. **M1/M3 sizing input:** 100 messages is ~120 ms of headroom at the reference scenario's 818 packets/s and ~40 ms at the 126-entity overload scenario's 2487/s. M3 ran the reference scenario on the `KEEP_LATEST` default and lost nothing — a measurement of headroom at this load, not a reason to keep the default |
+| OQ-5 | What float formatting guarantees round-trip-exact, locale-independent output on this toolchain? | **Resolved (M1, by test)** | M5 (output path) | `std::to_chars` shortest round-trip. The `printf` family is **disqualified**: `%.17g` is round-trip exact but silently locale-dependent, emitting `0,05` under a comma-decimal locale — which this machine has. Probe and corpus at `tests/float-format/`. Note for M5: BTB-CAP-3 says "17 significant digits", which is a *means* to round-trip exactness; shortest round-trip reaches the same end, and the spec text should say "round-trip exact" if shortest is adopted |
 | OQ-6 | Should the referee's condition-file schema be designed for EXT-17 to adopt directly, or purely for EXT-08's needs? | Provisional | M6 | Designing for a consumer that does not exist yet risks speculative generality. Provisional answer: design for EXT-08, document it fully, and let EXT-17 adopt or supersede it — an over-designed schema is harder to supersede than a simple documented one |
 
 ### Rabbit holes
@@ -910,6 +939,7 @@ Continue observing runs through the GUI.
 - **Unit — format:** every record type round-trips through the reader; an unknown `format_version` is rejected with a named error; the spec's version string equals the `header`'s.
 - **Unit — condition evaluation:** each of the three condition kinds against synthetic sample sequences, including the boundary case (exactly at the threshold) and the never-met case.
 - **Integration — lifecycle:** start-before-simulator; attach mid-run; load; reload producing two segments; entity removal with each reason the reference scenario produces; simulator killed mid-run.
+- **Integration — occupancy (ADR-6):** a full load-run-teardown cycle asserts that no `sample` follows its occupancy's `entity_remove`, that a name re-created by the engine's stop-path burst opens the next ordinal, and that the samples-with-no-open-occupancy count is zero. The mid-run kill-and-recreate case (`destroyed`, then re-created at teardown) is the one that distinguishes this from a segment-scoped check, so it is asserted by name rather than by aggregate count.
 - **Integration — backpressure:** deliberate overload with a throttled writer; verify drops are counted accurately, per-topic, and land in the trailer. This is also the recorded demonstration for BTB-BP-4.
 - **Integration — replay conformance:** live verdicts equal replay verdicts over the same run and condition file, byte for byte (BTB-REF-4).
 - **Integration — contract:** the sample reader parses the committed sample capture. This is the standing spec-versus-implementation check.
@@ -948,17 +978,18 @@ Any rollback that touches the format after the M7 freeze is communicated to the 
 
 Milestone order follows [S1]'s prescribed step order deliberately: observe, then minimal client, then subscribe, then output, then lifecycle, then backpressure, then shutdown. Effort target 1–2 weeks total [S1].
 
-### M1 — Watch the traffic (0.5 day)
+### M1 — Watch the traffic (0.5 day) — **delivered**
 Run the simulator; observe what the bus actually carries. Identify the reference scenario against R6's criteria. Record the entity-state topic, its schema fields, the update rate, and the entity count.
 **Validation:** OQ-3 answered from observation, not memory. Throughput baselines for §"Performance requirements" exist as numbers. Reference scenario chosen and justified. First entries written into the notes deliverable.
 
-### M2 — Smallest possible client (0.5 day)
+### M2 — Smallest possible client (0.5 day) — **delivered**
 `create()`, start the pump, print engine state once a second. Nothing else. [S1] is explicit that most of the difficulty is configuration, not logic — this milestone exists to hit that wall alone.
 **Validation:** BTB-CX-1. Engine state, frame number, simulation time, and scenario name print correctly from the local getters, with no bus round trip.
 
-### M3 — The entity picture (2–3 days) — *the item [S1] assumed was free*
+### M3 — The entity picture (2–3 days) — *the item [S1] assumed was free* — **delivered, inside budget**
 Register schemas; subscribe decoded; build the roster from `sim/entity/event`; build the latest-sample map with ordered containers.
 **Validation:** BTB-EP-1 through BTB-EP-4. Roster fills and empties correctly across a full scenario. Registry size and resolved topic logged. **Gate: if this exceeds three days, invoke R3's containment before proceeding.**
+**Result:** met. Both topics resolved from the registry with no topic literal in the codebase; all three BTB-EP-1 failure modes exercised on distinct exit codes. Reference run: 42 entities at load, 90 distinct names, 132 occupancies, removals `destroyed:23 expended:48 scenario_unload:19`, 132 188 samples, **0 drops, 0 orphans**. Two findings changed this document — the twelfth schema field (§"Prior art"), and BTB-EP-3's unsatisfiable criterion (ADR-6). R3 closed; the gate was not reached.
 
 ### M4 — Capture format and the spec (1 day)
 Design and document `n8ro-capture/1`; write the header with its embedded schema envelope; emit `sample` records; write `docs/capture-format-v1.md` alongside the code, not after it.
@@ -1060,9 +1091,14 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 **THEN** the handler receives the decoded `StreamValueMap` and its `MessageSchema`, and no manual payload parsing exists anywhere in the codebase
 
 ### UAC-BTB-EP-3: Roster lifecycle
-**GIVEN** an entity present in the roster
+**GIVEN** an entity present in the roster at occupancy *n*
 **WHEN** it is destroyed and `sim/entity/event` reports `entity_deleted` with reason `destroyed`
-**THEN** exactly one `entity_remove` record carries `destroyed` verbatim, and no later `sample` record names that entity
+**THEN** exactly one `entity_remove` record carries `destroyed` verbatim at occupancy *n*, and no later `sample` record names that entity **at occupancy *n***
+
+### UAC-BTB-EP-3b: A re-created name is a new occupancy
+**GIVEN** an entity that has been removed — by `destroyed` mid-run, or by the `scenario_unload` burst the engine's stop path publishes
+**WHEN** the engine re-creates it under the same scenario entity name
+**THEN** an `entity_add` opens occupancy *n+1*, every subsequent `sample` for that name carries *n+1*, and the count of samples attributed to an entity with no open occupancy is zero
 
 ### UAC-BTB-EP-4: Deterministic latest-sample map
 **GIVEN** a scenario with multiple entities publishing concurrently
@@ -1222,20 +1258,41 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 
 **Supersedes:** None
 
+### ADR-6: An entity's identity is (name, occupancy), not name
+**Status:** Accepted (M3)
+**Context:** BTB-EP-3 originally required that "no `sample` record for that entity appears after its `entity_remove`". M1 established, and M3 confirmed and quantified, that this cannot hold: the engine's stop path deletes every live entity with `reason="scenario_unload"` and then immediately re-creates the entire roster under the same names, so samples resume under a removed name. The reference run also showed the sharper case — `RedUAV_N_01` was `destroyed` at t=149.45 and re-created at teardown. A scenario entity name is unique *within a tenure*, not across a run. Left unresolved, the criterion is either dead or forces the reader of a capture to treat a legal file as corrupt.
+**Decision:** Identity is the pair (scenario entity name, **occupancy**). The occupancy is a per-name generation counter, from 1, opened by `entity_created` and closed by `entity_deleted`. A sample belongs to whichever occupancy is open when it arrives. A sample for a name with no open occupancy is counted as a named diagnostic and discarded rather than attributed to a closed tenure. The ordinal is carried in `entity_add`, `entity_remove` and `sample` records so the distinction survives into the capture.
+**Alternatives rejected:**
+- *Scope the criterion to a scenario segment.* Truer to BTB-CX-4's vocabulary, but it makes an M3 requirement depend on segment machinery that belongs to M5, and it is weaker — it says nothing about a mid-run kill-and-respawn within one segment.
+- *Exempt `scenario_unload` as teardown rather than removal.* Simplest, and wrong: it puts a reason **string literal** in the roster's control flow, which sits badly against the same requirement's "reason preserved verbatim", and it would not have caught the `destroyed`-then-recreated case at all.
+- *Declare the criterion unsatisfiable and drop it.* Discards a real invariant. The criterion was reaching for something true and worth enforcing — a sample must never be attributed to a dead entity — and occupancy scoping states exactly that.
+**Consequences:**
+- The criterion becomes exactly satisfiable and machine-checkable, in the capture as well as in memory. Verified at M3: zero orphaned samples across 19 `scenario_unload` removals and 42 re-creations.
+- The counter of samples-with-no-open-occupancy becomes a first-class loss metric alongside the bus drop counters, and it earned its keep immediately — it is what made a bridge that attached after scenario load diagnosable (7 740 orphans, zero drops, no error) rather than merely wrong.
+- Three record types gain a field, and EXT-17 must key on the pair rather than the name. Pre-freeze, so no format version bump (§"Revision history").
+- Segment ordinals (BTB-CX-4) and occupancy ordinals are independent and both appear on a `sample`. M5 must not conflate them.
+
+**Supersedes:** None
+
 ## Quality gate notes
 
 Advisory only — these do not block the PRD.
 
 **Notable gaps**
 
-- **Performance baselines are placeholders by design.** Every throughput figure in §"Performance requirements" is expressed relative to an M1 observation that has not happened yet. This is deliberate — inventing a records-per-second number before watching the bus would be a guess dressed as a requirement — but it means the section is not review-complete until M1 lands. *Suggestion: revise this PRD after M1 with the observed rate, entity count, and bytes-per-minute, and re-check the p95 handler target against them.*
-- **The reference scenario is unidentified.** Six acceptance criteria and three success metrics say "the reference scenario" and no scenario has been chosen. *Suggestion: choose it in M1 against R6's four criteria and record the name in a PRD revision — it is a dependency, not a detail.*
+- ~~**Performance baselines are placeholders by design.**~~ **Closed in rev 2.** M1 measured the stream; §"Performance requirements" now carries observed rates, entity counts and payload bandwidth for both the reference and the overload scenario. The p95 handler target has not been measured directly and remains an unvalidated target — *suggestion: instrument it at M5, when the handler finally has a writer to hand off to and the number means something.*
+- ~~**The reference scenario is unidentified.**~~ **Closed in rev 2.** `Atacama Air Defense`, chosen at M1 against R6's four criteria and justified in the notes deliverable. `Outback Kamikaze Swarm` is retained as the M6 overload case.
 - **UAC-BTB-CAP-4 is not fully self-verifying.** It requires adding a field to a message schema in the database, which means touching `C:\N8RO`'s data tree. *Suggestion: confirm with the mentor whether a scratch model database is available for this test; if not, downgrade the criterion to a code-inspection check that no field allowlist exists.*
 
 **Minor gaps**
 
 - **OQ-4 and OQ-6 are Provisional with reasoned defaults rather than Open.** That is the intended use of the status, but per the OQ lifecycle discipline, if either survives a second revision without moving to Resolved it should be escalated to Needs Input rather than left provisional.
 - **No customer quote was written.** The Working Backwards guidance suggests one for user-facing features. EXT-08's "customers" are an analyst, a mentor, and a downstream program; a quote would be invented rather than sourced, so the customer-scenario fields on each FR carry that weight instead.
+
+**Notes added in rev 2**
+
+- **One P1 acceptance criterion was found unsatisfiable by implementation, not by review.** BTB-EP-3's "no `sample` after `entity_remove`" survived the rev-1 smell scan because it is specific, testable and unambiguous — it was simply false about the platform. Corrected via ADR-6. The general lesson for the remaining milestones: a criterion that describes platform behaviour is only as good as the observation behind it, and M1-style observation is the cheapest place to catch that.
+- **`fields` on a `sample` record is now explicitly "what the message carried", not "what the schema declares".** M3 found a schema-declared field that is never published. `header.schemas` remains the full declaration, so a reader can still tell a never-published field from a dropped one.
 
 **Requirement smell scan**
 

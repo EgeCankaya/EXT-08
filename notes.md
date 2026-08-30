@@ -567,6 +567,14 @@ segment machinery, which belongs to M5.
 The real violation the criterion was reaching for gets its own counter: **a sample for an
 entity with no open occupancy** is `orphaned`, counted, and never entered into the map.
 
+**The PRD now says this too** — it is not a note-level workaround around a contract that still
+says something else. Rev 2 rewrites BTB-EP-3's requirement and criterion, records the decision
+and its rejected alternatives as **ADR-6**, adds UAC-BTB-EP-3b for the re-created name, and
+puts an `occupancy` ordinal on the `entity_add` / `entity_remove` / `sample` records so the
+criterion is checkable in the capture and not only in memory. That last part matters for
+EXT-17: without it, a reader seeing `entity_remove(destroyed)` followed by more samples under
+the same name has every reason to call the file corrupt.
+
 Confirmed on the reference run. `RedUAV_N_01` is the sharpest case — not merely unloaded but
 *killed*, and then back:
 

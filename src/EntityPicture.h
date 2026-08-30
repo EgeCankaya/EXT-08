@@ -34,7 +34,12 @@ namespace n8ro::bridge {
 // every entity with reason="scenario_unload" and then immediately re-creates it under the
 // same name, so samples resume. A name is therefore not a unique identity across a run -
 // a (name, generation) pair is. BTB-EP-3's "no sample after the removal" holds within an
-// occupancy, which is exactly satisfiable; read across occupancies it is not.
+// occupancy, which is exactly satisfiable; read across occupancies it is not. ADR-6.
+//
+// Vocabulary, for M4: this struct is one occupancy, and `generation` is its ordinal. The
+// capture's `entity_add` / `entity_remove` / `sample` records spell that ordinal
+// `occupancy` (docs/prd.md, "Data model"). Same number, and the only translation between
+// the picture and the file.
 struct Occupancy {
     std::uint64_t generation = 0;    // 1 for the first tenure of this name, then 2, 3, ...
     bool open = false;               // created and not yet deleted
