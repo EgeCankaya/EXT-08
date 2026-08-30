@@ -1,0 +1,20 @@
+# MSBuild output
+build/
+*.user
+*.aps
+
+# Visual Studio local state
+.vs/
+*.VC.db
+*.VC.VC.opendb
+
+# n8ro-sim-local writes a per-entity JSONL dump into ./test_artifacts relative to its
+# working directory, unasked. Hundreds of MB per run. See notes.md.
+test_artifacts/
+
+# Standalone probe builds
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb

@@ -1,0 +1,21 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.9.12023.133
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "n8ro-bridge", "n8ro-bridge.vcxproj", "{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}.Debug|x64.ActiveCfg = Debug|x64
+		{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}.Debug|x64.Build.0 = Debug|x64
+		{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}.Release|x64.ActiveCfg = Release|x64
+		{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

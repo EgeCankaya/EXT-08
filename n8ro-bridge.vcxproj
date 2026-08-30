@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- EXT-08 Bus Telemetry Bridge. An ordinary C++17 console program that links four
+       N8RO import libraries. Not a plugin: no plugin ABI, no Qt, no scaffolder. -->
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{6E1B7A42-9C3D-4F58-9E21-2B0C5A7D8F31}</ProjectGuid>
+    <RootNamespace>n8robridge</RootNamespace>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <!-- The release tree. setup.cmd exports N8RO_RELEASE; the fallback keeps the project
+       buildable from a plain developer prompt on a stock install. Override on the command
+       line with /p:N8roRelease=<path> if the release lives somewhere else. -->
+  <PropertyGroup Label="N8roRelease">
+    <!-- N8roRelease is the input and may arrive as an MSBuild global property (/p:), which a
+         PropertyGroup cannot rewrite - so the normalised form gets its own name. -->
+    <_N8roReleaseRaw>$(N8roRelease)</_N8roReleaseRaw>
+    <_N8roReleaseRaw Condition="'$(_N8roReleaseRaw)' == ''">$(N8RO_RELEASE)</_N8roReleaseRaw>
+    <_N8roReleaseRaw Condition="'$(_N8roReleaseRaw)' == ''">C:\N8RO</_N8roReleaseRaw>
+    <N8roReleaseDir>$([MSBuild]::EnsureTrailingSlash('$(_N8roReleaseRaw)'))</N8roReleaseDir>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Release'">false</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Debug'">true</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)' == 'Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>n8ro-bridge</TargetName>
+  </PropertyGroup>
+
+  <!-- Fail here rather than in the compiler, so a missing or mistyped release path reads
+       as one named diagnostic instead of a wall of "cannot open include file". -->
+  <Target Name="VerifyN8roRelease" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(N8roReleaseDir)include\n8ro-sim')"
+           Text="N8RO release tree not found. Expected headers at $(N8roReleaseDir)include\n8ro-sim. Run C:\N8RO\setup.cmd first, or pass /p:N8roRelease=&lt;path-to-release&gt;." />
+    <Error Condition="!Exists('$(N8roReleaseDir)lib\n8ro-sim.lib')"
+           Text="N8RO import libraries not found. Expected $(N8roReleaseDir)lib\n8ro-sim.lib." />
+  </Target>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level4</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- The libraries we link report failures as return values and log lines; we do the
+           same. /EHsc is still required because the standard library may throw and hard
+           rule 1 says nothing may escape main - main catches, so the tables must exist. -->
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(N8roReleaseDir)include\n8ro-core;$(N8roReleaseDir)include\n8ro-sim;$(N8roReleaseDir)include\n8ro-schema;$(N8roReleaseDir)include\n8ro-data;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <AdditionalLibraryDirectories>$(N8roReleaseDir)lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>n8ro-core.lib;n8ro-sim.lib;n8ro-schema.lib;n8ro-data.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
