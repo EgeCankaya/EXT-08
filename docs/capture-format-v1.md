@@ -505,6 +505,25 @@ The result of evaluating one declared condition against the run.
 | `entities` | array of string | Scenario entity names the evaluation involved |
 | `values` | object | The values that decided it, sufficient to locate the causing samples. Keys and value types are condition-specific; a reader should treat this as an opaque object and render it rather than interpret it |
 
+**Exactly one `verdict` per declared condition per capture.** A condition is decided once: at
+the first moment it is satisfied, or — if it never is — at the end of the run, with
+`met: false`. It is not re-emitted on every later sample that also satisfies it, because "did
+these two aircraft come within 5 km" is answered by the first time they did.
+
+**A `met: false` verdict is a positive statement, not an absence.** Its presence is what
+distinguishes a condition that was evaluated and never satisfied from one nobody evaluated.
+A reader that sees fewer verdicts than the condition file declares is looking at a capture
+that was cut short, not at a run where the rest passed.
+
+`sim_time_s` on a met verdict is the simulation time of the sample or event that decided it,
+so it locates the causing records exactly. On a not-met verdict it is the time of the last
+data record in the run, and `segment` the segment that record was in — there is no deciding
+moment to point at, and the producer does not invent one.
+
+`values` is condition-specific but always reproducible: numbers are written through the same
+round-trip-exact, locale-independent formatter every other double in the capture uses (§8.3),
+so a verdict's numbers can be checked by hand against the samples it names.
+
 ---
 
 ## 11. Record: `trailer`
@@ -775,23 +794,51 @@ The distinction above is the whole of the practical advice, so it is worth stati
 
 ### Known loss, and the fact that no counter reports it
 
-Measured against the simulation host's own per-entity record over the same window: of 99 981
-samples the host recorded as published, the capture contained 99 953. Of the 28 absent, 9 were
-the final frame cut mid-way by the record budget — that is the budget working, and
-`end_reason: "size_limit"` says so. The remaining **19 (0.019 %) are unexplained loss**, 18 of
-them in a single frame.
+**A capture is a very high-fidelity sample of the published stream. It is not a guaranteed-
+complete transcript, and the producer cannot always tell you when it is not.** This section
+says exactly what has been measured, because the measurement is more useful than the headline.
 
-**Every counter available reads zero for those 19.** The packed decoder's counters are zero
-because the messages never reached the decoder. The bus's own delivery counters
-(`messages_dropped`, `dropped_by_backpressure`, `dropped_by_queue_overflow`) are zero too, so
-whatever discarded them did not record having done so. The producer reports every counter the
-platform exposes, and the platform does not expose this.
+The method: compare a capture against the simulation host's **own** record of what it
+published. `n8ro-sim-local` writes a per-entity JSONL dump in its working directory, produced
+inside the host process, independent of the bus, the subscription and this producer. It is the
+only available check that does not rely on the counters being checked.
 
-The honest statement is therefore: **a `bus_metrics` block of all zeros means nothing the
-platform counts was lost. It is not proof that nothing was lost.** Treat a capture as a
-high-fidelity sample of the published stream — on the reference scenario, better than 99.98 %
-complete — rather than as a guaranteed-complete transcript. A consumer that must know whether
-a specific message existed should not infer its absence from this file alone.
+Measured twice at M6, on runtime 2.1.328, comparing per `(entity, sim_time_s)`:
+
+| | reference scenario, 818 samples/s | overload scenario, 2 487 samples/s |
+|---|---:|---:|
+| samples in the compared window | 131 744 | 135 581 |
+| **absent from the capture** | **30 (0.023 %)**, all in **one** frame | **0** |
+| absent from the *host's own dump*, though present in the capture | 30, in three frames | 203, in four frames |
+| what every counter reported | zero | zero |
+
+Three things follow, and the third is the one to carry away.
+
+**First, the loss is real and it is frame-shaped.** Where the capture is short, it is short by
+most of one simulation frame rather than by scattered individual messages — 30 of that frame's
+39 samples at the reference rate. M4 saw the same shape: 18 of its 19 missing samples were in
+a single frame. Whatever drops them drops a batch.
+
+**Second, it is not driven by rate.** The natural hypothesis was that three times the message
+rate would provoke it three times as often. It did the opposite: at 2 487 samples/s the
+capture was complete, by the host's own account, across 135 581 samples. Whatever the
+mechanism is, throughput is not the trigger, and a consumer should not assume a quiet run is a
+safer one.
+
+**Third — and this is new at M6 — the host's own dump loses whole frames too.** It is missing
+samples that the capture contains: 30 at the reference rate, 203 under the overload, in the
+same whole-frame shape. That has two consequences. It means this comparison bounds the
+capture's completeness **from one side only**, so the figures above are an upper bound on the
+disagreement rather than a measurement of our loss. And it means a frame-shaped gap appears in
+an artifact written *inside the host process*, with no bus and no subscription anywhere in its
+path — which is evidence that the mechanism sits upstream of any consumer, and that no
+consumer's configuration can avoid it.
+
+**The honest statement for a consumer is therefore unchanged, and now better founded:** a
+`bus_metrics` and `drops` block of all zeros means nothing the platform counts was lost. It is
+not proof that nothing was lost. A consumer that must know whether a specific message existed
+should not infer its absence from this file alone — and, per the third point, should not
+expect to establish it from the host's own record either.
 
 ---
 
@@ -832,18 +879,25 @@ This section describes **what the current producer emits**, as distinct from wha
 specification requires. It exists so that a reader author is never surprised by a real file,
 and it shrinks as the producer is completed.
 
-`n8ro-bridge` **0.5.0** (EXT-08 milestone M5) emits:
+`n8ro-bridge` **0.6.0** (EXT-08 milestone M6) emits **all eight record types**:
 
 | Record | Status |
 |---|---|
 | `header` | Complete |
-| `segment_open` / `segment_close` | **Complete.** The producer follows `sim/scenario/event` and splits a scenario reload into separate segments with distinct ordinals. See the note below on what a segment boundary looks like in practice |
+| `segment_open` / `segment_close` | Complete. A scenario reload is split into separate segments with distinct ordinals |
 | `sample` | Complete |
-| `entity_add` / `entity_remove` | **Complete.** Every occupancy the producer witnessed opening is bracketed by its own pair, and `trailer.counts.entities_added` / `entities_removed` carry real values |
-| `verdict` | **Not yet emitted.** `trailer.counts.verdicts` is `0`. Arrives at M6 |
-| `trailer` | Complete. `end_reason` is `host_lost` for an ordinary run — the producer follows the run rather than deciding when it ends, so the run ends when the host stops publishing — or `size_limit` if a record budget was configured and reached. `shutdown` arrives at M7 with signal handling |
+| `entity_add` / `entity_remove` | Complete. Every occupancy the producer witnessed opening is bracketed by its own pair |
+| `verdict` | Complete, when the producer is given a condition file. Without one it evaluates nothing and `trailer.counts.verdicts` is `0`, which is an accurate report of a run that declared no conditions |
+| `trailer` | Complete. `end_reason` is `host_lost` for an ordinary run — the producer follows the run rather than deciding when it ends — or `size_limit` if a record budget was configured and reached. `shutdown` arrives at M7 with signal handling |
 
-A reader written from this specification reads a 0.5.0 capture with no special casing.
+A reader written from this specification reads a 0.6.0 capture with no special casing.
+
+**The producer also writes its verdicts a second time**, to a `verdicts-<scenario>-<run-label>
+.jsonl` beside the capture, one `verdict` record per line and byte-identical to the ones in
+the capture. That file is not part of this format and a reader needs nothing from it; it
+exists so that a live run's verdicts and a re-judgement of its own capture can be compared as
+files. They are byte-identical, which is the check that this specification carries enough for
+a third party to reach the same conclusions from the file alone.
 
 ### What a real run's segments look like
 
@@ -904,6 +958,7 @@ It goes to the producer's log.
 | 0.4.1 | Both made deterministic: the field above became structurally `0`, and `attached_mid_run` is now derived from what the message stream contained |
 | 0.4.2 | `bus_metrics` gained the four delivery-side counters. Nothing had been reading them, so a capture could report all-zero drops while the bus was discarding messages. Adding keys is non-breaking (§13), so the format version is unchanged |
 | 0.5.0 | The writer thread and the bounded queue. `segment_open` / `segment_close` are driven by scenario events, `entity_add` / `entity_remove` are emitted, `drops.samples_not_recorded` carries a real overflow count, and `drops.events_not_recorded` joins it. `end_reason: "host_lost"` is reachable. The bus subscription moved off the `KEEP_LATEST` default to `FIFO_DROP` with a queue of 1024, which `header.subscription` records. Every record type emitted was already specified and only keys were added, so the format version does not move |
+| 0.6.0 | `verdict` records are emitted, completing the eight-type vocabulary. Nothing about the format changed — no key renamed, none retyped, no type added that was not already specified — so this is still `n8ro-capture/1` |
 
 ---
 

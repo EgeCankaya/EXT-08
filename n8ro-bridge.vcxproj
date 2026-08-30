@@ -112,6 +112,11 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\CaptureFormat.cpp" />
     <ClCompile Include="src\CaptureWriter.cpp" />
+    <ClCompile Include="src\Conditions.cpp" />
+    <ClCompile Include="src\Geodesy.cpp" />
+    <ClCompile Include="src\JsonParse.cpp" />
+    <ClCompile Include="src\Referee.cpp" />
+    <ClCompile Include="src\Replay.cpp" />
     <ClCompile Include="src\HandlerTiming.cpp" />
     <ClCompile Include="src\RecordQueue.cpp" />
     <ClCompile Include="src\Json.cpp" />
@@ -123,6 +128,11 @@
     <ClInclude Include="src\CaptureFormat.h" />
     <ClInclude Include="src\CaptureRecord.h" />
     <ClInclude Include="src\CaptureWriter.h" />
+    <ClInclude Include="src\Conditions.h" />
+    <ClInclude Include="src\Geodesy.h" />
+    <ClInclude Include="src\JsonParse.h" />
+    <ClInclude Include="src\Referee.h" />
+    <ClInclude Include="src\Replay.h" />
     <ClInclude Include="src\HandlerTiming.h" />
     <ClInclude Include="src\RecordQueue.h" />
     <ClInclude Include="src\EntityPicture.h" />

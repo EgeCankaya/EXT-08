@@ -1,18 +1,27 @@
-// EXT-08 Bus Telemetry Bridge - M5: the output path and the session lifecycle.
+// EXT-08 Bus Telemetry Bridge - M6: the referee, live and offline.
 //
 // Registers the packed schemas, resolves four topics from the registry, subscribes decoded,
-// maintains a roster and a latest-sample map, and streams a `n8ro-capture/1` file through a
-// writer thread behind a bounded queue.
+// maintains a roster and a latest-sample map, streams a `n8ro-capture/1` file through a
+// writer thread behind a bounded queue, and evaluates declared conditions against the run.
 //
-// Scope: BTB-CX-2, BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-BP-3, BTB-BP-4, BTB-EP-3's
-// records, on top of M2-M4. The normative description of what it writes is
-// docs/capture-format-v1.md; every decision taken while building it is in
+// Two modes, mutually exclusive:
+//
+//   live      --config ...   attach to a running simulation and record it, judging as it goes
+//   replay    --replay ...   re-judge a stored capture with no simulator, no bus, no client
+//
+// The referee is the same class in both, fed from a decoded StreamValueMap in one and from
+// `sample.fields` out of a file in the other. That is what makes "live verdicts equal replay
+// verdicts" true by construction rather than by testing (ADR-5), and it is the strongest
+// available conformance test for the capture format: if the referee can re-derive its own
+// verdicts from the file alone, the file demonstrably contains enough.
+//
+// Scope: BTB-REF-1 through BTB-REF-4 on top of M2-M5. The normative description of what it
+// writes is docs/capture-format-v1.md; every decision taken while building it is in
 // docs/decisions-m5-m7.md.
 //
-// What M5 deliberately does not have (docs/prd.md, M6-M7): no referee, no conditions file,
-// no verdict records, no --replay, no signal handling or Ctrl-C drain, no determinism
-// harness, no size limit in bytes (BTB-CAP-6). An M5 run ends on host loss or on the record
-// budget.
+// What M6 deliberately does not have (docs/prd.md, M7): no signal handling or Ctrl-C drain,
+// no determinism harness, no size limit in bytes (BTB-CAP-6). A live run ends on host loss
+// or on the record budget.
 //
 // The four topics, and why each is here:
 //
@@ -28,10 +37,13 @@
 #include "CaptureFormat.h"
 #include "CaptureRecord.h"
 #include "CaptureWriter.h"
+#include "Conditions.h"
 #include "EntityPicture.h"
 #include "ExitCodes.h"
 #include "HandlerTiming.h"
 #include "RecordQueue.h"
+#include "Referee.h"
+#include "Replay.h"
 #include "TopicResolution.h"
 
 #include <DbModel.h>
@@ -52,6 +64,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -116,7 +129,8 @@ constexpr const char* kUsage =
     "                   --out-dir <dir> [--run-label <label>]\n"
     "                   [--entity-state-message <name>] [--engine-state-message <name>]\n"
     "                   [--queue-size <n>] [--overflow-policy <drop_newest|drop_oldest>]\n"
-    "                   [--capture-max-samples <n>]\n"
+    "                   [--capture-max-samples <n>] [--conditions <file>]\n"
+    "       n8ro-bridge --replay <capture> --conditions <file> [--out-dir <dir>]\n"
     "\n"
     "  --config                 client-side sim engine config entry, e.g.\n"
     "                           SimEngineClient_SharedMemory. A SimEngineHost_* entry names\n"
@@ -141,7 +155,13 @@ constexpr const char* kUsage =
     "                           ask for it to be told why.\n"
     "  --capture-max-samples    stop after this many sample records and close the capture\n"
     "                           with end_reason=size_limit. Default 0, meaning no bound -\n"
-    "                           an M5 run ends on host loss.\n";
+    "                           a live run ends on host loss.\n"
+    "  --conditions             JSON file of declared conditions. Verdicts are written into\n"
+    "                           the capture and into verdicts-<scenario>-<run-label>.jsonl\n"
+    "                           beside it. Without it the bridge records but judges nothing.\n"
+    "  --replay                 offline mode: re-judge a stored capture with no simulator,\n"
+    "                           no bus and no client. Requires --conditions. Mutually\n"
+    "                           exclusive with --config.\n";
 
 struct Options {
     std::string config;
@@ -154,6 +174,10 @@ struct Options {
     std::size_t queueSize = kDefaultQueueSize;
     OverflowPolicy overflowPolicy = OverflowPolicy::DropNewest;
     std::size_t captureMaxSamples = 0;   // 0 = unbounded
+    std::string conditionsPath;
+    std::string replayPath;
+
+    [[nodiscard]] bool isReplay() const { return !replayPath.empty(); }
 };
 
 [[nodiscard]] bool parseCount(const std::string& flag, const std::string& value, bool allowZero,
@@ -215,10 +239,37 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
             if (!parseCount(arg, value, true, out.captureMaxSamples, error)) {
                 return false;
             }
+        } else if (arg == "--conditions") {
+            out.conditionsPath = value;
+        } else if (arg == "--replay") {
+            out.replayPath = value;
         } else {
             error = "unrecognised option " + arg;
             return false;
         }
+    }
+
+    // Live and replay are mutually exclusive, and the PRD says so explicitly: replay has no
+    // bus, no client and no engine configuration, so accepting both would mean silently
+    // ignoring one of them.
+    if (out.isReplay()) {
+        if (!out.config.empty()) {
+            error = "--replay and --config are mutually exclusive. Replay mode has no bus, no "
+                    "client and no engine configuration; it re-judges a stored capture";
+            return false;
+        }
+        if (out.conditionsPath.empty()) {
+            error = "--replay needs --conditions - there is nothing to judge without them";
+            return false;
+        }
+        if (out.outDir.empty()) {
+            // Default to the capture's own directory, which is where a campaign would want
+            // the verdicts anyway.
+            const std::size_t slash = out.replayPath.find_last_of("/\\");
+            out.outDir = slash == std::string::npos ? std::string(".")
+                                                    : out.replayPath.substr(0, slash);
+        }
+        return true;
     }
 
     if (out.config.empty()) {
@@ -378,6 +429,11 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
     std::printf("entities    %zu names seen, %zu occupancies open at exit\n", snap.roster.size(),
                 snap.liveCount);
     std::printf("removals    %s\n", formatCountsByName(snap.removalsByReason).c_str());
+    if (!writer.verdictPath().empty()) {
+        std::printf("verdicts    %llu written -> %s\n",
+                    static_cast<unsigned long long>(writer.counts().verdicts),
+                    writer.verdictPath().c_str());
+    }
 
     std::printf("\n-- loss, in the order it can happen ---------------------------------------\n");
     std::printf("bus deliver  dropped=%llu backpressure=%llu queueOverflow=%llu rateLimit=%llu\n",
@@ -438,10 +494,99 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
     std::fflush(stdout);
 }
 
+// Offline mode (BTB-REF-4). No bus, no client, no engine configuration - the referee reads a
+// finished file and reaches the same verdicts a live run reached from the same records.
+int runReplay(const Options& options) {
+    std::vector<Condition> conditions;
+    std::string error;
+    if (!loadConditions(options.conditionsPath, conditions, error)) {
+        N8RO_LOG_ERROR(std::string("condition file rejected: ") + error, kCategory);
+        return kExitConditionsInvalid;
+    }
+    N8RO_LOG_INFO(std::string("loaded ") + std::to_string(conditions.size()) +
+                      " conditions from " + options.conditionsPath,
+                  kCategory);
+
+    std::string outDir;
+    if (!validateOutDir(options.outDir, outDir)) {
+        return kExitOutDirInvalid;
+    }
+
+    // The verdict file is named from the capture rather than from a scenario, because replay
+    // is addressed by the file it re-judges. `capture-x-000.n8rocap.jsonl` gives
+    // `verdicts-x-000.replay.jsonl`, so a replay never overwrites the live run's verdicts and
+    // the two can be diffed - which is exactly what BTB-REF-4's acceptance criterion asks for.
+    const std::filesystem::path capture(options.replayPath);
+    std::string stem = capture.filename().string();
+    const std::string captureSuffix = ".n8rocap.jsonl";
+    if (stem.size() > captureSuffix.size() &&
+        stem.compare(stem.size() - captureSuffix.size(), captureSuffix.size(), captureSuffix) ==
+            0) {
+        stem.resize(stem.size() - captureSuffix.size());
+    }
+    if (stem.rfind("capture-", 0) == 0) {
+        stem = stem.substr(std::string("capture-").size());
+    }
+    const std::string verdictPath =
+        (std::filesystem::path(outDir) / ("verdicts-" + stem + ".replay.jsonl")).string();
+
+    ReplayResult result;
+    if (!replay(options.replayPath, verdictPath, conditions, result, error)) {
+        N8RO_LOG_ERROR(std::string("replay failed: ") + error, kCategory);
+        return kExitReplayFailed;
+    }
+
+    std::printf("\n=== replay summary ======================================================\n");
+    std::printf("capture     %s\n", options.replayPath.c_str());
+    std::printf("format      %s   end_reason %s\n", result.formatVersion.c_str(),
+                result.endReason.empty() ? "(none)" : result.endReason.c_str());
+    std::printf("read        %llu lines (segments=%llu samples=%llu entity_add=%llu "
+                "entity_remove=%llu)\n",
+                static_cast<unsigned long long>(result.linesRead),
+                static_cast<unsigned long long>(result.segments),
+                static_cast<unsigned long long>(result.samples),
+                static_cast<unsigned long long>(result.entityAdds),
+                static_cast<unsigned long long>(result.entityRemoves));
+    if (result.verdictsInInput != 0) {
+        std::printf("            the capture already carried %llu verdict records from the run "
+                    "that produced it; ignored\n",
+                    static_cast<unsigned long long>(result.verdictsInInput));
+    }
+    std::printf("conditions  %zu declared\n", conditions.size());
+    std::printf("verdicts    %llu written (%llu met, %llu not met) -> %s\n",
+                static_cast<unsigned long long>(result.verdictsEmitted),
+                static_cast<unsigned long long>(result.met),
+                static_cast<unsigned long long>(result.verdictsEmitted - result.met),
+                verdictPath.c_str());
+    std::printf("=========================================================================\n");
+    std::fflush(stdout);
+    return kExitOk;
+}
+
 int run(const Options& options) {
     std::string outDir;
     if (!validateOutDir(options.outDir, outDir)) {
         return kExitOutDirInvalid;
+    }
+
+    // BTB-REF-1: a malformed condition file is a named parse error and a non-zero exit
+    // **before any subscription is made**. A run that quietly evaluates nothing and reports
+    // nothing is indistinguishable from one where everything passed.
+    std::vector<Condition> conditions;
+    if (!options.conditionsPath.empty()) {
+        std::string conditionError;
+        if (!loadConditions(options.conditionsPath, conditions, conditionError)) {
+            N8RO_LOG_ERROR(std::string("condition file rejected: ") + conditionError, kCategory);
+            return kExitConditionsInvalid;
+        }
+        N8RO_LOG_INFO(std::string("loaded ") + std::to_string(conditions.size()) +
+                          " conditions from " + options.conditionsPath +
+                          "; verdicts go into the capture and into a verdicts-*.jsonl beside it",
+                      kCategory);
+    } else {
+        N8RO_LOG_INFO(std::string("no --conditions given; recording only, no verdicts will be "
+                                  "evaluated"),
+                      kCategory);
     }
 
     // The registry is built from our own DbModel over the same model path and schema file
@@ -528,6 +673,12 @@ int run(const Options& options) {
         // Only used to name the file when the bridge attached mid-run and has therefore never
         // seen a scenario_loaded. A local read on the client; nothing here touches the bus.
         [&client] { return client->getLoadedScenarioName().value_or(std::string{}); });
+
+    if (!conditions.empty()) {
+        // Driven on the writer thread, from the same record stream in the same order, so a
+        // verdict lands in the capture at the position where it was decided.
+        writer.setReferee(std::make_unique<Referee>(conditions));
+    }
 
     // --- subscriptions ------------------------------------------------------------------
     //
@@ -879,7 +1030,7 @@ int main(int argc, char** argv) {
             return kExitUsage;
         }
 
-        const int code = run(options);
+        const int code = options.isReplay() ? runReplay(options) : run(options);
         n8ro::core::GlobalLogger::flush();
         return code;
     } catch (const std::exception& e) {

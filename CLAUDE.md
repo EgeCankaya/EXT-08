@@ -82,7 +82,7 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
-**M1 through M5 are delivered. M6 is next.**
+**M1 through M6 are delivered. M7 is next.**
 
 **OQ-1 is decided: we own the entity picture permanently** (PRD rev 3, ADR-1). It is not a
 shim. It has tests in `tests/entity-picture/` that need no simulator — keep them passing, and
@@ -99,7 +99,7 @@ the code that ordinal is `Occupancy::generation`; in the capture it is spelled `
 **Every decision taken during M5–M7 is recorded in `docs/decisions-m5-m7.md`** — read it
 before revisiting one, because most of them turned on a measurement rather than a preference.
 
-M6 inherits these from M5, all measured rather than assumed:
+M7 inherits these from M5 and M6, all measured rather than assumed:
 
 - **A single run produces two segments**, because the engine's stop path unloads and reloads.
   Segment 1 is the teardown reload and holds the re-created roster at occupancy 2. Not a bug.
@@ -117,6 +117,15 @@ M6 inherits these from M5, all measured rather than assumed:
   against targets of 20 / 100 / 500 µs. `src/HandlerTiming.h` is the instrument.
 - The internal-queue drop counters are the one deliberately scheduler-dependent thing in the
   file. They are zero whenever a byte comparison is meaningful; §14 says so.
+- **Live and replay verdicts are byte-identical**, and that holds by construction: one
+  `Referee`, two `FieldSource` implementations. Do not duplicate a deciding rule across the
+  two paths - that is the only way to break it. End-of-run verdicts are anchored on the last
+  *data* record for the same reason.
+- **OQ-4 and OQ-6 are resolved** (PRD rev 7). `FIFO_DROP` / 1024 at the bus, and the condition
+  schema is EXT-08's own, documented in the README.
+- **R7 was re-measured and reframed, not closed.** The rate hypothesis was falsified, and the
+  host's own per-entity dump - the instrument M4 measured against - loses whole frames too.
+  Treat it as a one-sided bound, never as ground truth.
 
 ## Conventions
 

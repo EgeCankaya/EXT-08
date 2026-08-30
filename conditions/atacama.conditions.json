@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "EXT-08 referee conditions for the Atacama Air Defense reference scenario.",
+    "The schema is documented in README.md under 'Declaring conditions'. Every key not",
+    "listed there is ignored, which is what lets this comment live here.",
+    "",
+    "Units are the platform's own and are never converted: metres for distances,",
+    "degrees for angles, and geodetic positions in the platform's [lat, lon, alt] order."
+  ],
+
+  "conditions": [
+    {
+      "id": "red-leader-reaches-airfield",
+      "kind": "proximity",
+      "entities": ["RedUAV_N_01", "BlueBase_Airfield"],
+      "within_m": 3000
+    },
+
+    {
+      "id": "red-leader-enters-base-circle",
+      "kind": "area",
+      "entity": "RedUAV_N_01",
+      "test": "inside",
+      "region": {
+        "shape": "circle",
+        "centre": [-23.49849, -68.25173, 7.5],
+        "radius_m": 3000
+      }
+    },
+
+    {
+      "id": "red-leader-crosses-corridor",
+      "kind": "area",
+      "entity": "RedUAV_N_01",
+      "test": "inside",
+      "region": {
+        "shape": "polygon",
+        "vertices": [
+          [-23.47, -68.29],
+          [-23.47, -68.23],
+          [-23.52, -68.23],
+          [-23.52, -68.29]
+        ]
+      }
+    },
+
+    {
+      "id": "red-leader-is-destroyed",
+      "kind": "terminal_state",
+      "entity": "RedUAV_N_01",
+      "removal_reason": "destroyed"
+    },
+
+    {
+      "id": "airfield-reaches-operational",
+      "kind": "terminal_state",
+      "entity": "BlueBase_Airfield",
+      "field": "phase",
+      "equals": "operational"
+    },
+
+    {
+      "_comment": "Deliberately never met. BTB-REF-2 requires an explicit not-met verdict at end of run rather than silence, and a condition file with nothing to prove it would not exercise that.",
+      "id": "command-centre-is-destroyed",
+      "kind": "terminal_state",
+      "entity": "BlueBase_CommandCenter",
+      "removal_reason": "destroyed"
+    },
+
+    {
+      "_comment": "Also never met: the two bases are about 400 m apart, so a 10 m threshold cannot be reached. This is the proximity kind's not-met case.",
+      "id": "bases-implausibly-close",
+      "kind": "proximity",
+      "entities": ["BlueBase_Airfield", "BlueBase_AmmoDepot"],
+      "within_m": 10
+    }
+  ]
+}

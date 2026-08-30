@@ -49,14 +49,17 @@ constexpr const char* kProducerName = "n8ro-bridge";
 // Both were run-to-run variable at 0.4.0 (see docs/capture-format-v1.md §16). 0.4.2 adds the
 // bus's four delivery-side drop counters to `bus_metrics`, which nothing in this program had
 // ever read - adding keys is non-breaking, so the format version does not move.
-// 0.5.0 is M5: the buffer-then-dump recorder is gone, replaced by a writer thread behind a
-// bounded queue, and the producer now emits the record types M4 left unwritten -
-// segment_open / segment_close driven by scenario events, and entity_add / entity_remove
-// from the roster. `drops.samples_not_recorded` carries a real overflow count for the first
-// time, and `drops.events_not_recorded` joins it. Adding keys is non-breaking (spec section
-// 13), and every record type emitted was already specified, so the format version does not
-// move.
-constexpr const char* kProducerVersion = "0.5.0";
+// 0.5.0 was M5: the writer thread behind a bounded queue, segment_open / segment_close
+// driven by scenario events, entity_add / entity_remove from the roster, and a real overflow
+// count in `drops.samples_not_recorded`.
+//
+// 0.6.0 is M6: `verdict` records are emitted, which completes the eight-type vocabulary. The
+// referee also writes them to a `verdicts-*.jsonl` beside the capture, so a live run and a
+// `--replay` of its own capture can be compared as files - and they are byte-identical, which
+// is what makes BTB-REF-4 a test rather than a claim. Nothing about the format changed: every
+// record type emitted was already specified and no key was renamed or retyped, so this is
+// still n8ro-capture/1.
+constexpr const char* kProducerVersion = "0.6.0";
 
 // Every value here is observed, not asserted. `runtimeVersion` comes from the SDK's own
 // getN8roVersion(), which reports "unknown" when the release headers were compiled without

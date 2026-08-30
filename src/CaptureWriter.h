@@ -47,6 +47,7 @@
 #include "CaptureFormat.h"
 #include "CaptureRecord.h"
 #include "RecordQueue.h"
+#include "Referee.h"
 
 #include <messaging/packed/MessageSchema.h>
 
@@ -55,6 +56,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,7 +76,7 @@ struct WriterCounts {
     std::uint64_t samples = 0;
     std::uint64_t entitiesAdded = 0;
     std::uint64_t entitiesRemoved = 0;
-    std::uint64_t verdicts = 0;          // always 0 until M6
+    std::uint64_t verdicts = 0;
     std::uint64_t stagedDropped = 0;     // staging area overflow - see kStagingCapacity
     std::uint64_t unloadNoiseIgnored = 0; // scenario_unloaded with an empty scenario name
 };
@@ -93,6 +95,18 @@ public:
                   n8ro::sim::MessageSchema stateSchema, std::size_t maxSamples,
                   std::function<bool()> attachedMidRun,
                   std::function<std::string()> lastKnownScenario);
+
+    // Optional. When present, the referee is driven from the same record stream the writer is
+    // already draining, in the same order, so a verdict lands in the capture at the position
+    // and in the segment where it was decided. Set before run(); owned from here on.
+    //
+    // Verdicts go to two places: into the capture as `verdict` records, and into a separate
+    // `verdicts-<scenario>-<run-label>.jsonl` beside it. The first is what the format
+    // specifies; the second is what replay can also produce, which is how "live verdicts
+    // equal replay verdicts" becomes a file comparison (BTB-REF-4).
+    void setReferee(std::unique_ptr<Referee> referee);
+
+    [[nodiscard]] const std::string& verdictPath() const { return verdictPath_; }
 
     // The writer thread's body. Drains until the queue is closed and empty, then returns.
     void run(RecordQueue& queue);
@@ -140,6 +154,7 @@ private:
     void closeSegment(double simTimeS, const char* reason);
     void flushStaging();
     void emit(const std::string& line);
+    void drainVerdicts();
 
     std::string outDir_;
     std::string runLabel_;
@@ -164,12 +179,23 @@ private:
     // Roster records waiting for a segment to belong to.
     std::deque<CaptureRecord> staging_;
 
+    std::unique_ptr<Referee> referee_;
+    std::ofstream verdictFile_;
+    std::string verdictPath_;
+
     capture::FieldPresence presence_;
     WriterCounts counts_;
     double firstSampleSimTimeS_ = 0.0;
     double lastSampleSimTimeS_ = 0.0;
     bool haveFirstSample_ = false;
     double lastRecordSimTimeS_ = 0.0;
+
+    // The last record that carried data rather than a boundary. End-of-run verdicts are
+    // stamped from these so that live and replay agree exactly: replay reads a file whose
+    // boundary records it also sees, and anchoring on the last *data* record is the one
+    // point both paths can reach identically (BTB-REF-4).
+    double lastDataSimTimeS_ = 0.0;
+    std::uint64_t lastDataSegment_ = 0;
 
     std::atomic<bool> budgetReached_{false};
     std::atomic<std::uint64_t> samplesWritten_{0};

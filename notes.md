@@ -1378,3 +1378,182 @@ computing a duration from them gives zero for a run of any length.
 - **The staging area's high-water mark was 42 and the queue's was 42**, on a queue of 8192.
   At the reference rate the writer keeps up completely; the queue is sized for a burst that
   did not happen. That is the right way round, and M6's overload is where it gets tested.
+
+## M6 — The referee, and what re-measuring R7 actually found
+
+Two halves. The referee was the straightforward one: three condition kinds, a declaration file,
+and the same evaluation engine driven from a live bus or from a stored file. The measurement
+half was not straightforward at all, and it changed what we believe about R7.
+
+### Live verdicts and replay verdicts are byte-identical
+
+BTB-REF-4's acceptance criterion is that a live run and an offline re-judgement of the same
+records produce identical verdicts. They do, and the check is a hash rather than an inspection:
+
+```
+live    1718 bytes  7 lines  sha256 dca9c5fe63587cc6ad53ce42b91a05bb78790151bbdfd137fe6829e398652faa
+replay  1718 bytes  7 lines  sha256 dca9c5fe63587cc6ad53ce42b91a05bb78790151bbdfd137fe6829e398652faa
+```
+
+That is true **by construction rather than by testing**, which is the part worth keeping. There
+is one `Referee` class and one set of deciding rules; the two paths differ only in a
+`FieldSource` that reads a named field out of either a decoded `StreamValueMap` or a parsed
+`sample.fields` object. Nothing about proximity, containment or terminal state is written
+twice, so the two paths cannot drift.
+
+It also depends on two smaller things being right, and both were designed for rather than
+discovered:
+
+- **Floats survive the round trip exactly.** `std::to_chars` shortest round-trip out,
+  `strtod` back in, identical bit pattern — so the distance computed live and the distance
+  computed from the file are the same double, not merely close. OQ-5 was settled at M1 for the
+  capture's sake; this is the second thing it bought.
+- **End-of-run verdicts have to be anchored somewhere both paths can reach.** They are stamped
+  from the last *data* record — the last `sample`, `entity_add` or `entity_remove` — rather
+  than from the last record of any kind. A replay reading the file also sees the `segment_close`
+  and the `trailer`, and anchoring on those would have put a different `sim_time_s` in the
+  replayed verdict. One line, and it is the difference between identical and nearly identical.
+
+Replay of a 64 MB, 132 454-line capture takes **1.02 s** against BTB-REF-4's target of under
+60 s for a ten-minute capture.
+
+### The verdicts, and what a verdict is worth
+
+The reference run's seven, in the order they were decided:
+
+```
+airfield-reaches-operational    met   t=0.05     phase=operational
+red-leader-reaches-airfield     met   t=149.05   distance_m=2999.9981116642175  within_m=3000
+red-leader-enters-base-circle   met   t=149.05   distance_from_centre_m=2999.95  radius_m=3000
+red-leader-crosses-corridor     met   t=149.05   polygon
+red-leader-is-destroyed         met   t=149.45   removal_reason=destroyed
+command-centre-is-destroyed     NOT MET
+bases-implausibly-close         NOT MET
+```
+
+`RedUAV_N_01` closes to 2 999.998 m of the airfield — two millimetres inside a 3 000 m
+threshold — and is shot down 0.4 s later. The narrative reads itself out of the verdict file,
+and every number in it can be checked by hand against samples the capture names: a proximity
+verdict carries each entity's occupancy and each sample's own `sim_time_s`, which is exactly
+enough to find the two causing records.
+
+**The two not-met verdicts are the ones that make the file trustworthy.** Without them, a
+condition that was never evaluated and a condition that was evaluated and never satisfied look
+identical — and BTB-REF-2 is right to insist that silence is not an answer.
+
+### The boundary case is not reachable, and that is worth knowing
+
+The PRD's test plan asks for the boundary case, "exactly at the threshold". Writing it found
+that **a caller cannot arrange one.** A geodetic distance is a computed double: two points a
+nominal 1 000 m apart come out a fraction of a millimetre off 1 000, so `within_m: 1000` does
+not match them and no round threshold ever lands on the boundary.
+
+The documented `<=` therefore matters for **reproducibility** — the same input always gives the
+same answer, on every host and every build — and not because anyone will hit it deliberately.
+The test asserts it by computing the distance first and using that value as the threshold,
+which is the only honest way to test the comparison rather than approximately test it.
+
+Region containment is different and the boundary there *is* reachable, because a region is
+declared rather than computed: a point exactly on a circle's edge or a polygon's edge or
+vertex is **inside**. The polygon case needed explicit handling — ray casting alone gives an
+arbitrary answer on a vertex, depending on which way the parity happened to fall.
+
+### The geodetic method, and why not the obvious one
+
+Positions go to earth-centred, earth-fixed coordinates on WGS-84 and distance is the
+straight-line Euclidean distance in metres. Haversine was the obvious choice and is wrong for
+the question being asked: it ignores altitude, and two aircraft stacked 6 km apart vertically
+are not close. Vincenty answers the surface question, iterates, and famously fails to converge
+near-antipodally. ECEF is closed-form, has no convergence case, handles altitude naturally, and
+is reproducible from the formulae in `src/Geodesy.h` by anyone with a calculator — which is
+what BTB-REF-3's "reproducible by a third party" actually asks for.
+
+Checked against a published figure rather than against our own output: one degree of latitude
+at the equator comes out at 110 574 m.
+
+### R7 re-measured, and the reference turned out to be lossy too
+
+This is the finding that changed a belief rather than confirming one.
+
+M4 measured our capture against the simulation host's own per-entity dump and found 19 samples
+(0.019 %) absent with every platform counter reading zero — 18 of them in a single frame. That
+became R7: *a capture is not a guaranteed-complete transcript, and no counter says so.* M6 was
+tasked with re-running it under the 126-entity overload scenario, on the stated hypothesis that
+three times the rate would provoke the mechanism and make it attributable.
+
+Both runs, compared per `(entity, sim_time_s)` against the host's own record:
+
+| | reference, 818/s | overload, 2 487/s |
+|---|---:|---:|
+| samples in the compared window | 131 744 | 135 581 |
+| **absent from our capture** | **30 (0.023 %)**, all in **one** frame | **0** |
+| **absent from the host's own dump**, though present in our capture | 30, in three frames | 203, in four frames |
+| what every counter reported | zero | zero |
+
+Three findings, and the third is the one that matters.
+
+**The hypothesis was wrong.** Three times the rate did not provoke it; the overload run's
+capture was complete by the host's own account across 135 581 samples. Whatever the mechanism
+is, throughput is not the trigger. Worth recording as plainly as the finding itself — M6 was
+commissioned to provoke it and instead falsified the reason for expecting to.
+
+**The loss is frame-shaped, and reproducible in shape if not in place.** Where our capture is
+short it is short by most of one frame — 30 of that frame's 39 samples at t = 73.10. M4 saw
+18 of 19 in one frame. Whatever drops them drops a batch.
+
+**And the host's own dump loses whole frames too.** It is missing samples our capture contains:
+30 at the reference rate across three frames, 203 under the overload across four. That is the
+same shape, in an artifact written **inside the host process**, with no bus, no subscription
+and no consumer anywhere in its path.
+
+That reframes R7 rather than closing it:
+
+- The comparison bounds our completeness **from one side only**. The host's dump is not ground
+  truth, so "30 absent" is an upper bound on the disagreement between two lossy artifacts, not
+  a measurement of our loss.
+- A frame-shaped gap appearing in an in-process writer is evidence that the mechanism sits
+  **upstream of any consumer**. No subscription policy, queue size or backpressure choice can
+  affect something that also happens to a file writer inside the publisher.
+- The honest statement to EXT-17 is unchanged and now better founded: all-zero counters mean
+  nothing the platform counts was lost, not that nothing was lost — and you cannot establish
+  the difference from the host's own record either. §14 of the format spec carries all of it.
+
+`tests/publisher-compare/compare.py` is the tool, kept in the repository rather than
+reconstructed each time, and it now reports loss in **both** directions by frame, because the
+direction that surprised us was the one M4 had not thought to print.
+
+### OQ-4, resolved
+
+**`FIFO_DROP` with a bus-side queue of 1024.** Three legs:
+
+- **`BLOCK` is rejected on principle, and no measurement could overturn it.** A recorder that
+  stalls the bus changes the run it is recording. ADR-4 says so, [S2] reaches the same
+  conclusion independently from the downstream side (PRD rev 6), and §14 of the format spec
+  now promises consumers in writing that this producer never blocks. Testing it would mean
+  deliberately building a producer that violates its own published contract.
+- **`FIFO_DROP` at 1024 is sufficient.** Zero bus-side drops on the overload scenario at
+  2 487 samples/s — 136 000 samples, `dropped_by_backpressure: 0`. The internal queue's
+  high-water mark was **54 of 8 192**.
+- **The residual unexplained loss does not bear on the choice.** The PRD said OQ-4 could not
+  honestly be resolved while a loss path existed that no counter reports. That path still
+  exists, but it is now known to affect an in-process consumer with no subscription at all,
+  so no backpressure policy can be implicated in it.
+
+The overload scenario is not, on this design, an overload. The only way to make the internal
+queue drop anything was `--queue-size 4`, which is three orders of magnitude below the default.
+
+### Smaller things
+
+- **The condition file needed a JSON parser, and replay needed the same one.** Both arrived
+  together, which is the argument for `--replay` being cheap: the reader a capture consumer
+  needs is the reader a condition file needs.
+- **A duplicate object key is rejected rather than resolved.** Last-wins and first-wins are
+  both defensible and neither is discoverable by the person who wrote the file twice.
+- **The condition loader rejects an empty `conditions` array.** A run that evaluates nothing
+  and reports nothing is indistinguishable from one where everything passed, which is the same
+  failure mode BTB-REF-1 exists to prevent one level up.
+- **This machine's locale really is comma-decimal.** PowerShell reported the replay time as
+  `1,02 s`. That is the hazard OQ-5 catalogued, visible in passing — and the reason the capture
+  and the verdict file both go through `std::to_chars` rather than the `printf` family.
+- **`n8ro-sim-local`'s per-entity dump is ~58 MB for a 60-second 126-entity run**, on top of
+  our own 72 MB capture. Running two lossy recorders to check one another is not free.

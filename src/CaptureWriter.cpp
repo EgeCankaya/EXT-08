@@ -106,6 +106,24 @@ CaptureWriter::CaptureWriter(std::string outDir, std::string runLabel,
       lastKnownScenario_(std::move(lastKnownScenario)),
       presence_(stateSchema_) {}
 
+void CaptureWriter::setReferee(std::unique_ptr<Referee> referee) {
+    referee_ = std::move(referee);
+}
+
+void CaptureWriter::drainVerdicts() {
+    if (!referee_) {
+        return;
+    }
+    for (const Verdict& verdict : referee_->drainVerdicts()) {
+        const std::string line = writeVerdict(verdict);
+        ++counts_.verdicts;
+        emit(line);
+        if (verdictFile_) {
+            verdictFile_ << line << '\n';
+        }
+    }
+}
+
 void CaptureWriter::emit(const std::string& line) {
     if (failed_) {
         return;
@@ -155,6 +173,23 @@ bool CaptureWriter::ensureOpen(const std::string& scenarioForName) {
     opened_ = true;
     emit(capture::writeHeader(header_));
 
+    if (referee_) {
+        const std::filesystem::path verdicts =
+            std::filesystem::path(outDir_) /
+            ("verdicts-" + slug + "-" + runLabel_ + ".jsonl");
+        verdictPath_ = verdicts.string();
+        verdictFile_.open(verdictPath_, std::ios::binary | std::ios::trunc);
+        if (!verdictFile_) {
+            // Not fatal to the capture. The verdicts are still written into the capture
+            // itself as `verdict` records, which is what the format specifies; the separate
+            // file is the convenience that makes a live-versus-replay comparison a diff.
+            N8RO_LOG_ERROR(std::string("could not open verdict file for writing: ") +
+                               verdictPath_ + "; verdicts will appear in the capture only",
+                           kCategory);
+            verdictPath_.clear();
+        }
+    }
+
     N8RO_LOG_INFO(std::string("capture opened: ") + path_ + " format " + capture::kFormatVersion +
                       " producer " + capture::kProducerVersion + " attached_mid_run=" +
                       (header_.attachedMidRun ? "true" : "false"),
@@ -194,12 +229,23 @@ void CaptureWriter::flushStaging() {
             ++counts_.entitiesAdded;
             emit(capture::writeEntityAdd(record.simTimeS, segmentOrdinal_, record.subject,
                                          record.occupancy));
+            if (referee_) {
+                referee_->onEntityAdd(record.subject, record.occupancy, record.simTimeS,
+                                      segmentOrdinal_);
+            }
         } else if (record.kind == RecordKind::EntityRemove) {
             ++counts_.entitiesRemoved;
             emit(capture::writeEntityRemove(record.simTimeS, segmentOrdinal_, record.subject,
                                             record.occupancy, record.reason));
+            if (referee_) {
+                referee_->onEntityRemove(record.subject, record.occupancy, record.simTimeS,
+                                         segmentOrdinal_, record.reason);
+            }
         }
         lastRecordSimTimeS_ = record.simTimeS;
+        lastDataSimTimeS_ = record.simTimeS;
+        lastDataSegment_ = segmentOrdinal_;
+        drainVerdicts();
     }
 }
 
@@ -252,12 +298,23 @@ void CaptureWriter::apply(const CaptureRecord& record) {
                 ++counts_.entitiesAdded;
                 emit(capture::writeEntityAdd(record.simTimeS, segmentOrdinal_, record.subject,
                                              record.occupancy));
+                if (referee_) {
+                    referee_->onEntityAdd(record.subject, record.occupancy, record.simTimeS,
+                                          segmentOrdinal_);
+                }
             } else {
                 ++counts_.entitiesRemoved;
                 emit(capture::writeEntityRemove(record.simTimeS, segmentOrdinal_, record.subject,
                                                 record.occupancy, record.reason));
+                if (referee_) {
+                    referee_->onEntityRemove(record.subject, record.occupancy, record.simTimeS,
+                                             segmentOrdinal_, record.reason);
+                }
             }
             lastRecordSimTimeS_ = record.simTimeS;
+            lastDataSimTimeS_ = record.simTimeS;
+            lastDataSegment_ = segmentOrdinal_;
+            drainVerdicts();
             return;
         }
 
@@ -295,6 +352,16 @@ void CaptureWriter::apply(const CaptureRecord& record) {
             lastSampleSimTimeS_ = record.simTimeS;
             emit(capture::writeSample(record, segmentOrdinal_, stateSchema_));
             lastRecordSimTimeS_ = record.simTimeS;
+            lastDataSimTimeS_ = record.simTimeS;
+            lastDataSegment_ = segmentOrdinal_;
+            if (referee_) {
+                // Driven from the record that was just written, so a verdict can never refer
+                // to a sample the capture does not contain (BTB-REF-2).
+                const StreamValueSource source(record.values);
+                referee_->onSample(record.subject, record.occupancy, record.simTimeS,
+                                   segmentOrdinal_, source);
+                drainVerdicts();
+            }
             if (maxSamples_ != 0 && counts_.samples >= maxSamples_) {
                 budgetReached_.store(true);
             }
@@ -354,6 +421,22 @@ bool CaptureWriter::finish(EndReason reason, const capture::TrailerDrops& drops,
         openSegment(lastScenarioSeen_, staging_.front().simTimeS);
     }
 
+    if (referee_) {
+        // Explicit not-met verdicts for everything never satisfied (BTB-REF-2). Emitted
+        // before the segment closes, so every verdict record sits inside a segment as the
+        // format requires, and anchored on the last *data* record so replay reaches the same
+        // stamp from the same file.
+        for (const Verdict& verdict : referee_->finalVerdicts(lastDataSegment_,
+                                                              lastDataSimTimeS_)) {
+            const std::string line = writeVerdict(verdict);
+            ++counts_.verdicts;
+            emit(line);
+            if (verdictFile_) {
+                verdictFile_ << line << '\n';
+            }
+        }
+    }
+
     closeSegment(lastRecordSimTimeS_, endReasonName(reason));
 
     capture::TrailerCounts counts;
@@ -368,6 +451,10 @@ bool CaptureWriter::finish(EndReason reason, const capture::TrailerDrops& drops,
     file_.flush();
     const bool ok = !failed_ && static_cast<bool>(file_);
     file_.close();
+    if (verdictFile_) {
+        verdictFile_.flush();
+        verdictFile_.close();
+    }
     if (!ok) {
         N8RO_LOG_ERROR(std::string("capture file was opened but writing failed: ") + path_,
                        kCategory);

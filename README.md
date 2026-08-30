@@ -4,14 +4,17 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 through M5.** The bridge registers the packed schemas, resolves **four** topics
+**Status: M1 through M6.** The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
 subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
 streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
 queue. It splits a scenario reload into separate segments, writes the roster's transitions out
 as `entity_add` / `entity_remove` records, detects the simulator disappearing and closes the
-capture cleanly, and works whichever of the two processes starts first. Once a second it prints
-the engine state, the entity picture, the capture's progress and both bus loss surfaces.
+capture cleanly, and works whichever of the two processes starts first.
+
+It also **judges**: conditions declared in a JSON file are evaluated against the run, live or
+offline against a stored capture, and produce `verdict` records. Live and replay verdicts over
+the same run are byte-identical — see [The referee](#the-referee).
 
 The capture format is specified in [`docs/capture-format-v1.md`](docs/capture-format-v1.md).
 That document is a **cross-repo contract**: EXT-17 gets it and nothing else, and the
@@ -19,12 +22,11 @@ conformance reader in `tests/capture-reader/` was written from it alone — it l
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
-It does not judge anything yet — the referee, the condition file, `verdict` records and
-`--replay` are M6, and §16 of the format spec states exactly what a current capture is missing.
-There is no signal handling yet either: an M5 run ends when the simulation host stops
-publishing, or on a record budget if you set one. Ctrl-C with a clean drain is M7.
+There is no signal handling yet: a live run ends when the simulation host stops publishing, or
+on a record budget if you set one. Ctrl-C with a clean drain is M7, and so is the byte-limited
+capture (BTB-CAP-6).
 
-Both backpressure boundaries are now set explicitly (BTB-BP-3, BTB-BP-4) — see
+Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
 [Backpressure](#backpressure) below for the values and why they are those values.
 
 ### Two things to know before you compare or trust a capture
@@ -128,9 +130,12 @@ with `end_reason: host_lost`, prints a run summary and exits 0.
 | `--engine-state-message` | message instance name the host-loss heartbeat is resolved *from*. Default `simEngineState`. Optional |
 | `--queue-size` | handler-to-writer queue bound, in sample records. Default `8192`. Optional |
 | `--overflow-policy` | `drop_newest` (default) or `drop_oldest`. Optional |
-| `--capture-max-samples` | stop after this many `sample` records and close with `end_reason: size_limit`. Default `0`, meaning no bound — an M5 run ends on host loss. Optional |
+| `--capture-max-samples` | stop after this many `sample` records and close with `end_reason: size_limit`. Default `0`, meaning no bound — a live run ends on host loss. Optional |
+| `--conditions` | JSON file of declared conditions. Without it the bridge records but judges nothing. Optional |
+| `--replay` | offline mode: re-judge a stored capture with no simulator, no bus and no client. Requires `--conditions`, and is mutually exclusive with `--config` |
 
-`--config`, `--model-path`, `--schema-file` and `--out-dir` are required; none are compiled in.
+`--config`, `--model-path`, `--schema-file` and `--out-dir` are required for a live run; none
+are compiled in. A replay needs only `--replay` and `--conditions`.
 
 ### The capture file's name
 
@@ -256,6 +261,8 @@ scenario load is *refused* — `Component type 'componentPhysics' has no registe
 | 14 | the scenario-event topic could not be resolved, so reloads could not be told apart (BTB-CX-4) |
 | 15 | the engine-state topic could not be resolved, so host loss could not be detected. The bridge refuses to run rather than block indefinitely on a dead bus (BTB-CX-3) |
 | 16 | `--out-dir` is missing, is not a directory, or is not writable |
+| 17 | the condition file is malformed — named parse error, **before any subscription** (BTB-REF-1) |
+| 18 | a replay failed: the capture is missing, truncated, malformed, or declares a `format_version` this build does not implement |
 
 ### Loss reporting
 
@@ -285,6 +292,151 @@ the file it could not open and then names all three values back:
 [ERROR] (n8ro-bridge)   --schema-file = NoSuchSchema
 ```
 
+## The referee
+
+The bridge evaluates **declared conditions** against a run and emits a verdict for each. The
+conditions live in a JSON file, so adding or changing one needs no rebuild — which is the whole
+point: conditions compiled into the binary cannot be re-applied to a stored run, and
+re-applying them to a stored run is what makes a capture worth keeping.
+
+```cmd
+:: live - judge as the run happens
+build\x64\Release\n8ro-bridge.exe ^
+    --config      SimEngineClient_SharedMemory ^
+    --model-path  C:\N8RO\data\db ^
+    --schema-file N8roSimSchema ^
+    --out-dir     captures ^
+    --conditions  conditions\atacama.conditions.json
+
+:: offline - re-judge a finished capture, no simulator, no bus, no client
+build\x64\Release\n8ro-bridge.exe ^
+    --replay     captures\capture-atacama-air-defense-000.n8rocap.jsonl ^
+    --conditions conditions\atacama.conditions.json
+```
+
+Verdicts go to two places: into the capture as `verdict` records, and into a
+`verdicts-<scenario>-<run-label>.jsonl` beside it. A replay writes
+`verdicts-<stem>.replay.jsonl`, so it never overwrites the live run's.
+
+### Live and replay agree, byte for byte
+
+```
+live    1718 bytes  sha256 dca9c5fe63587cc6ad53ce42b91a05bb78790151bbdfd137fe6829e398652faa
+replay  1718 bytes  sha256 dca9c5fe63587cc6ad53ce42b91a05bb78790151bbdfd137fe6829e398652faa
+```
+
+That is BTB-REF-4's acceptance criterion, and it holds **by construction rather than by
+testing**: there is one evaluation engine, and the two paths differ only in how a named field
+is read out of a record — a decoded `StreamValueMap` off the bus, or a parsed `sample.fields`
+object out of a file. No deciding rule is written twice, so the two cannot drift.
+
+It is also the strongest available check on the format itself. If the referee can re-derive its
+own verdicts from the file alone, the file demonstrably contains enough for a third party.
+
+Replay of a 64 MB, 132 454-line capture takes **1.02 s**, against a target of under 60 s for a
+ten-minute capture.
+
+### Declaring conditions
+
+The vocabulary is **closed at three kinds**. A fourth is a named parse error and a non-zero
+exit before any subscription is made — never a silently skipped condition, because a run that
+reports "all passed" after quietly dropping the one that mattered is the failure this design
+exists to prevent.
+
+```json
+{
+  "conditions": [
+    {"id": "red-leader-reaches-airfield", "kind": "proximity",
+     "entities": ["RedUAV_N_01", "BlueBase_Airfield"], "within_m": 3000},
+
+    {"id": "red-leader-enters-base-circle", "kind": "area", "entity": "RedUAV_N_01",
+     "test": "inside",
+     "region": {"shape": "circle", "centre": [-23.49849, -68.25173, 7.5], "radius_m": 3000}},
+
+    {"id": "red-leader-crosses-corridor", "kind": "area", "entity": "RedUAV_N_01",
+     "region": {"shape": "polygon",
+                "vertices": [[-23.47, -68.29], [-23.47, -68.23],
+                             [-23.52, -68.23], [-23.52, -68.29]]}},
+
+    {"id": "red-leader-is-destroyed", "kind": "terminal_state",
+     "entity": "RedUAV_N_01", "removal_reason": "destroyed"},
+
+    {"id": "airfield-reaches-operational", "kind": "terminal_state",
+     "entity": "BlueBase_Airfield", "field": "phase", "equals": "operational"}
+  ]
+}
+```
+
+A working file is committed at
+[`conditions/atacama.conditions.json`](conditions/atacama.conditions.json).
+
+| key | applies to | meaning |
+|---|---|---|
+| `id` | all | Stable identifier, unique in the file. It is what the verdict is traced by, so a duplicate is a parse error |
+| `kind` | all | `proximity`, `area` or `terminal_state`. Anything else is a named parse error |
+| `entities` | proximity | Exactly two entity names. Naming the same one twice is rejected — it is met at distance zero |
+| `within_m` | proximity | Threshold in **metres**. The comparison is `<=` |
+| `entity` | area, terminal_state | One entity name |
+| `test` | area | `inside` (default) or `outside` |
+| `region.shape` | area | `circle` or `polygon` |
+| `region.centre` | circle | `[latitude°, longitude°, altitude m]`. Altitude may be omitted and defaults to 0. `center` is accepted too |
+| `region.radius_m` | circle | Radius in **metres**, positive |
+| `region.vertices` | polygon | At least three `[latitude°, longitude°]` points |
+| `removal_reason` | terminal_state | Matched **verbatim** against `entity_remove.reason`. The platform's vocabulary is open, so a supplier-specific reason this build has never seen still matches |
+| `field` + `equals` | terminal_state | Matched against a sample's field value. Use one form or the other, never both |
+
+Any key the loader does not recognise is ignored, which is what lets a `_comment` live in the
+file. Units are the platform's own and are never converted: metres, degrees, and the
+platform's `[lat, lon, alt]` order.
+
+### Verdict semantics
+
+**One verdict per condition per run.** At the first moment it is satisfied, or an explicit
+`met: false` at end of run. It is not re-emitted on every later sample that also satisfies it —
+"did the two aircraft come within 5 km" is answered by the first time they did.
+
+**The not-met verdict is the load-bearing half.** Without it, a condition that was evaluated
+and never satisfied is indistinguishable from one nobody evaluated.
+
+A verdict carries enough to find the samples that caused it. A proximity verdict names both
+entities, each one's **occupancy**, each one's sample `sim_time_s`, and the computed distance —
+which is exactly the key needed to locate the two causing records in the capture.
+
+```
+red-leader-reaches-airfield  met  t=149.05  distance_m=2999.9981116642175  within_m=3000
+red-leader-is-destroyed      met  t=149.45  removal_reason=destroyed
+command-centre-is-destroyed  NOT MET
+```
+
+### How distance is computed
+
+Positions are converted to **earth-centred, earth-fixed (ECEF) coordinates on WGS-84**, and
+distance is the straight-line Euclidean distance between them in metres. The formulae are in
+[`src/Geodesy.h`](src/Geodesy.h) with the constants spelled out, so a third party can reproduce
+any verdict with a calculator — which is what BTB-REF-3 asks for.
+
+Haversine was rejected because it ignores altitude, and two aircraft stacked 6 km apart
+vertically are not close. Vincenty answers the surface question, iterates, and does not
+converge for near-antipodal pairs.
+
+**Boundary semantics**, because a threshold test that is ambiguous at the threshold is
+untestable:
+
+- A point exactly at `within_m`, or exactly on a circle's edge, is **inside** — the comparison
+  is `<=`.
+- A point exactly on a polygon's edge or vertex is **inside**.
+- Polygons are treated as plane figures in latitude/longitude. Accurate at scenario scale; one
+  spanning the antimeridian or a pole is not supported.
+
+In practice the proximity boundary is not reachable: a geodetic distance is a computed double,
+so two points a nominal 1 000 m apart come out a fraction of a millimetre off and `within_m:
+1000` does not match them. The `<=` matters for **reproducibility** — the same input always
+gives the same answer — not because anyone will land on it.
+
+Altitudes carry the platform's own caveat: where the host's geoid grid is absent, as it is on
+this machine, they are ellipsoidal rather than orthometric. That is the datum ECEF wants, so
+the absence helps here.
+
 ## Tests
 
 The entity picture (`src/EntityPicture.*`) is a component we own permanently rather than a
@@ -311,6 +463,25 @@ The suite's own adequacy is checked by mutation: deliberate defects introduced i
 `EntityPicture.cpp` must make it fail. That is worth re-running when the picture changes —
 it is how the "stale sample survives a re-creation" gap was found, which every other test
 had been passing over.
+
+### The referee
+
+`tests/referee/` covers the three condition kinds against synthetic sample sequences, the
+boundary case, the never-met case, the loader's rejections, and the one invariant that is
+invisible from outside — that a re-created name does not inherit the previous tenure's position
+(ADR-6). It drives the referee through the same `FieldSource` seam the live and replay paths
+use, so it exercises the real entry points. **No simulator, no bus, no model database.**
+
+```cmd
+cl /std:c++17 /EHsc /W4 /O2 ^
+   /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
+   /Fe:referee_test.exe ^
+   tests\referee\referee_test.cpp src\Referee.cpp src\Conditions.cpp ^
+   src\Geodesy.cpp src\JsonParse.cpp src\Json.cpp
+referee_test.exe
+```
+
+93 checks, exit 0 if all pass.
 
 ### Capture conformance reader
 
@@ -363,9 +534,22 @@ removal — **16 caught, 0 survivors.**
 
 `n8ro-sim-local` writes its own per-entity JSONL under `test_artifacts/` in its working
 directory. That is the publisher's own account of what it published, independent of our bus,
-our subscription and our code, and it is the only way to answer "did we record everything?"
-without trusting the counters we are trying to check. It is how R7 was measured — see the M4
-follow-up in [`notes.md`](notes.md) for the method and the numbers.
+our subscription and our code, and it is the closest thing available to answering "did we
+record everything?" without trusting the counters we are trying to check.
+
+```cmd
+python tests\publisher-compare\compare.py ^
+    captures\capture-atacama-air-defense-000.n8rocap.jsonl ^
+    test_artifacts\n8ro-sim-local\sim_entity_state.jsonl
+```
+
+**Read the result carefully in both directions.** M6 established that the host's own dump is
+lossy too — it is missing whole frames that our capture contains, 30 at the reference rate and
+203 under the overload scenario. So this comparison bounds our completeness from one side only
+and is not a ground truth. The tool reports both directions by frame for exactly that reason.
+
+Risk R7 and §14 of the format spec carry the full picture; the M6 section of
+[`notes.md`](notes.md) has the numbers and what changed because of them.
 
 ## Determinism probe
 
@@ -395,10 +579,18 @@ src/RecordQueue.{h,cpp}                  BTB-BP-1/BP-2/BP-4 — the bounded queu
 src/CaptureWriter.{h,cpp}                BTB-CX-3/CX-4 — the writer thread and the segment machine
 src/CaptureFormat.{h,cpp}                BTB-CAP-1/CAP-4 — the `n8ro-capture/1` serialiser
 src/HandlerTiming.{h,cpp}                BTB-BP-1 — how long a handler actually takes
+src/Conditions.{h,cpp}                   BTB-REF-1/REF-3 — the closed three-kind vocabulary
+src/Geodesy.{h,cpp}                      the stated, reproducible distance method
+src/Referee.{h,cpp}                      BTB-REF-2 — one engine, live and offline
+src/Replay.{h,cpp}                       BTB-REF-4 — re-judging a stored capture
 src/Json.{h,cpp}                         JSON escaping and the round-trip-exact float format
+src/JsonParse.{h,cpp}                    reading JSON back — conditions and captures
 src/ExitCodes.h                          one table of process exit codes
+conditions/                              a working condition file for the reference scenario
 tests/entity-picture/                    unit tests for the picture — no simulator needed
+tests/referee/                           unit tests for the referee — no simulator needed
 tests/capture-reader/                    conformance reader, written from the format spec alone
+tests/publisher-compare/                 capture vs the host's own record — how R7 is measured
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
 ```

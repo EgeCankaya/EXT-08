@@ -285,3 +285,133 @@ One consequence nobody had written down, found in the late-attach run: **`entiti
 3). The teardown deletes name entities whose creation the bridge never saw, and those cannot
 become `entity_remove` records without producing a malformed file. It is now in notes.md so a
 reader does not read the imbalance as corruption.
+
+---
+
+## M6 — the referee, live and offline
+
+### D-19 — The condition file is JSON, and replay is what pays for the parser
+
+BTB-REF-1 wants conditions declared outside the code; OQ-6 says design for EXT-08, document it
+fully, and let EXT-17 adopt or supersede it. A line-oriented format would have needed no
+parser, but `--replay` has to read a JSON capture anyway — so a JSON parser was going to exist
+either way, and a second syntax would have been the extra cost rather than the saving.
+
+`src/JsonParse.{h,cpp}` is a small DOM over the subset this project writes. Objects keep their
+members in an **ordered** map, because nothing on the capture or verdict path may iterate an
+unordered container (BTB-CAP-3), and a duplicate key is a named error rather than a
+last-wins-or-first-wins guess nobody can discover.
+
+### D-20 — Distance is 3D Euclidean over WGS-84 ECEF
+
+BTB-REF-3 requires "a stated geodetic method, documented in the README, so a result is
+reproducible by a third party". Positions are converted to earth-centred, earth-fixed
+coordinates and the distance is the straight line between them.
+
+Haversine was the obvious alternative and is wrong for the question: it ignores altitude, and
+two aircraft 6 km apart vertically are not close. Vincenty answers the surface question,
+iterates, and does not converge near-antipodally. ECEF is closed-form, has no convergence case,
+takes altitude for free, and is reproducible from the formulae in `src/Geodesy.h` alone.
+
+Checked against a published figure rather than our own output: one degree of latitude at the
+equator comes out at 110 574 m.
+
+### D-21 — Two region shapes: circle and polygon
+
+BTB-REF-3 says "a declared geodetic region" without naming a shape. A circle alone would have
+made "did red cross this corridor" inexpressible; a polygon alone would have made the common
+case verbose. Both are ~30 lines given the distance function that proximity already needs.
+
+**Boundary semantics, documented because the requirement demands it:** a point on a circle's
+edge is inside (`<=`), and a point on a polygon's edge or vertex is inside. The polygon case
+needed handling explicitly — ray casting alone gives an arbitrary answer on a vertex depending
+on which way the parity falls, so an edge test runs first.
+
+Polygons are treated as plane figures in lat/lon. Accurate at scenario scale, and stated
+rather than hidden: one spanning the antimeridian or a pole is not supported.
+
+### D-22 — One verdict per condition per run
+
+At the first moment a condition is satisfied, or an explicit `met: false` at end of run. Not
+re-emitted on every later sample that also satisfies it: "did the two aircraft come within
+5 km" is answered by the first time they did, and re-emitting would have put thousands of
+identical records in the capture.
+
+BTB-REF-2 requires the not-met verdict, and it is the load-bearing half. Without it a condition
+that was never satisfied and one that nobody evaluated look the same.
+
+### D-23 — Verdicts are written twice, on purpose
+
+Into the capture as `verdict` records, which is what the format specifies, **and** into a
+`verdicts-<scenario>-<run-label>.jsonl` beside it.
+
+The second is what makes BTB-REF-4 checkable as a file comparison. Replay produces no capture,
+so without a separate verdict file "live verdicts equal replay verdicts" would have to be
+checked by extracting records from one file and comparing them to another — a comparison whose
+own correctness would then be in question. Two files, one `sha256`, no extraction step.
+
+A replay writes `verdicts-<stem>.replay.jsonl`, so it never overwrites the live run's.
+
+### D-24 — End-of-run verdicts are anchored on the last *data* record
+
+Not the last record of any kind. A replay reading a capture also sees the `segment_close` and
+the `trailer` that the live writer emitted *after* it decided its final verdicts, so anchoring
+on "the last record" would have stamped the two paths differently. Anchoring on the last
+`sample` / `entity_add` / `entity_remove` is the one point both paths reach identically.
+
+One line, and it is the whole difference between byte-identical and nearly identical.
+
+### D-25 — The referee gets an interface, and ADR-1 said not to
+
+ADR-1 declined a pure-virtual seam for the entity picture, on the grounds that it buys
+substitutability we have no second implementation for. `FieldSource` has one anyway, because
+here there genuinely are two implementations — a decoded `StreamValueMap` off the bus and a
+parsed `sample.fields` object out of a file — and single-sourcing the deciding logic across
+them is what makes BTB-REF-4 true by construction rather than by testing.
+
+The reasoning in ADR-1 is not contradicted; its condition is simply met this time.
+
+### D-26 — OQ-4 resolved: `FIFO_DROP`, bus queue 1024
+
+Three legs, and the first is not a measurement:
+
+- **`BLOCK` is rejected on principle and no measurement could overturn it.** A recorder that
+  stalls the bus changes the run it records — ADR-4's argument, [S2]'s independent one (PRD
+  rev 6), and a written promise to consumers in §14 of the format spec. Testing it would mean
+  building a producer that violates its own published contract.
+- **`FIFO_DROP` at 1024 is sufficient**: zero bus-side drops across 136 000 samples at the
+  overload scenario's 2 487/s, with the internal queue's high-water mark at 54 of 8 192.
+- **The residual unexplained loss does not bear on the choice.** The PRD held OQ-4 open while a
+  loss path existed that no counter reports. It still exists — but M6 established that it also
+  affects a consumer *inside the host process* with no subscription at all (see D-27), so no
+  backpressure policy can be implicated.
+
+### D-27 — R7 is reframed, not closed, and the reference instrument is now suspect
+
+M6 was tasked with re-running M4's publisher-versus-capture comparison under the overload
+scenario, on the hypothesis that 3× the rate would provoke the mechanism.
+
+**The hypothesis was falsified.** At 2 487 samples/s the capture was complete by the host's own
+account across 135 581 samples — zero absent. At the reference rate it was short by 30 samples,
+all in one frame, with every counter reading zero.
+
+**And the host's own dump loses whole frames too** — 30 at the reference rate, 203 under the
+overload, all present in our capture. That is an artifact written inside the host process, with
+no bus and no subscription in its path.
+
+Two consequences, both now in §14 of the format spec:
+
+- The comparison bounds our completeness **from one side only**. "30 absent" is the
+  disagreement between two lossy artifacts, not a measurement of our loss.
+- A frame-shaped gap in an in-process writer is evidence the mechanism sits **upstream of any
+  consumer**, which is why it does not block OQ-4.
+
+R7 stays open as a documented caveat rather than an unexplained defect. `tests/
+publisher-compare/compare.py` is kept in the repository and now reports both directions — the
+direction that surprised us is the one M4 had not thought to print.
+
+### D-28 — `--capture-max-samples` keeps its M5 meaning; no size limit in bytes
+
+BTB-CAP-6 (bounded capture size, P2) is still unbuilt: no byte limit, no rotation choice, no
+statement of either in the `header`. Flagged again for the project owner — it is P2 and M7 is
+budgeted for shutdown, determinism and evidence, so it stays out unless asked for.
