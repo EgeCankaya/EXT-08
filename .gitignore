@@ -18,3 +18,8 @@ test_artifacts/
 *.pdb
 *.ilk
 *.idb
+
+# Source documents supplied to the project, not produced by it. The client brief [S1] is
+# the outer contract this work must comply with; docs/prd.md carries the detailed musts.
+# Deliberately untracked: it is a proprietary binary and its content is Arkheon's, not ours.
+*.docx
