@@ -75,6 +75,12 @@ SampleOutcome EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
         return SampleOutcome{};
     }
 
+    if (counters_.samplesAccepted == 0) {
+        // Frozen here, at the first acceptance, and never touched again. Reading it later
+        // would answer a different question - by the end of a run every bridge has orphans.
+        counters_.orphansBeforeFirstAccepted = counters_.samplesOrphaned;
+    }
+
     LatestSample& entry = latest_[*name];
     entry.simulationTimeS = *simTime;
     entry.generation = rosterEntry->second.generation;

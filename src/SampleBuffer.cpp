@@ -12,12 +12,28 @@ SampleBuffer::SampleBuffer(std::size_t capacity) : capacity_(capacity) {
 }
 
 void SampleBuffer::offer(CapturedSample sample) {
-    const std::lock_guard<std::mutex> guard(mutex_);
-    if (records_.size() >= capacity_) {
-        ++notRecorded_;
-        return;
+    bool becameFull = false;
+    {
+        const std::lock_guard<std::mutex> guard(mutex_);
+        if (records_.size() >= capacity_) {
+            ++notRecorded_;
+            return;
+        }
+        records_.push_back(std::move(sample));
+        becameFull = records_.size() >= capacity_;
     }
-    records_.push_back(std::move(sample));
+    if (becameFull) {
+        // Once, on the transition - not on every sample. Notifying outside the lock so the
+        // waiter does not wake straight into a contended mutex.
+        full_.notify_all();
+    }
+}
+
+bool SampleBuffer::waitUntilFull(std::chrono::milliseconds timeout) const {
+    std::unique_lock<std::mutex> guard(mutex_);
+    // The predicate form: it re-checks on wake, so a spurious wake or a notify that arrived
+    // before the wait began cannot lose the transition.
+    return full_.wait_for(guard, timeout, [this] { return records_.size() >= capacity_; });
 }
 
 bool SampleBuffer::atCapacity() const {

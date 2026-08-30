@@ -23,6 +23,21 @@ capture is missing. The bus-side subscription still runs on the lossy `KEEP_LATE
 default; M6 sets both backpressure boundaries explicitly. The bridge says so in a warning
 at startup, and the policy it recorded under goes into every capture's header.
 
+### Two things to know before you compare or trust a capture
+
+**Two live runs of one scenario are not byte-identical, and that is the platform, not the
+recorder.** `n8ro-sim-local` paces against the wall clock and skips about 1% of frames — a
+different 1% each run — so the two runs are not the same published stream. The recorder
+contributes no variation of its own. [`docs/capture-format-v1.md`](docs/capture-format-v1.md)
+§14 has the measurement and what to do instead if you are building a determinism self-test.
+
+**All-zero drop counters mean nothing the platform counts was lost — not that nothing was
+lost.** Measured against the simulation host's own record, a reference capture held 99 953 of
+99 981 published samples; nine of the 28 absent were the record budget cutting the final
+frame, and the other 19 (0.019%) are unexplained with every available counter reading zero.
+Risk R7 in the PRD, §14 of the spec. Do not read the absence of a message from a capture as
+evidence that it never happened.
+
 ## Requirements
 
 - Windows 10/11, x64
@@ -153,6 +168,23 @@ scenario load is *refused* — `Component type 'componentPhysics' has no registe
 | 12 | the client was created but exposes no message bus |
 | 13 | the capture file could not be opened or written |
 
+### Loss reporting
+
+The status line carries **two** independent loss surfaces, because a message lost before it
+reaches the decoder is invisible to the decoder:
+
+```
+samples=100000 drops=0(hash=0 decode=0 noschema=0)
+    busLoss=0(dropped=0 backpressure=0 queueOverflow=0 rateLimit=0)
+```
+
+`drops` is `MessageBusPacked::metricsSnapshot()` — the message arrived and could not be
+decoded, which is what a schema mismatch looks like. `busLoss` is
+`IMessageBus::getStatistics()` — the message never arrived, because the bus discarded it.
+Both go into every capture's `trailer.bus_metrics`. Nothing in this program read the second
+group before producer 0.4.2, which is why every "0 drops" printed up to M4 was answering only
+half the question.
+
 Configuration is where the difficulty lives. A wrong `--schema-file`, for example, names
 the file it could not open and then names all three values back:
 
@@ -233,6 +265,14 @@ Sixteen deliberate defects — wrong field order, an undeclared field, a sample 
 segment, a miscounted trailer, a truncated file, a record after the trailer, an injected
 timestamp, CRLF endings, an unknown `format_version`, a sample after its own occupancy's
 removal — **16 caught, 0 survivors.**
+
+### Comparing a capture against the publisher
+
+`n8ro-sim-local` writes its own per-entity JSONL under `test_artifacts/` in its working
+directory. That is the publisher's own account of what it published, independent of our bus,
+our subscription and our code, and it is the only way to answer "did we record everything?"
+without trusting the counters we are trying to check. It is how R7 was measured — see the M4
+follow-up in [`notes.md`](notes.md) for the method and the numbers.
 
 ## Determinism probe
 

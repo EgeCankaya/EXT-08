@@ -91,6 +91,21 @@ struct RosterEvent {
 struct PictureCounters {
     std::uint64_t samplesAccepted = 0;
     std::uint64_t samplesOrphaned = 0;       // a sample whose entity has no open occupancy
+
+    // How many samples had already been orphaned when the *first* sample was accepted.
+    //
+    // This is the late-attach signature, stated causally rather than by a clock. A bridge
+    // present at scenario load witnesses the entity_created burst first, so its first
+    // accepted sample arrives with this at zero. A bridge that attached after the burst sees
+    // samples for entities it never saw created - every one orphaned - until the engine next
+    // creates something, so its first accepted sample arrives with this non-zero. M3
+    // measured that case: 7 740 orphans, zero drops, and no error anywhere.
+    //
+    // It exists so the capture's `attached_mid_run` can be derived from what happened rather
+    // than from what a status tick happened to observe a second after start-up, which is a
+    // race and would put a scheduler-dependent value in a file that must be byte-reproducible
+    // (BTB-CAP-3). Frozen at the first acceptance and never updated again.
+    std::uint64_t orphansBeforeFirstAccepted = 0;
     std::uint64_t samplesUnnamed = 0;        // no scenarioEntityName field in the payload
     std::uint64_t samplesUntimed = 0;        // no simulationTime field in the payload
     std::uint64_t entityCreated = 0;

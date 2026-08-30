@@ -886,6 +886,8 @@ int validate(const std::string& capturePath, const std::string& specPath) {
 
             const Value* busMetrics = record.member("bus_metrics");
             if (busMetrics != nullptr && busMetrics->isObject()) {
+                // Decode side. Present since the first version of the format, so a reader may
+                // require these (spec 11).
                 for (const char* key : {"schema_hash_drops", "message_id_drops",
                                         "decode_failures", "missing_schema_passthrough",
                                         "legacy_payload_passthrough"}) {
@@ -902,6 +904,30 @@ int validate(const std::string& capturePath, const std::string& specPath) {
                                     " - a schema disagreement; message types may be MISSING "
                                     "from this capture (spec 11)");
                     }
+                }
+                // Delivery side. Added at producer 0.4.2, so spec 11 requires a reader to
+                // treat these as optional: absent means UNKNOWN, never zero. Reporting the
+                // difference matters - "the bus lost nothing" and "nobody asked the bus"
+                // are not the same statement about a capture.
+                std::size_t deliveryPresent = 0;
+                for (const char* key : {"messages_dropped", "dropped_by_backpressure",
+                                        "dropped_by_queue_overflow", "dropped_by_rate_limiting"}) {
+                    long long value = 0;
+                    if (!readIntegerMember(*busMetrics, key, value)) {
+                        continue;
+                    }
+                    ++deliveryPresent;
+                    if (value != 0) {
+                        report.note(std::string("bus_metrics.") + key + " = " +
+                                    std::to_string(value) +
+                                    " - the bus discarded messages; this capture is a sampled "
+                                    "view of the stream, not a complete one (spec 11)");
+                    }
+                }
+                if (deliveryPresent == 0) {
+                    report.note("trailer.bus_metrics carries no delivery-side counters - written "
+                                "by a producer before 0.4.2, so bus-side loss for this run is "
+                                "UNKNOWN rather than zero (spec 11)");
                 }
             }
 

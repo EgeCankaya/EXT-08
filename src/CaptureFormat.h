@@ -42,7 +42,14 @@ namespace n8ro::bridge::capture {
 // and tests/capture-reader does that check.
 constexpr const char* kFormatVersion = "n8ro-capture/1";
 constexpr const char* kProducerName = "n8ro-bridge";
-constexpr const char* kProducerVersion = "0.4.0";
+// The format is unchanged - no key added, removed or retyped - so this stays
+// n8ro-capture/1. What the producer version tracks is how this build fills the format, and
+// 0.4.1 changed two answers: `drops.samples_not_recorded` is structurally 0 at this
+// milestone, and `attached_mid_run` is derived causally rather than from a status tick.
+// Both were run-to-run variable at 0.4.0 (see docs/capture-format-v1.md §16). 0.4.2 adds the
+// bus's four delivery-side drop counters to `bus_metrics`, which nothing in this program had
+// ever read - adding keys is non-breaking, so the format version does not move.
+constexpr const char* kProducerVersion = "0.4.2";
 
 // Every value here is observed, not asserted. `runtimeVersion` comes from the SDK's own
 // getN8roVersion(), which reports "unknown" when the release headers were compiled without
@@ -92,15 +99,33 @@ struct TrailerDrops {
     std::uint64_t samplesUntimed = 0;
 };
 
-// The five MessageBusPackedMetricsSnapshot counters that report loss or anomaly, as
-// BTB-OBS-1 requires. The four throughput counters on the same struct are not losses and
-// are deliberately not here.
+// Everything the platform will tell us about what it lost, as BTB-OBS-1 requires. Two
+// groups, and the distinction between them cost a determinism experiment to learn.
+//
+// The DECODE group is MessageBusPackedMetricsSnapshot: a message reached our subscription
+// and could not be turned into values. These are the counters M1-M4 reported, and they were
+// zero throughout - correctly, because nothing ever failed to decode.
+//
+// The DELIVERY group is IMessageBus::Statistics: a message never reached our subscription at
+// all, because the bus discarded it. **Nothing in EXT-08 read these until now**, which is
+// why a run could lose whole simulation frames and still report "0 drops" - we were watching
+// the decoder while the loss was happening upstream of it. A capture that says zero because
+// nobody asked the right object is the silent-wrong-answer failure R2 is about, so both
+// groups now go into every capture and onto the status line.
 struct TrailerBusMetrics {
+    // Decode side - MessageBusPacked.
     std::uint64_t schemaHashDrops = 0;
     std::uint64_t messageIdDrops = 0;
     std::uint64_t decodeFailures = 0;
     std::uint64_t missingSchemaPassthrough = 0;
     std::uint64_t legacyPayloadPassthrough = 0;
+    // Delivery side - IMessageBus::Statistics. Bus-wide, not per-subscription: the bus does
+    // not attribute a discard to a subscriber, so a non-zero value here means the bus lost
+    // something, not necessarily something of ours. It is still the only warning available.
+    std::uint64_t messagesDropped = 0;
+    std::uint64_t droppedByBackpressure = 0;
+    std::uint64_t droppedByQueueOverflow = 0;
+    std::uint64_t droppedByRateLimiting = 0;
 };
 
 // Each of these returns exactly one capture line, without its terminating LF. `format_version`

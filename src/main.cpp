@@ -231,6 +231,7 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
                                     const n8ro::sim::MessageSchema& stateSchema,
                                     const PictureSnapshot& snapshot,
                                     const n8ro::sim::MessageBusPackedMetricsSnapshot& metrics,
+                                    const n8ro::core::IMessageBus::Statistics& busStats,
                                     const std::string& endReason) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) {
@@ -273,7 +274,17 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
     counts.verdicts = 0;
 
     capture::TrailerDrops drops;
-    drops.samplesNotRecorded = buffer.notRecorded();
+    // Zero by construction at this version, and that is the honest value rather than a
+    // convenient one. The buffer is preallocated to exactly the budget, so it never rejects
+    // a sample *while recording* - the buffer filling IS the end of recording. Samples that
+    // arrive afterwards are not dropped, they are after the end, which is precisely what
+    // `end_reason: size_limit` tells a reader. Writing the observed tail here instead would
+    // put a scheduler-dependent number into a file that must be byte-identical across two
+    // identical runs (BTB-CAP-3), and would be misleading besides: it counts the handful
+    // that landed in the shutdown window and not the tens of thousands published after we
+    // stopped. The tail goes to the log, below. M5 fills this field with the internal
+    // queue's real overflow, and the name and meaning carry over unchanged.
+    drops.samplesNotRecorded = 0;
     drops.samplesOrphaned = snapshot.counters.samplesOrphaned;
     drops.samplesUnnamed = snapshot.counters.samplesUnnamed;
     drops.samplesUntimed = snapshot.counters.samplesUntimed;
@@ -284,6 +295,13 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
     busMetrics.decodeFailures = metrics.decodeFailures;
     busMetrics.missingSchemaPassthrough = metrics.missingSchemaPassthrough;
     busMetrics.legacyPayloadPassthrough = metrics.legacyPayloadPassthrough;
+    // The delivery side, which nothing in this program read before 0.4.2. A message the bus
+    // discards never reaches the decoder, so the five counters above stay at zero through a
+    // loss - which is exactly what happened, and what made whole missing frames invisible.
+    busMetrics.messagesDropped = busStats.messagesDropped;
+    busMetrics.droppedByBackpressure = busStats.droppedByBackpressure;
+    busMetrics.droppedByQueueOverflow = busStats.droppedByQueueOverflow;
+    busMetrics.droppedByRateLimiting = busStats.droppedByRateLimiting;
 
     file << capture::writeTrailer(lastSimTimeS, endReason, counts, drops, busMetrics) << '\n';
     file.flush();
@@ -298,6 +316,18 @@ void logRosterEvents(const std::vector<RosterEvent>& events) {
                       std::to_string(counts.samples) + " sample records, segment " +
                       std::to_string(segment) + ", simTime " + std::to_string(firstSimTimeS) +
                       " to " + std::to_string(lastSimTimeS) + ", end_reason=" + endReason + ")",
+                  kCategory);
+
+    // The residue, reported here and deliberately not in the file. It cannot be zero - a bus
+    // subscription cannot be stopped atomically - and it varies run to run, which is exactly
+    // why a log line is its place (CLAUDE.md: wall-clock and anything like it belongs in log
+    // lines and nowhere durable).
+    N8RO_LOG_INFO(std::string("recording ended at the budget; ") +
+                      std::to_string(buffer.notRecorded()) +
+                      " further samples arrived between the budget being reached and the "
+                      "subscription being cancelled. They are not in the capture and are not "
+                      "counted as drops in it: the run was still publishing when we stopped "
+                      "on purpose, which is what end_reason=size_limit records",
                   kCategory);
 
     // A schema field nothing ever published is a fact about the run and belongs in the
@@ -459,18 +489,6 @@ int run(const Options& options) {
                               "picture once a second (Ctrl-C to stop)"),
                   kCategory);
 
-    // header.attached_mid_run, decided once and held for the file. It is true when the
-    // engine already reported a loaded scenario at the bridge's first status tick, before
-    // the bridge had accepted a single sample: that is the late-attach signature M3
-    // documented, where the entity_created burst has already been and gone. Recording it at
-    // attach time and serialising it later is required, not incidental - by the time the
-    // file is written the answer would be true on every run.
-    //
-    // BTB-CX-2 - surviving either start order without operator intervention - is M5's, and
-    // will make this a decision the bridge acts on rather than only reports.
-    bool attachedMidRunDecided = false;
-    bool attachedMidRun = false;
-
     // The scenario name for the segment records. BTB-CX-4 requires it to be the name the
     // platform reports rather than one supplied on the command line; at M4 that is the
     // engine's own mirrored value, and at M5 it becomes the sim/scenario/event payload.
@@ -484,21 +502,30 @@ int run(const Options& options) {
         const PictureSnapshot snap = picture.snapshot();
         const n8ro::sim::MessageBusPackedMetricsSnapshot metrics = packed.metricsSnapshot();
 
-        // The decoder's three loss counters (CLAUDE.md: a silent topic is a schema mismatch,
-        // and these prove it). Reported every second whether zero or not - a number that
-        // only appears when it is bad is a number nobody trusts.
+        // Two independent loss surfaces, and reporting only the first is what let whole
+        // simulation frames go missing while this line said "drops=0" for four milestones.
+        //
+        //   decode  - MessageBusPacked: the message arrived and could not be turned into
+        //             values. A schema mismatch shows up here (CLAUDE.md).
+        //   deliver - IMessageBus: the message never arrived at all, because the bus
+        //             discarded it under its backpressure policy. Nothing upstream of the
+        //             decoder is visible to the decoder, so no amount of watching the first
+        //             group can reveal the second.
+        //
+        // Both are printed every second whether zero or not: a number that only appears when
+        // it is bad is a number nobody trusts.
+        const n8ro::core::IMessageBus::Statistics busStats = bus->getStatistics();
         const std::uint64_t drops =
             metrics.schemaHashDrops + metrics.decodeFailures + metrics.missingSchemaPassthrough;
+        const std::uint64_t busLoss = busStats.messagesDropped + busStats.droppedByBackpressure +
+                                      busStats.droppedByQueueOverflow +
+                                      busStats.droppedByRateLimiting;
 
         // Every value on the engine line is a local read on the client; nothing here
         // touches the bus.
         const std::string engineState = client->getEngineState();
         const std::optional<std::string> scenario = client->getLoadedScenarioName();
 
-        if (!attachedMidRunDecided) {
-            attachedMidRun = client->isScenarioLoaded() && snap.counters.samplesAccepted == 0;
-            attachedMidRunDecided = true;
-        }
         if (scenarioName.empty() && scenario && !scenario->empty()) {
             scenarioName = *scenario;
         }
@@ -520,6 +547,13 @@ int run(const Options& options) {
                     static_cast<unsigned long long>(snap.counters.entityCreated),
                     static_cast<unsigned long long>(snap.counters.entityDeleted),
                     static_cast<unsigned long long>(snap.counters.samplesOrphaned));
+        std::printf("    busLoss=%llu(dropped=%llu backpressure=%llu queueOverflow=%llu "
+                    "rateLimit=%llu)\n",
+                    static_cast<unsigned long long>(busLoss),
+                    static_cast<unsigned long long>(busStats.messagesDropped),
+                    static_cast<unsigned long long>(busStats.droppedByBackpressure),
+                    static_cast<unsigned long long>(busStats.droppedByQueueOverflow),
+                    static_cast<unsigned long long>(busStats.droppedByRateLimiting));
         if (capturing) {
             std::printf("    capture=%zu/%zu records notRecorded=%llu\n", buffer.size(),
                         options.captureMaxSamples,
@@ -558,6 +592,11 @@ int run(const Options& options) {
                               " samples; unsubscribed and stopped the pump, writing the file",
                           kCategory);
 
+            // Taken once, after the pump has stopped, so the header and the trailer describe
+            // the same instant and nothing can change under them.
+            const PictureSnapshot finalSnapshot = picture.snapshot();
+            const n8ro::sim::MessageBusPackedMetricsSnapshot finalMetrics = packed.metricsSnapshot();
+
             capture::HeaderInfo header;
             header.platform.engineConfig = options.config;
             header.platform.modelPath = options.modelPath;
@@ -569,14 +608,23 @@ int run(const Options& options) {
                 backpressurePolicyName(subscriptionOptions.backpressurePolicy);
             header.subscription.queueSize =
                 static_cast<std::uint64_t>(subscriptionOptions.queueSize);
-            header.attachedMidRun = attachedMidRun;
+            // Derived from what happened, not from what a status tick happened to see. A
+            // bridge present at scenario load witnesses the entity_created burst first, so
+            // its first accepted sample arrives with no orphans behind it; one that attached
+            // after the burst sees nothing but orphans until the engine next creates
+            // something. Same answer on every run, no clock involved (BTB-CAP-3).
+            //
+            // The fallback covers the case where nothing was ever accepted: a bridge that
+            // attached mid-run to a scenario that then created no entity has orphans and no
+            // samples, and is still mid-run.
+            header.attachedMidRun =
+                finalSnapshot.counters.samplesAccepted > 0
+                    ? finalSnapshot.counters.orphansBeforeFirstAccepted > 0
+                    : finalSnapshot.counters.samplesOrphaned > 0;
             // One entry, because one message type appears as a sample record's `message`.
             // The entity-event schema is not here: no record in the file is a verbatim dump
             // of one, so no reader ever needs it to interpret a line.
             header.schemas.push_back(resolution.entityState);
-
-            const PictureSnapshot finalSnapshot = picture.snapshot();
-            const n8ro::sim::MessageBusPackedMetricsSnapshot finalMetrics = packed.metricsSnapshot();
 
             // The budget is a configured bound on capture size, so `size_limit` is the
             // reason the format already has for it. It is the only end_reason an M4 run can
@@ -584,11 +632,22 @@ int run(const Options& options) {
             // detection (M5).
             const bool written =
                 writeCaptureFile(options.captureOut, header, scenarioName, buffer,
-                                 resolution.entityState, finalSnapshot, finalMetrics, "size_limit");
+                                 resolution.entityState, finalSnapshot, finalMetrics,
+                                 bus->getStatistics(), "size_limit");
             return written ? kExitOk : kExitCaptureWriteFailed;
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // While capturing, wait on the buffer rather than sleeping blind: the budget is what
+        // ends the run, and waking a status tick after it was reached would let the run keep
+        // publishing into a subscription we have already decided to cancel. The one-second
+        // timeout keeps the report cadence identical either way. Without a capture there is
+        // nothing to wait on - and the buffer's capacity is zero, which would read as
+        // permanently full - so that path still sleeps.
+        if (capturing) {
+            static_cast<void>(buffer.waitUntilFull(std::chrono::seconds(1)));
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
 }
 

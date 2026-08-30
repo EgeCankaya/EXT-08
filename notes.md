@@ -918,3 +918,154 @@ knew where its records came from.
   ours, at our own boundary, and counted there. The header records which policy the capture was
   taken under, so a future comparison between two captures can rule the policy in or out
   before anything else.
+
+## M4 follow-up — the determinism experiment, and what it found
+
+M4 shipped with three things flagged for follow-up. Two turned out not to need fixing, and
+the third turned out to be a different and larger problem than it looked. The experiment that
+separated them is the most useful hour spent on this milestone so far.
+
+### The claim that had never been tested
+
+`docs/capture-format-v1.md` §14 promised EXT-17, in writing, that two runs of the same
+scenario under the same configuration produce **byte-identical** captures. BTB-CAP-3 said the
+same. Nothing in M1–M4 had ever run two identical runs and compared them.
+
+Two reference runs, bridge first, budget 100 000:
+
+```
+det-A  ad0bb50d71ddc39b...  48 445 101 bytes
+det-B  60a7a1e4d6daff88...  48 446 649 bytes
+```
+
+**Not identical.** Header byte-identical, record counts equal, first 30 789 records identical
+— then divergence at line 30790, where run B is a whole simulation frame ahead of run A at
+the same line number.
+
+### First hypothesis, and it was wrong
+
+Frame `t = 36.10` had 33 samples in run A and **zero** in run B. A partial frame is not what a
+skipped simulator frame looks like — the host publishes a frame's entities together — so the
+obvious reading was the bus discarding under `KEEP_LATEST`, exactly as ADR-4 predicts.
+
+Checking it turned up something worse than the hypothesis.
+
+### `IMessageBus::getStatistics()` existed the whole time, and nothing here had ever read it
+
+There are **two independent loss surfaces**, and until now this program watched only one:
+
+| | what it counts | read since |
+|---|---|---|
+| `MessageBusPacked::metricsSnapshot()` | the message arrived and could not be **decoded** | M3 |
+| `IMessageBus::getStatistics()` | the message **never arrived**, because the bus discarded it | *nothing, ever* |
+
+`Statistics` carries `messagesDropped`, `droppedByBackpressure`, `droppedByQueueOverflow`,
+`droppedByRateLimiting`. A message the bus discards never reaches the decoder, so **no amount
+of watching the decoder can reveal it**. Every `drops=0` this project has printed since M1 —
+including "132 188 samples, 0 drops" in M3's headline result and OQ-4's "the default lost
+nothing" data point — was the decoder's counter answering a question nobody had asked.
+
+That is R2's shape exactly: not a wrong answer, but a confident answer from the wrong object.
+Both groups now go into every capture's `bus_metrics` and onto the status line (producer
+0.4.2). Adding keys is non-breaking, so the format version does not move.
+
+### Instrumented, re-run — and the bus says it lost nothing
+
+```
+busLoss=0(dropped=0 backpressure=0 queueOverflow=0 rateLimit=0)
+```
+
+Zero on both runs, while frames were still missing and the two captures still differed. **The
+hypothesis was wrong.** Worth writing down as much as the finding: the instrumentation was
+right to add and it did not explain the loss.
+
+### The publisher's own record settles it
+
+`n8ro-sim-local` writes a per-entity JSONL dump under `test_artifacts/` — the publisher's own
+account of what it published, independent of our bus, our subscription and our code. Comparing
+it against our capture over the window the capture covers, across all 77 entities:
+
+```
+published by the host   99 981
+present in our capture   99 953
+absent                       28   (0.028%)
+```
+
+and the 28 break down cleanly:
+
+| where | count | what it is |
+|---|---:|---|
+| `t = 130.10` | 9 | the **final frame, cut mid-way by the record budget** — by design, and `end_reason: size_limit` says so |
+| `t = 20.95` | 18 | one frame, mostly lost |
+| `t = 95.60` | 1 | a single sample |
+
+So the real, unexplained loss is **19 samples in 99 981 — 0.019%** — and every counter on the
+platform reads zero for all of them. It is not the budget, not the decoder, not the bus's own
+accounting, not our orphan counter.
+
+**And the missing frames were mostly never published at all.** Over the same 130-second
+window, a 0.05 s tick would give 2 601 frames; the host published **2 577**. `n8ro-sim-local`
+paces against the wall clock and simply skips about **1% of frames** under load — a different
+1% each run. Our capture faithfully records a stream that genuinely differs between runs.
+
+### What that means, and what changed because of it
+
+**Byte-for-byte identity across two live runs was never achievable on this platform, and the
+reason is not ours.** Two runs are not the same sequence of published messages, so no property
+of the recorder can make the captures match.
+
+The requirement was wrong, not the implementation. BTB-CAP-3 now binds the recorder to what
+the recorder controls — *given the same published stream, produce the same bytes* — which is
+true, enforceable, and what EXT-17 actually needs (PRD rev 5). Its harness moves from "ten
+identical-configuration pairs" to **ten replays of one stored capture**, because live pairs on
+a wall-clock-paced host measure the host's repeatability, not ours, and would have made a
+platform property look like a recorder defect. §14 of the format spec carries the same scoping
+plus the practical advice: compare on content — per-`(entity, occupancy)` value sequences keyed
+by `sim_time_s` — rather than on bytes, unless the publisher is known to be deterministic.
+
+Two determinism leaks that **were** ours, both found by the same experiment and both fixed:
+
+- **`drops.samples_not_recorded` was scheduler-dependent.** It counted samples arriving between
+  the budget filling and the once-a-second loop noticing. Now structurally `0`: the buffer is
+  sized to exactly the budget, so it never rejects a sample *while recording* — the buffer
+  filling **is** the end of recording, which `end_reason: size_limit` already states. The
+  residue goes to the log, where a scheduler-dependent number belongs. Keeping it in the file
+  would also have been misleading: it counted the handful in the shutdown window and not the
+  ~57 000 published after we stopped.
+- **`attached_mid_run` was decided by a one-second race.** It read `isScenarioLoaded()` at the
+  first status tick, so a simulator that won that race flipped the answer. Now derived causally
+  from `orphansBeforeFirstAccepted` — whether samples arrived for entities whose creation we
+  never saw, which is precisely M3's measured late-attach signature.
+
+The prompt-stop fix (a condition variable, so recording ends at the budget rather than up to a
+tick later) cut the shutdown residue from **114 to 9–12** samples. It cannot reach zero: a bus
+subscription cannot be stopped atomically.
+
+### R7, and why absence is not evidence
+
+The 0.019% is now **R7** in the risk register, and the honest statement is in §14 for EXT-17 to
+inherit rather than rediscover: *all-zero counters mean nothing the platform counts was lost —
+not that nothing was lost.* A capture is a very high-fidelity sample of the published stream,
+better than 99.98% complete on the reference scenario, and it is not a guaranteed-complete
+transcript. A referee that reads the absence of a message as evidence that it never happened
+would be drawing a wrong conclusion from a file that looks perfectly clean.
+
+M6 re-runs this comparison under the 126-entity overload scenario, where the rate is 3× higher
+and the mechanism should be easier to provoke and attribute. OQ-4 cannot honestly be closed
+while a loss path exists that no counter reports.
+
+### The two that did not need fixing
+
+- **No second occupancy in the reference capture.** Not a defect and not fixable at M4. A
+  gen-2 sample needs an `entity_add` to open it — a sample under an occupancy no record opened
+  is a file the format spec itself calls malformed — and `entity_add` / `entity_remove` are
+  M5's. It is also unreachable: the teardown burst is at t ≈ 200 s and the budget fires at
+  t ≈ 130 s. ADR-6 is already proven in memory (M3) and against a synthetic capture
+  (`mutate.py`). Proving it end-to-end in a real file is now an M5 acceptance item.
+- **`runtime_version: "unknown"` — checked, and there is genuinely nothing to read.**
+  `getN8roVersion()` is `constexpr` and resolves in *our* translation unit, where
+  `N8RO_VERSION` is not defined. The remaining candidate was the DLL version resource, and
+  **`n8ro-core.dll` and `n8ro-sim.dll` carry none** — `VersionInfo.FileVersion` is empty on
+  both. That leaves compiling in a constant or parsing `components.xml`, and either would put
+  a number nobody observed into a field documented as observed. `"unknown"` is the accurate
+  answer. Recorded here so nobody re-derives it.

@@ -535,7 +535,12 @@ load and missed the entity-creation burst; it usually accompanies `attached_mid_
 It means the file is a partial view of the run, and it is the difference between a capture
 that is empty because nothing happened and one that is empty because nobody was watching.
 
-`bus_metrics` — the platform decoder's own counters, passed through:
+`bus_metrics` — the platform's own counters, passed through. **Two groups, and the
+distinction matters**: a message can be lost before it ever reaches a decoder, in which case
+no decode counter can see it.
+
+*Decode side* — the message arrived and could not be turned into values. Present since the
+first version of this format; a reader may require these keys.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -545,11 +550,30 @@ that is empty because nothing happened and one that is empty because nobody was 
 | `missing_schema_passthrough` | number (integer) | Messages passed through undecoded for want of a schema |
 | `legacy_payload_passthrough` | number (integer) | Messages passed through as legacy payloads |
 
-Any non-zero value in `bus_metrics` means the producer and the simulation host disagreed about
-a schema. A capture recorded under that condition may be missing entire message types silently
-— the platform drops them with a warning rather than an error. **A reader should surface a
-non-zero `bus_metrics` value prominently**; it is the difference between a quiet topic and a
-misconfigured one.
+*Delivery side* — the message never reached the producer's subscription, because the bus
+discarded it. Bus-wide rather than per-subscription: the bus does not attribute a discard to a
+subscriber, so a non-zero value means the bus lost something, not necessarily something in
+this capture. **Added at producer 0.4.2**, so a capture written by an earlier producer may
+omit these keys; a reader must treat them as optional and absent-means-unknown, not
+absent-means-zero.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `messages_dropped` | number (integer) | Total messages the bus discarded |
+| `dropped_by_backpressure` | number (integer) | Discarded under the subscription's backpressure policy |
+| `dropped_by_queue_overflow` | number (integer) | Discarded because a delivery queue was full |
+| `dropped_by_rate_limiting` | number (integer) | Discarded by a rate limit |
+
+Any non-zero value on the **decode side** means the producer and the simulation host disagreed
+about a schema. A capture recorded under that condition may be missing entire message types
+silently — the platform drops them with a warning rather than an error. Any non-zero value on
+the **delivery side** means the bus could not keep up. **A reader should surface either
+prominently**; the first is the difference between a quiet topic and a misconfigured one, and
+the second is the difference between a complete capture and a sampled one.
+
+**All zeros does not mean nothing was lost.** It means nothing the platform counts was lost.
+Loss has been measured on this platform with every one of these counters reading zero — see
+§14, "Known loss".
 
 ---
 
@@ -639,14 +663,16 @@ remain valid under version 1, and this document remains their specification.
 
 ## 14. Determinism guarantees
 
-Two runs of the same scenario under the same configuration on the same host produce
-**byte-identical** capture files. A consumer may rely on this, and the value of relying on it
-is that any difference between two such files is attributable to the simulation rather than to
-the recorder.
+**Read this section before building anything that compares two captures.** The guarantee is
+narrower than it is natural to assume, and the difference was measured rather than reasoned
+about.
 
-What the producer guarantees, and how:
+### What the producer guarantees
 
-| Hazard | Guarantee |
+**The recorder contributes no run-to-run variation of its own.** Given the same sequence of
+published messages, it produces the same bytes — on every host, every build, every run.
+
+| Hazard | How it is closed |
 |---|---|
 | Wall-clock contamination | No wall-clock-derived value is written into any record, in any field, ever |
 | Field ordering | `sample.fields` follows the schema's declared field order, never a hash-map iteration order |
@@ -654,13 +680,60 @@ What the producer guarantees, and how:
 | Float formatting | Shortest round-trip, locale-independent, uniquely determined per double |
 | Line endings | LF, written in binary mode, on every platform |
 | Container iteration | No container with unspecified iteration order is iterated anywhere on the writing path |
+| Scheduler-dependent counters | No count whose value depends on thread timing is written into the file. Where such a number exists it goes to the producer's log — see §16 on `drops.samples_not_recorded` |
+| Timing-dependent flags | `attached_mid_run` is derived from what the message stream contained, never from what a status tick happened to observe |
 
-**The one exception** is `platform.model_path`, which is a host filesystem path. Captures of
-the same scenario recorded on hosts with different install locations differ in that field and
-nowhere else. A consumer comparing across hosts should compare with that field excluded.
+**The one host-dependent field** is `platform.model_path`, a filesystem path. Two captures of
+the same run recorded on hosts with different install locations differ there and nowhere
+else; compare with that field excluded.
 
-Run labels in filenames are ordinals, never timestamps, for the same reason: two identical
-runs must be addressable as a pair.
+### What the producer cannot guarantee
+
+**Two captures of the same scenario are not necessarily byte-identical, and on the reference
+platform they are not.** A capture is a record of what was *published*. If the publisher does
+not publish the same thing twice, the captures differ, and no property of the recorder can
+change that.
+
+Measured on runtime 2.1.328, two runs of `Atacama Air Defense` recorded under identical
+configuration:
+
+- The **headers were byte-identical**, the record counts equal, and the first 30 789 records
+  identical.
+- They then diverged, because **the simulation host skipped different frames in each run.**
+  `n8ro-sim-local` paces against the wall clock, and under load it does not publish every
+  frame: over one 130-second window it published 2 577 of the 2 601 frames a 0.05 s tick
+  would give — about **1 % of frames never published at all** — and a different 1 % each run.
+
+A capture is faithful to its run either way. But a consumer diffing two captures is measuring
+*the publisher's* repeatability as well as its own, and on a wall-clock-paced host the
+publisher's repeatability is the weaker of the two by a wide margin.
+
+**If you are building a determinism self-test**, this is the load-bearing consequence: run it
+against a publisher whose publication schedule is deterministic, or compare on content rather
+than bytes — for example, per-`(entity, occupancy)` value sequences keyed by `sim_time_s`,
+which are stable across runs where the raw byte stream is not. Establishing whether a headless
+or fixed-step host publishes deterministically is worth doing before committing to a
+byte-comparison strategy; it has not been established here.
+
+### Known loss, and the fact that no counter reports it
+
+Measured against the simulation host's own per-entity record over the same window: of 99 981
+samples the host recorded as published, the capture contained 99 953. Of the 28 absent, 9 were
+the final frame cut mid-way by the record budget — that is the budget working, and
+`end_reason: "size_limit"` says so. The remaining **19 (0.019 %) are unexplained loss**, 18 of
+them in a single frame.
+
+**Every counter available reads zero for those 19.** The packed decoder's counters are zero
+because the messages never reached the decoder. The bus's own delivery counters
+(`messages_dropped`, `dropped_by_backpressure`, `dropped_by_queue_overflow`) are zero too, so
+whatever discarded them did not record having done so. The producer reports every counter the
+platform exposes, and the platform does not expose this.
+
+The honest statement is therefore: **a `bus_metrics` block of all zeros means nothing the
+platform counts was lost. It is not proof that nothing was lost.** Treat a capture as a
+high-fidelity sample of the published stream — on the reference scenario, better than 99.98 %
+complete — rather than as a guaranteed-complete transcript. A consumer that must know whether
+a specific message existed should not infer its absence from this file alone.
 
 ---
 
@@ -701,7 +774,7 @@ This section describes **what the current producer emits**, as distinct from wha
 specification requires. It exists so that a reader author is never surprised by a real file,
 and it shrinks as the producer is completed.
 
-`n8ro-bridge` **0.4.0** (EXT-08 milestone M4) emits:
+`n8ro-bridge` **0.4.2** (EXT-08 milestone M4) emits:
 
 | Record | Status |
 |---|---|
@@ -712,10 +785,37 @@ and it shrinks as the producer is completed.
 | `verdict` | **Not yet emitted.** `trailer.counts.verdicts` is `0` |
 | `trailer` | Complete. `end_reason` is always `size_limit` at this version, because the record budget is what ends a run |
 
-A reader written from this specification reads a 0.4.0 capture correctly without special
+A reader written from this specification reads a 0.4.2 capture correctly without special
 casing — every record it contains is fully conformant, and the gaps are absences rather than
-deviations. The two things such a reader cannot do on a 0.4.0 file are reconstruct the roster
+deviations. The two things such a reader cannot do on a 0.4.2 file are reconstruct the roster
 independently of the samples, and distinguish two scenario runs within one file.
+
+### `drops.samples_not_recorded` at this version
+
+**Always `0`, structurally**, and that is the accurate value rather than a convenient one.
+
+This producer records into a buffer sized to exactly its record budget, so it never rejects a
+sample *while recording* — the buffer filling **is** the end of recording. Samples the
+simulation publishes after that point are not dropped; they are after the end, which is what
+`end_reason: "size_limit"` records.
+
+A handful of samples do arrive between the budget being reached and the subscription actually
+being cancelled — a bus subscription cannot be stopped atomically. That count is
+scheduler-dependent, so writing it here would make two captures of the same run differ on a
+number that has nothing to do with the run (§14). It goes to the producer's log instead. It is
+also not a meaningful loss total: it counts the few samples that landed in the shutdown window
+and not the tens of thousands published afterwards.
+
+From M5, when the producer gains a real writer queue, this field carries that queue's genuine
+overflow count. The name and meaning do not change.
+
+### Producer version history
+
+| Version | Change |
+|---|---|
+| 0.4.0 | First producer. `drops.samples_not_recorded` carried a scheduler-dependent count and `attached_mid_run` was decided by a timing observation, so both could differ between two identical runs |
+| 0.4.1 | Both made deterministic: the field above became structurally `0`, and `attached_mid_run` is now derived from what the message stream contained |
+| 0.4.2 | `bus_metrics` gained the four delivery-side counters. Nothing had been reading them, so a capture could report all-zero drops while the bus was discarding messages. Adding keys is non-breaking (§13), so the format version is unchanged |
 
 ---
 

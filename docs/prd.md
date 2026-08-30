@@ -3,7 +3,7 @@
 > **One-liner:** A standalone C++17 console program that connects to a running N8RO simulation over the message bus and turns the published stream into a durable, versioned, self-describing capture file plus a pass/fail verdict — so a run can be analysed, and re-judged, long after it has ended.
 
 **Date:** 2026-08-30
-**Revision:** 4 — BTB-CAP-3 restated on round-trip exactness; M4 delivered. See §"Revision history".
+**Revision:** 5 — BTB-CAP-3 scoped to what the recorder controls; two determinism leaks and one blind spot closed. See §"Revision history".
 **Status:** Draft
 **Owner:** EXT-08 implementer
 **DRI:** egemencankaya14@gmail.com
@@ -16,6 +16,7 @@
 | Rev | Date | Change |
 |----:|------|--------|
 | 1 | 2026-08-30 | Initial PRD. |
+| 5 | 2026-08-31 | **BTB-CAP-3 scoped to what the recorder actually controls, after measuring it.** The requirement asked for byte-identical captures from two runs of one scenario. A determinism experiment run at M4 close-out shows that is unachievable and not for any reason inside EXT-08: `n8ro-sim-local` paces against the wall clock and skips ~1% of frames, a different ~1% each run, so two runs are not the same published stream. The requirement now binds the recorder to introducing no variation of its own, which is true, enforceable, and what EXT-17 actually needs. The same experiment found **two determinism leaks in our own output** (both fixed) and **one blind spot** — nothing in EXT-08 had ever read `IMessageBus::getStatistics()`, so every "0 drops" reported since M1 was the decoder's counter and delivery-side loss was structurally invisible. R7 added. |
 | 4 | 2026-08-30 | **BTB-CAP-3's float criterion restated as the end rather than the means.** It said "17 significant digits"; seventeen digits is one way to reach round-trip exactness and naming it as the criterion excluded `std::to_chars` shortest round-trip, which reaches the same end in fewer bytes and is what OQ-5 resolved on. The criterion now states round-trip exactness, locale independence and uniqueness directly. No other requirement changed; M4 is delivered against this text. |
 | 3 | 2026-08-30 | **OQ-1 decided: we own the entity-picture layer.** The brief was checked and is silent on the question, so it did not settle it. The layer is treated as a permanent component: unit tests that need no simulator (`tests/entity-picture/`), documented invariants, and a snapshot API that cannot report a removed entity as live. No interface was added, and ADR-1 says why. |
 | 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was unsatisfiable as written** and is now scoped to an entity occupancy; `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so the criterion is checkable in the capture itself (ADR-6). BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
@@ -345,7 +346,9 @@ The system SHALL stamp every capture record with the simulation time carried by 
 **Trace:** UAC-BTB-CAP-2
 
 #### BTB-CAP-3 (P1): Byte-for-byte reproducibility of the capture
-Given two runs of the same scenario under the same configuration, the system SHALL produce byte-identical capture files.
+Given the **same sequence of published messages**, the system SHALL produce byte-identical capture files. The system SHALL NOT introduce any run-to-run variation of its own — no wall-clock value, no unordered iteration, no locale-dependent formatting, no scheduler-dependent counter, and no timing-dependent flag.
+
+*(Rev 5: this previously read "given two runs of the same scenario under the same configuration". That is **not achievable on this platform and never was**, and the difference is not ours — measured at M4, `n8ro-sim-local` paces against the wall clock and does not publish about 1% of frames, a different 1% each run, so the two runs are not the same sequence of published messages. Scoping the requirement to what the recorder controls makes it both true and enforceable; §"Data model" and `docs/capture-format-v1.md` §14 carry the same scoping, and §14 tells EXT-17 what it means for a determinism self-test.)*
 
 **Customer scenario:** EXT-17's determinism self-test runs before every campaign and must attribute any difference to the simulation, never to the recorder.
 **Pain removed:** Three concrete non-determinism sources exist in this design and all three are ours: `StreamValueMap` is an `std::unordered_map` whose iteration order is not stable; floating-point formatting is lossy and locale-sensitive by default; and any container of entities iterated for output must be ordered. Each would silently break EXT-17 in a way that looks like a platform defect.
@@ -354,7 +357,8 @@ Given two runs of the same scenario under the same configuration, the system SHA
 - Field order in every `sample` record follows the `MessageSchema::fields` vector, never `StreamValueMap` iteration order.
 - Floating-point values are emitted in a **round-trip-exact, locale-independent format that is uniquely determined for a given double**, so a value written and re-read is bit-identical and the same double always produces the same bytes on every host and every build. *(Rev 4: this criterion previously said "17 significant digits". Seventeen digits is a **means** to round-trip exactness, not the end, and stating the means excluded the shorter form that reaches the same end. `std::to_chars` shortest round-trip satisfies all three properties; the `printf` family is disqualified outright, because `%.17g` is round-trip exact and **silently** locale-dependent — it emits `0,05` under a comma-decimal locale, which is not JSON. Settled by test at M1, adopted at M4. See OQ-5 and `tests/float-format/`.)*
 - No container with unspecified iteration order is iterated anywhere in the capture path.
-- Ten consecutive identical-configuration pairs hash identically.
+- Ten consecutive runs **replayed from one stored capture** hash identically. Live-run pairs are **not** a valid check of this requirement on a wall-clock-paced host, because they vary for a reason outside the system — that is what M4 measured, and using them as the harness would have made a platform property look like a recorder defect.
+- No scheduler-dependent or timing-dependent value is written into any record. M4 found two and removed both: `drops.samples_not_recorded` and `attached_mid_run`.
 
 **Trace:** UAC-BTB-CAP-3
 
@@ -857,6 +861,7 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 | **R4 — A determinism leak in our own emission path** | High — silently invalidates EXT-17's foundational self-test | Medium-high — three known sources exist (unordered map, float formatting, container iteration) and all three are easy to reintroduce | BTB-CAP-3 names all three; the M7 harness is the standing check, run on every change, not once |
 | **R5 — Format churn after EXT-17 starts consuming it** | Medium — breaks a downstream repo | Medium | Freeze at end of M7; version-bump discipline in §"Migration plan"; the reader's version check makes a mismatch loud |
 | **R6 — The reference scenario turns out to be unrepresentative** (too few entities, too short, no removals) — **CLOSED at M1.** `Atacama Air Defense`: 42 entities at load, two distinct removal reasons (`destroyed`, `expended`), a natural quiescent end at t ≈ 180 s. `Outback Kamikaze Swarm` (126 entities) is retained as the M6 overload case | Medium — acceptance demos prove less than they appear to | ~~Medium — no scenario has been chosen yet~~ | Choose it in M1 against explicit criteria: multiple entities, at least one removal, a natural end, and a duration that makes the rate measurable |
+| **R7 — A capture is not a guaranteed-complete transcript, and no counter says so.** M4 measured our capture against the simulation host's own per-entity record: 99 953 of 99 981 published samples present. Nine of the 28 absent were the record budget cutting the final frame, by design. The other **19 (0.019%) are unexplained, 18 of them in one frame — and every counter the platform exposes reads zero for them**, including the delivery-side ones now being read | Medium — an analyst or a referee that reads absence as evidence draws a wrong conclusion from a file that looks clean | Confirmed, measured | Stated plainly in `docs/capture-format-v1.md` §14 so EXT-17 inherits the caveat rather than the assumption: all-zero counters mean nothing the platform counts was lost, not that nothing was lost. Read every counter the platform does expose (done at 0.4.2). Re-measure at M6 under the overload scenario, where the rate is 3× higher and the mechanism should be easier to provoke and attribute |
 
 ### Open questions
 
@@ -1001,11 +1006,11 @@ Design and document `n8ro-capture/1`; write the header with its embedded schema 
 
 ### M5 — Output path and lifecycle (1.5 days)
 The writer thread; the handler-to-writer handoff; segment boundaries on scenario load and reload; entity-removal records; host-loss handling. *(Float formatting was resolved at M4, not here — see OQ-5.)*
-**Validation:** BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-CAP-2, BTB-CAP-3. A reload produces two segments. Killing the simulator produces a `host_lost` trailer. No wall-clock value appears anywhere in the capture path.
+**Validation:** BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-CAP-2, BTB-CAP-3. A reload produces two segments. Killing the simulator produces a `host_lost` trailer. No wall-clock value appears anywhere in the capture path. **Carried in from M4:** a capture containing a real *second occupancy* — a name removed and re-created, bracketed by its own `entity_add` / `entity_remove` records. M4's captures stop at the record budget before the teardown burst, and could not have shown it anyway without those records: a sample under an occupancy no record opened is a file the format spec calls malformed. ADR-6 is proven in memory (M3) and against a synthetic capture (`mutate.py`); this is where it gets proven end-to-end in a real file.
 
 ### M6 — Referee and backpressure (2 days)
 Condition file parsing; the three condition kinds; live verdicts; replay mode; both backpressure boundaries set explicitly; the overload demonstration.
-**Validation:** BTB-REF-1 through BTB-REF-4, BTB-BP-3, BTB-BP-4, BTB-OBS-1. Replay verdicts equal live verdicts. Overload produces accurate per-topic drop counts. OQ-4 resolved under real load.
+**Validation:** BTB-REF-1 through BTB-REF-4, BTB-BP-3, BTB-BP-4, BTB-OBS-1. Replay verdicts equal live verdicts. Overload produces accurate per-topic drop counts. OQ-4 resolved under real load. **Carried in from M4 (R7):** re-run the publisher-versus-capture comparison under the 126-entity overload scenario. At 2 487 packets/s the 0.019% unexplained loss should be easier to provoke and to attribute, and OQ-4 cannot honestly be resolved while a loss path exists that no counter reports.
 
 ### M7 — Shutdown, determinism, evidence (1.5 days)
 Signal handling and drain; the determinism harness; the twenty-cycle shutdown loop; the R1 teardown spike; README, sample capture, reader, recording, notes.

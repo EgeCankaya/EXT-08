@@ -269,6 +269,13 @@ std::string writeTrailer(double simTimeS, const std::string& endReason,
     appendUintMember(out, "decode_failures", busMetrics.decodeFailures);
     appendUintMember(out, "missing_schema_passthrough", busMetrics.missingSchemaPassthrough);
     appendUintMember(out, "legacy_payload_passthrough", busMetrics.legacyPayloadPassthrough);
+    // Delivery side. Added at producer 0.4.2; adding keys to an existing record is a
+    // non-breaking change under the format's own rule (spec section 13), so this is still
+    // n8ro-capture/1 and a 0.4.1 reader ignores them.
+    appendUintMember(out, "messages_dropped", busMetrics.messagesDropped);
+    appendUintMember(out, "dropped_by_backpressure", busMetrics.droppedByBackpressure);
+    appendUintMember(out, "dropped_by_queue_overflow", busMetrics.droppedByQueueOverflow);
+    appendUintMember(out, "dropped_by_rate_limiting", busMetrics.droppedByRateLimiting);
     out.push_back('}');
 
     out.push_back('}');

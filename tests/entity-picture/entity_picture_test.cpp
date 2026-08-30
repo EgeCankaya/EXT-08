@@ -148,6 +148,70 @@ void testSampleBeforeAnyCreateIsOrphaned() {
     check(snap.liveSample("RedUAV_N_01") == nullptr, "not readable as live");
 }
 
+// --- orphansBeforeFirstAccepted: the late-attach signature, stated causally -------
+//
+// This counter is what the capture's `attached_mid_run` is derived from (BTB-CAP-1). It has
+// to be decided by what happened rather than by what a status tick observed a second after
+// start-up, because a race would put a run-to-run-variable value into a file that must be
+// byte-reproducible (BTB-CAP-3). Three cases: attached early, attached late, and frozen.
+
+void testEarlyAttachHasNoOrphansBeforeFirstSample() {
+    beginCase("a bridge present at scenario load accepts its first sample with no orphans behind it");
+    EntityPicture picture;
+    picture.onEntityEvent(createEvent("RedUAV_N_01", 0.0));
+    picture.onSample(sample("RedUAV_N_01", 0.05));
+
+    const PictureSnapshot snap = picture.snapshot();
+    checkEq(snap.counters.samplesAccepted, 1u, "the sample was accepted");
+    checkEq(snap.counters.samplesOrphaned, 0u, "nothing was orphaned");
+    checkEq(snap.counters.orphansBeforeFirstAccepted, 0u,
+            "so the late-attach signal is zero - this bridge saw the roster being built");
+}
+
+void testLateAttachIsVisibleAtTheFirstAcceptedSample() {
+    // M3's measured case: the entity_created burst fires once, at scenario load, and a
+    // bridge that arrives after it sees nothing but samples for entities it never saw
+    // created - 7 740 of them on the run that found this, with zero drops and no error.
+    beginCase("a bridge that missed the creation burst carries orphans into its first acceptance");
+    EntityPicture picture;
+    for (int i = 0; i < 5; ++i) {
+        picture.onSample(sample("RedUAV_N_01", 12.5 + 0.05 * i));   // all orphaned
+    }
+    // The engine eventually creates something, and from there the picture works normally.
+    picture.onEntityEvent(createEvent("RedUAV_N_02", 13.0));
+    picture.onSample(sample("RedUAV_N_02", 13.05));
+
+    const PictureSnapshot snap = picture.snapshot();
+    checkEq(snap.counters.samplesAccepted, 1u, "one sample accepted");
+    checkEq(snap.counters.samplesOrphaned, 5u, "five orphaned before it");
+    checkEq(snap.counters.orphansBeforeFirstAccepted, 5u,
+            "and the signal carries them - this bridge attached mid-run");
+}
+
+void testOrphansBeforeFirstAcceptedIsFrozen() {
+    // Read at the end of a run it would answer a different question: by then almost every
+    // bridge has orphans, because the engine's teardown churn produces them. It must be the
+    // value at the FIRST acceptance and never move again.
+    beginCase("the late-attach signal freezes at the first acceptance and never moves");
+    EntityPicture picture;
+    picture.onEntityEvent(createEvent("RedUAV_N_01", 0.0));
+    picture.onSample(sample("RedUAV_N_01", 0.05));
+    checkEq(picture.snapshot().counters.orphansBeforeFirstAccepted, 0u, "zero at the first sample");
+
+    // Now orphan a pile of samples under a name that was never created, and accept more
+    // under the one that was.
+    for (int i = 0; i < 9; ++i) {
+        picture.onSample(sample("NeverCreated", 1.0 + 0.05 * i));
+        picture.onSample(sample("RedUAV_N_01", 1.0 + 0.05 * i));
+    }
+
+    const PictureSnapshot snap = picture.snapshot();
+    checkEq(snap.counters.samplesOrphaned, 9u, "the later orphans are still counted");
+    checkEq(snap.counters.samplesAccepted, 10u, "and the later acceptances too");
+    checkEq(snap.counters.orphansBeforeFirstAccepted, 0u,
+            "but the signal is unmoved - it is a fact about attachment, not about the run");
+}
+
 void testNoSampleAfterRemovalWithinOccupancy() {
     // BTB-EP-3's criterion, in its satisfiable form.
     beginCase("BTB-EP-3: no sample enters an occupancy after that occupancy is removed");
@@ -434,6 +498,9 @@ int main() {
 
     testAcceptsSampleWithinOpenOccupancy();
     testSampleBeforeAnyCreateIsOrphaned();
+    testEarlyAttachHasNoOrphansBeforeFirstSample();
+    testLateAttachIsVisibleAtTheFirstAcceptedSample();
+    testOrphansBeforeFirstAcceptedIsFrozen();
     testNoSampleAfterRemovalWithinOccupancy();
     testRemovalReasonVerbatim();
     testRecreatedNameOpensNextOccupancy();
