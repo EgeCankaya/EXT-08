@@ -739,3 +739,182 @@ recipe is bridge first, simulator second.
   samples/s. The default is lossy, and on this scenario it lost nothing. That is a measurement
   of headroom on *this* load, not a reason to keep the default. The bridge warns about the
   policy at startup so that it is never an implicit choice.
+
+## M4 — The capture format
+
+The milestone where the stream stops being something we watch and becomes something we hand
+to another repository. Almost everything below is a fact about what a real capture *contains*
+that was not obvious before one existed.
+
+### The reference capture
+
+`n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 200000`,
+bridge started first, budget 100 000 samples.
+
+```
+capture=100000/100000 records notRecorded=114
+capture written: captures\capture-atacama-000.n8rocap.jsonl
+    (100000 sample records, segment 0, simTime 0.050000 to 129.900000, end_reason=size_limit)
+declared but never published, so present in header.schemas and in no sample record:
+    activeAnimation (1 of 12 declared fields)
+```
+
+| | |
+|---|---:|
+| sample records | 100 000 |
+| file size | 48 444 217 bytes |
+| bytes per sample record | ~484 |
+| simulation time covered | 0.05 → 129.90 s |
+| distinct entity names | 77 |
+| distinct (name, occupancy) pairs | 77 |
+| bus decoder drops | **0** |
+| orphaned samples | **0** |
+| samples not recorded | 114 |
+
+**~484 bytes of JSONL per ~210 packed bytes on the wire — a 2.3× expansion.** Worth writing
+down next to the M1 measurement of `n8ro-shark`, which produced ~4.4 MB/s of JSONL for
+~520 KB/s of payload — roughly 26× — because it writes both a hex and a base64 copy of the
+raw bytes. Decoded-and-schema-headed is an order of magnitude cheaper than raw-and-doubled,
+which is the trade ADR-2 was making without a number attached. It is also the input BTB-CAP-6
+needs: a ten-minute reference run is on the order of 240 MB of capture.
+
+### The 114 that did not make it, and why that is the good news
+
+`notRecorded=114` on the first real capture. The budget filled at 100 000 while the bridge was
+asleep between two one-second status ticks, and 114 more samples arrived before the loop woke
+up and unsubscribed. **The M4 harness's stop is tick-granular, not sample-exact.**
+
+It is in the trailer as `drops.samples_not_recorded`, and the conformance reader surfaces it
+unprompted. That is the whole design working on its first outing: a recorder that had quietly
+dropped 114 samples and said nothing would be indistinguishable from one that had not, and
+the file itself now says which. M5 replaces the budget with a real queue; the field keeps its
+meaning and its name.
+
+### What a `double` actually looks like in the file
+
+Three shapes, all in the reference capture, all valid JSON numbers, all produced by
+`std::to_chars` shortest round-trip:
+
+```
+"sim_time_s":72.09999999999805          accumulated frame error, preserved to the bit
+"positionGeodetic":[-23.454302692591245,-68.25275,400]      <- 400, not 400.0
+"velocityNed":[-55,6.735557395310443e-15,0]                 <- integer-looking, and scientific
+```
+
+**`400` is a `double` field.** So are `-55`, `0` and `3.141592653589793`. Shortest round-trip
+emits no trailing `.0`, because it does not need one to round-trip — and that is a genuine
+trap for a reader that types values from the JSON token instead of from the schema. Such a
+reader silently gets an integer for every round altitude in the file and a double for every
+other, and nothing anywhere reports a problem. §8.3 of the format spec says this in bold for
+exactly that reason, and the conformance reader parses every `double`-declared field through
+a double path regardless of how the token looks.
+
+Scientific notation appears too (`6.735557395310443e-15`), which is legal JSON and worth
+having seen before a reader meets it.
+
+### Two header fields the platform would not tell us
+
+Both are recorded honestly rather than filled in from somewhere plausible.
+
+- **`platform.schema_version` came back empty.** `DbModel::getSchemaVersion()` returns `""` on
+  this model database — it declares none. The spec says the field may be empty and what that
+  means, rather than the producer inventing a value.
+- **`platform.runtime_version` is the literal `"unknown"`.** The SDK's own accessor,
+  `n8ro::core::getN8roVersion()`, is `constexpr` and returns `"unknown"` unless `N8RO_VERSION`
+  was defined when *the including translation unit* was compiled, which for us it is not.
+  `C:\N8RO\components.xml` does carry `2.1.328`, and reading it was rejected: parsing an
+  installer manifest and writing the result into a field called "observed" would be the
+  producer claiming to have measured something it looked up. `"unknown"` means the runtime did
+  not tell us, and the spec says so in those words.
+
+### `format_version` first beat `type` first
+
+BTB-CAP-1 requires `format_version` to be the first key of the first record, so a reader can
+reject an unknown version before parsing anything. The envelope's own shape wants `type`
+first, on every record. They collide on exactly one line.
+
+Resolved in favour of the requirement: the header is `{"format_version":…,"type":"header",…}`.
+`type` is still present, so a reader dispatches every record in the file on one key, and the
+version check still works on a prefix of the first line. Small, and the kind of thing that is
+a one-line fix now and a format-version bump after the M7 freeze.
+
+### The occupancy field is exercised, but only at generation 1
+
+77 distinct names, 77 distinct (name, occupancy) pairs — **no name reuse in this capture.**
+That is not the occupancy scheme failing; it is the budget stopping the recording at
+t = 129.9 s, and the engine's stop-path teardown burst — the thing that re-creates the whole
+roster under the same names — happens at engine stop, at t ≈ 200 s. The reference capture ends
+before the interesting case.
+
+Recorded as a known gap rather than left to be discovered. M3's evidence has the gen-2 case
+measured (`RedUAV_N_01` destroyed at 149.45, re-created at teardown), the conformance reader
+has a mutation that constructs the violation synthetically and catches it, and the first
+capture that will contain a real second occupancy is M5's, once the run is allowed to end and
+`entity_add` / `entity_remove` records exist to bracket it.
+
+### The wall-clock check, and its two false positives
+
+BTB-CAP-2 says no wall-clock value appears anywhere in the capture. Checked by walking every
+JSON value of all 100 004 records rather than by grepping the text, which matters:
+
+- **A bare-year regex (`20\d\d`) matches 1104 times, and every one is a scenario entity name.**
+  The platform names weapons `BlueSAM_ShortRange_wpn_20900_2`, and `20900` contains `2090`.
+- **An epoch-magnitude number check (1e9–2e9) matches exactly once:** `schemas[0].message_id`
+  = `1308183250`, the platform's own message identifier, copied verbatim from the runtime
+  schema and identical on every run.
+
+Strict date and clock shapes (`YYYY-MM-DD`, `hh:mm:ss`) match **zero** times, and no key name
+suggests a clock. Both false positives are now excluded by name in the conformance reader,
+with the reason in a comment — because the next person to run this check will hit them too,
+and a determinism check that cries wolf gets switched off.
+
+### The reader is the test of the document, and it is mutation-checked
+
+`tests/capture-reader/` is written from `docs/capture-format-v1.md` and links neither the
+bridge nor the SDK — standard library only. That is what makes BTB-CAP-5's "complete enough
+to write a reader from" checkable instead of assertable. Every rule it enforces cites the
+spec section it came from; a rule with no citation would be a rule the document failed to
+state.
+
+Writing it found three things the first draft of the spec did not say, all now in it: that a
+`double` may be written without a fractional part (§8.3), that `sim_time_s` is not monotonic
+across a segment boundary so a reader must not sort by it (§5.1), and that the
+`entity_remove.reason` vocabulary is deliberately **open** while every other vocabulary in the
+format is closed (§9). All three are things a reader author would otherwise get wrong on their
+first attempt and only discover against real data.
+
+`tests/capture-reader/mutate.py` holds it honest: 16 deliberate defects injected into a valid
+capture, **16 caught, 0 survivors** — wrong field order, an undeclared field, a sample outside
+a segment, a miscounted trailer, a truncated file, a record after the trailer, an injected
+timestamp, CRLF endings, an unknown `format_version`, a sample after its own occupancy's
+removal. Same discipline as `tests/entity-picture/`, and for the same reason: a checker that
+has never failed has not been shown to work.
+
+### How M4 records, and why it is not a draft of M5
+
+The handler is still a courier. It copies each accepted sample into a bounded, preallocated
+buffer and returns; nothing consumes that buffer while it fills, because there is no consumer.
+When the budget is reached the bridge unsubscribes, stops the pump, and only then does our own
+thread read the buffer, format every record and write the file. All IO, all formatting and all
+float conversion happen on our thread, which is the rule.
+
+**This is deliberately not the M5 design and should not be mistaken for a first draft of one.**
+M5's writer thread behind a bounded queue exists to bound *memory* and to make loss an explicit
+decision at the second boundary (BTB-BP-4); M4's buffer does the opposite — it trades memory
+for not having to build any of that yet. It costs about forty lines and M5 deletes them. What
+survives is `src/CaptureFormat.cpp`, which is pure functions over their arguments and never
+knew where its records came from.
+
+### Open questions this milestone touched
+
+- **OQ-5 — float formatting. Closed, and the PRD wording changed with it (rev 4).** BTB-CAP-3
+  said "17 significant digits". Seventeen digits is a *means* to round-trip exactness, not the
+  end, and stating the means excluded the shorter form that reaches the same end. The criterion
+  now states round-trip exactness, locale independence and uniqueness directly, and §8.3 of the
+  format spec carries the same wording, so the requirement and the cross-repo contract say one
+  thing rather than two. Adopted at M4 rather than M5 because the first capture needed it.
+- **OQ-4 — backpressure. Still M6's, one more data point:** 100 000 samples at ~860/s through
+  the `KEEP_LATEST` default, zero bus-side drops. The 114 losses in this capture are entirely
+  ours, at our own boundary, and counted there. The header records which policy the capture was
+  taken under, so a future comparison between two captures can rule the policy in or out
+  before anything else.

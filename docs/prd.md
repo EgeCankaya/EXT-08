@@ -3,7 +3,7 @@
 > **One-liner:** A standalone C++17 console program that connects to a running N8RO simulation over the message bus and turns the published stream into a durable, versioned, self-describing capture file plus a pass/fail verdict — so a run can be analysed, and re-judged, long after it has ended.
 
 **Date:** 2026-08-30
-**Revision:** 3 — reconciled with M1–M3; OQ-1 decided. See §"Revision history".
+**Revision:** 4 — BTB-CAP-3 restated on round-trip exactness; M4 delivered. See §"Revision history".
 **Status:** Draft
 **Owner:** EXT-08 implementer
 **DRI:** egemencankaya14@gmail.com
@@ -16,6 +16,7 @@
 | Rev | Date | Change |
 |----:|------|--------|
 | 1 | 2026-08-30 | Initial PRD. |
+| 4 | 2026-08-30 | **BTB-CAP-3's float criterion restated as the end rather than the means.** It said "17 significant digits"; seventeen digits is one way to reach round-trip exactness and naming it as the criterion excluded `std::to_chars` shortest round-trip, which reaches the same end in fewer bytes and is what OQ-5 resolved on. The criterion now states round-trip exactness, locale independence and uniqueness directly. No other requirement changed; M4 is delivered against this text. |
 | 3 | 2026-08-30 | **OQ-1 decided: we own the entity-picture layer.** The brief was checked and is silent on the question, so it did not settle it. The layer is treated as a permanent component: unit tests that need no simulator (`tests/entity-picture/`), documented invariants, and a snapshot API that cannot report a removed entity as live. No interface was added, and ADR-1 says why. |
 | 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was unsatisfiable as written** and is now scoped to an entity occupancy; `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so the criterion is checkable in the capture itself (ADR-6). BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
 
@@ -351,7 +352,7 @@ Given two runs of the same scenario under the same configuration, the system SHA
 
 **Acceptance criteria:**
 - Field order in every `sample` record follows the `MessageSchema::fields` vector, never `StreamValueMap` iteration order.
-- Floating-point values are emitted with a fixed, round-trip-exact, locale-independent format (17 significant digits), so a value written and re-read is bit-identical.
+- Floating-point values are emitted in a **round-trip-exact, locale-independent format that is uniquely determined for a given double**, so a value written and re-read is bit-identical and the same double always produces the same bytes on every host and every build. *(Rev 4: this criterion previously said "17 significant digits". Seventeen digits is a **means** to round-trip exactness, not the end, and stating the means excluded the shorter form that reaches the same end. `std::to_chars` shortest round-trip satisfies all three properties; the `printf` family is disqualified outright, because `%.17g` is round-trip exact and **silently** locale-dependent — it emits `0,05` under a comma-decimal locale, which is not JSON. Settled by test at M1, adopted at M4. See OQ-5 and `tests/float-format/`.)*
 - No container with unspecified iteration order is iterated anywhere in the capture path.
 - Ten consecutive identical-configuration pairs hash identically.
 
@@ -865,7 +866,7 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 | OQ-2 | What is the exact `n8ro-sim-app.exe` headless invocation? | Needs input | Before the controller stretch goal; **before EXT-17 starts** | [S2] itself says "confirm the invocation with your mentor." EXT-17 depends on it outright. Raised here because EXT-08's controller stretch goal touches the same surface, and because raising it now buys EXT-17 lead time it would otherwise lose |
 | OQ-3 | What is the entity-state topic string, and what fields does its schema actually declare? | **Resolved (M1, corrected at M3)** | M1 (observe the bus) | `sim/entity/state`, message `simEntityStateUpdate`, **twelve** declared fields — eleven of which are ever published. Recorded in the notes deliverable, not restated here as a constant: the code still resolves both at runtime (BTB-EP-1), and this PRD deliberately does not become the second copy that drifts |
 | OQ-4 | Which bus-side backpressure policy is correct for a recorder — `FIFO_DROP` with a large queue, or `BLOCK`? | Provisional | M6 (backpressure) | `KEEP_LATEST` is ruled out: it discards the older of two samples, which is the one already part of the run's history. Between the remaining two, `BLOCK` risks perturbing the observed simulation and `FIFO_DROP` risks losing data. Provisional answer: `FIFO_DROP` with a queue sized from the M1 rate, because a recorder that changes the run it records is worse than one that admits a gap. Confirm under the M6 overload. **M1/M3 sizing input:** 100 messages is ~120 ms of headroom at the reference scenario's 818 packets/s and ~40 ms at the 126-entity overload scenario's 2487/s. M3 ran the reference scenario on the `KEEP_LATEST` default and lost nothing — a measurement of headroom at this load, not a reason to keep the default |
-| OQ-5 | What float formatting guarantees round-trip-exact, locale-independent output on this toolchain? | **Resolved (M1, by test)** | M5 (output path) | `std::to_chars` shortest round-trip. The `printf` family is **disqualified**: `%.17g` is round-trip exact but silently locale-dependent, emitting `0,05` under a comma-decimal locale — which this machine has. Probe and corpus at `tests/float-format/`. Note for M5: BTB-CAP-3 says "17 significant digits", which is a *means* to round-trip exactness; shortest round-trip reaches the same end, and the spec text should say "round-trip exact" if shortest is adopted |
+| OQ-5 | What float formatting guarantees round-trip-exact, locale-independent output on this toolchain? | **Resolved (M1, by test)** | M5 (output path) | `std::to_chars` shortest round-trip. The `printf` family is **disqualified**: `%.17g` is round-trip exact but silently locale-dependent, emitting `0,05` under a comma-decimal locale — which this machine has. Probe and corpus at `tests/float-format/`. **Landed at M4 (rev 4):** shortest round-trip is adopted, and BTB-CAP-3 no longer says "17 significant digits" — it states round-trip exactness, locale independence and uniqueness directly, which is what the criterion was always reaching for. `docs/capture-format-v1.md` §8.3 carries the same wording, so the requirement and the cross-repo contract say one thing |
 | OQ-6 | Should the referee's condition-file schema be designed for EXT-17 to adopt directly, or purely for EXT-08's needs? | Provisional | M6 | Designing for a consumer that does not exist yet risks speculative generality. Provisional answer: design for EXT-08, document it fully, and let EXT-17 adopt or supersede it — an over-designed schema is harder to supersede than a simple documented one |
 
 ### Rabbit holes
@@ -993,12 +994,13 @@ Register schemas; subscribe decoded; build the roster from `sim/entity/event`; b
 **Validation:** BTB-EP-1 through BTB-EP-4. Roster fills and empties correctly across a full scenario. Registry size and resolved topic logged. **Gate: if this exceeds three days, invoke R3's containment before proceeding.**
 **Result:** met. Both topics resolved from the registry with no topic literal in the codebase; all three BTB-EP-1 failure modes exercised on distinct exit codes. Reference run: 42 entities at load, 90 distinct names, 132 occupancies, removals `destroyed:23 expended:48 scenario_unload:19`, 132 188 samples, **0 drops, 0 orphans**. Two findings changed this document — the twelfth schema field (§"Prior art"), and BTB-EP-3's unsatisfiable criterion (ADR-6). R3 closed; the gate was not reached.
 
-### M4 — Capture format and the spec (1 day)
+### M4 — Capture format and the spec (1 day) — **delivered**
 Design and document `n8ro-capture/1`; write the header with its embedded schema envelope; emit `sample` records; write `docs/capture-format-v1.md` alongside the code, not after it.
 **Validation:** BTB-CAP-1, BTB-CAP-4, BTB-CAP-5. A capture from a real run parses. The spec is complete enough to hand to someone who has not seen the code.
+**Result:** met. `docs/capture-format-v1.md` specifies all eight record types normatively; `tests/capture-reader/` is a conformance reader written from that document alone, linking neither the bridge nor the SDK, and it is the standing check that the document stays sufficient. Float formatting landed here rather than at M5 (OQ-5, rev 4). Two scope notes: M4 emits the state model's **attach-mid-run** segment branch only — one segment, opened on the first sample — so that no `sample` sits outside an open segment and the reference capture is conformant rather than a known-bad file; and it records by filling a bounded buffer on the pump thread and writing the whole file from our own thread afterwards, because the writer thread and the handler-to-writer queue are M5's (BTB-BP-1/BP-2) and building them early would have pre-empted that milestone's backpressure accounting. §"Producer conformance" in the format spec states both gaps to a reader.
 
 ### M5 — Output path and lifecycle (1.5 days)
-The writer thread; the handler-to-writer handoff; segment boundaries on scenario load and reload; entity-removal records; host-loss handling; float formatting resolved (OQ-5).
+The writer thread; the handler-to-writer handoff; segment boundaries on scenario load and reload; entity-removal records; host-loss handling. *(Float formatting was resolved at M4, not here — see OQ-5.)*
 **Validation:** BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-CAP-2, BTB-CAP-3. A reload produces two segments. Killing the simulator produces a `host_lost` trailer. No wall-clock value appears anywhere in the capture path.
 
 ### M6 — Referee and backpressure (2 days)

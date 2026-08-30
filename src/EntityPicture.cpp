@@ -46,7 +46,7 @@ void EntityPicture::pushEventLocked(RosterEvent event) {
     eventLog_.push_back(std::move(event));
 }
 
-void EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
+SampleOutcome EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
     // Read the two keys we need before taking the lock. Everything else stays verbatim.
     const std::optional<std::string> name = tryReadString(values, "scenarioEntityName");
     const std::optional<double> simTime = tryReadDouble(values, "simulationTime");
@@ -56,13 +56,13 @@ void EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
     if (!name) {
         // Cannot be keyed, so it cannot enter the map. Counted rather than dropped quietly.
         ++counters_.samplesUnnamed;
-        return;
+        return SampleOutcome{};
     }
     if (!simTime) {
         // A sample with no clock of its own has nothing durable to be stamped with, and
         // wall-clock is not a substitute (tenet 2).
         ++counters_.samplesUntimed;
-        return;
+        return SampleOutcome{};
     }
 
     const auto rosterEntry = roster_.find(*name);
@@ -72,7 +72,7 @@ void EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
         // re-create under the same name opens a new occupancy first, so the scenario_unload
         // churn M1 found does not land here.
         ++counters_.samplesOrphaned;
-        return;
+        return SampleOutcome{};
     }
 
     LatestSample& entry = latest_[*name];
@@ -80,6 +80,8 @@ void EntityPicture::onSample(const n8ro::sim::StreamValueMap& values) {
     entry.generation = rosterEntry->second.generation;
     entry.values = values;   // verbatim copy; the courier's whole job
     ++counters_.samplesAccepted;
+
+    return SampleOutcome{true, *name, entry.generation, *simTime};
 }
 
 void EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& values) {

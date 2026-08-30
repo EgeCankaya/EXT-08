@@ -23,3 +23,11 @@ test_artifacts/
 # the outer contract this work must comply with; docs/prd.md carries the detailed musts.
 # Deliberately untracked: it is a proprietary binary and its content is Arkheon's, not ours.
 *.docx
+
+# Capture files produced by real runs. A reference run of Atacama Air Defense at the
+# default 100 000-sample budget is roughly 45 MB of JSON Lines - an artifact to produce and
+# check, not one to version. M7's evidence pack carries a small trimmed sample instead.
+captures/
+*.n8rocap.jsonl
+build.log
+buildtests.log

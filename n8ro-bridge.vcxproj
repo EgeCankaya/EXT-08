@@ -110,13 +110,19 @@
 
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\CaptureFormat.cpp" />
+    <ClCompile Include="src\Json.cpp" />
+    <ClCompile Include="src\SampleBuffer.cpp" />
     <ClCompile Include="src\EntityPicture.cpp" />
     <ClCompile Include="src\TopicResolution.cpp" />
   </ItemGroup>
 
   <ItemGroup>
+    <ClInclude Include="src\CaptureFormat.h" />
     <ClInclude Include="src\EntityPicture.h" />
     <ClInclude Include="src\ExitCodes.h" />
+    <ClInclude Include="src\Json.h" />
+    <ClInclude Include="src\SampleBuffer.h" />
     <ClInclude Include="src\TopicResolution.h" />
   </ItemGroup>
 

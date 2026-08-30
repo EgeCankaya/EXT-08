@@ -62,6 +62,21 @@ struct LatestSample {
     n8ro::sim::StreamValueMap values;
 };
 
+// What onSample() decided, handed back so the caller can record the sample without
+// re-deriving the roster lookup the picture just did. This is the whole coupling between
+// the entity picture and the capture: the picture never learns that a capture exists, and
+// the capture path never touches the roster.
+//
+// `accepted` false means the sample did not enter the map - it was unnamed, untimed, or
+// orphaned - and the counter that says which has already been incremented. An accepted
+// sample carries the (name, occupancy) pair the capture keys on (ADR-6).
+struct SampleOutcome {
+    bool accepted = false;
+    std::string scenarioEntityName;
+    std::uint64_t generation = 0;
+    double simulationTimeS = 0.0;
+};
+
 // A roster transition, queued for our own thread to log. The handler must not format or
 // write, so it pushes one of these and returns.
 struct RosterEvent {
@@ -124,7 +139,10 @@ public:
     static constexpr std::size_t kEventLogCapacity = 4096;
 
     // Called from the bus pump thread. Copies, updates, returns - no IO, no formatting.
-    void onSample(const n8ro::sim::StreamValueMap& values);
+    //
+    // The return value is not [[nodiscard]] on purpose: a caller that only wants the
+    // picture maintained, which is every caller before M4, ignores it and reads correctly.
+    SampleOutcome onSample(const n8ro::sim::StreamValueMap& values);
     void onEntityEvent(const n8ro::sim::StreamValueMap& values);
 
     // Called from our own thread.

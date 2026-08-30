@@ -20,5 +20,6 @@ constexpr int kExitEntityStateShapeWrong = 9;    // resolved, but not shaped lik
 constexpr int kExitEntityEventUnresolved = 10;   // entity-event topic unresolvable; no roster
 constexpr int kExitSubscribeFailed = 11;         // subscribeByTopic() returned no subscription
 constexpr int kExitNoMessageBus = 12;            // client exposed no message bus
+constexpr int kExitCaptureWriteFailed = 13;      // the capture file could not be opened or written
 
 }  // namespace n8ro::bridge

@@ -4,15 +4,24 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 + M2 + M3.** The bridge registers the packed schemas, resolves the
-entity-state and entity-event topics *from the registry*, subscribes decoded to both, and
-maintains a roster and a latest-sample map of its own. Once a second it prints the engine
-state plus the entity picture and the bus decoder's drop counters.
+**Status: M1 + M2 + M3 + M4.** The bridge registers the packed schemas, resolves the
+entity-state and entity-event topics *from the registry*, subscribes decoded to both,
+maintains a roster and a latest-sample map of its own, and — new at M4 — records a run into
+a self-describing `n8ro-capture/1` capture file. Once a second it prints the engine state
+plus the entity picture and the bus decoder's drop counters.
 
-It does not write a capture file, does not know about segments, and does not judge
-anything — those are M4 onward. The bus-side subscription still runs on the lossy
-`KEEP_LATEST` default; M6 sets both backpressure boundaries explicitly. The bridge says so
-in a warning at startup rather than leaving it implicit.
+The capture format is specified in [`docs/capture-format-v1.md`](docs/capture-format-v1.md).
+That document is a **cross-repo contract**: EXT-17 gets it and nothing else, and the
+conformance reader in `tests/capture-reader/` was written from it alone — it links neither
+this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
+rather than a claim.
+
+It does not yet split scenario reloads into separate segments, does not write roster
+transitions out as `entity_add` / `entity_remove` records, and does not judge anything —
+those are M5 onward, and §16 of the format spec states exactly which of them a current
+capture is missing. The bus-side subscription still runs on the lossy `KEEP_LATEST`
+default; M6 sets both backpressure boundaries explicitly. The bridge says so in a warning
+at startup, and the policy it recorded under goes into every capture's header.
 
 ## Requirements
 
@@ -86,6 +95,8 @@ bus.
 | `--model-path` | directory holding the schema and instance database, e.g. `C:\N8RO\data\db` |
 | `--schema-file` | schema name inside that database, e.g. `N8roSimSchema` |
 | `--entity-state-message` | message instance name the entity-state topic is resolved *from*. Default `simEntityStateUpdate`. Optional |
+| `--capture-out` | write a capture to this path. Without it the bridge only reports. **M4 only** — M5 replaces it with `--out-dir` / `--run-label` and the naming convention in the PRD |
+| `--capture-max-samples` | stop recording after this many accepted samples, then write the file and exit 0. Default `100000`. Optional |
 
 The first three are required; none are compiled in.
 
@@ -140,6 +151,7 @@ scenario load is *refused* — `Component type 'componentPhysics' has no registe
 | 10 | the entity-event topic could not be resolved, so no roster could be built |
 | 11 | `subscribeByTopic` returned no subscription |
 | 12 | the client was created but exposes no message bus |
+| 13 | the capture file could not be opened or written |
 
 Configuration is where the difficulty lives. A wrong `--schema-file`, for example, names
 the file it could not open and then names all three values back:
@@ -179,6 +191,49 @@ The suite's own adequacy is checked by mutation: deliberate defects introduced i
 it is how the "stale sample survives a re-creation" gap was found, which every other test
 had been passing over.
 
+### Capture conformance reader
+
+`tests/capture-reader/` is a reader for the capture format, **written from
+[`docs/capture-format-v1.md`](docs/capture-format-v1.md) and not from this program's source.**
+It links neither the bridge nor the N8RO SDK — standard library only — which is what makes
+BTB-CAP-5's "the spec is complete enough to write a reader from" a test rather than a claim.
+Every rule it enforces cites the spec section it came from.
+
+```cmd
+cl /std:c++17 /EHsc /W4 /O2 /Fe:capture_reader.exe tests\capture-reader\capture_reader.cpp
+
+capture_reader.exe captures\capture-atacama-000.n8rocap.jsonl --spec docs\capture-format-v1.md
+```
+
+```
+  format n8ro-capture/1
+  records  header=1 segment_open=1 segment_close=1 entity_add=0 entity_remove=0 sample=100000 verdict=0 trailer=1
+  sim_time 0.05 -> 129.9 s
+  entities 77 distinct names, 77 distinct (name, occupancy) pairs
+  schema   simEntityStateUpdate (sim/entity/state): 12 declared, 11 ever published
+           declared and NEVER published: activeAnimation  (absent from every sample, present in header.schemas - spec 8.2)
+  clock    no wall-clock-shaped value found (spec 1, 14)
+  version  specification title and header agree: n8ro-capture/1
+
+RESULT: CONFORMS to n8ro-capture/1
+```
+
+Exit 0 if the capture conforms, 1 if it does not with every failure named by line and spec
+section, 2 on a usage or IO error.
+
+A reader that has never rejected anything has not been shown to work, so its own adequacy is
+mutation-checked the same way the entity picture's suite is:
+
+```cmd
+python tests\capture-reader\mutate.py ^
+    captures\capture-atacama-000.n8rocap.jsonl build\tests\capture_reader.exe docs\capture-format-v1.md
+```
+
+Sixteen deliberate defects — wrong field order, an undeclared field, a sample outside a
+segment, a miscounted trailer, a truncated file, a record after the trailer, an injected
+timestamp, CRLF endings, an unknown `format_version`, a sample after its own occupancy's
+removal — **16 caught, 0 survivors.**
+
 ## Determinism probe
 
 `tests/float-format/float_format_probe.cpp` settles which double-to-text format is
@@ -201,10 +256,42 @@ src/main.cpp                             CLI, wiring, the once-a-second report
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and both topics from the registry
 src/EntityPicture.{h,cpp}                BTB-EP-3/EP-4 — the roster and the latest-sample map
 src/ExitCodes.h                          one table of process exit codes
+src/CaptureFormat.{h,cpp}                BTB-CAP-1/CAP-4 — the `n8ro-capture/1` serialiser
+src/Json.{h,cpp}                         JSON escaping and the round-trip-exact float format
+src/SampleBuffer.{h,cpp}                 M4's bounded record buffer — M5 replaces it
 tests/entity-picture/                    unit tests for the picture — no simulator needed
+tests/capture-reader/                    conformance reader, written from the format spec alone
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
 ```
+
+## Recording a capture
+
+```cmd
+:: bridge first - the entity_created burst fires once, at scenario load
+build\x64\Release\n8ro-bridge.exe ^
+    --config      SimEngineClient_SharedMemory ^
+    --model-path  C:\N8RO\data\db ^
+    --schema-file N8roSimSchema ^
+    --capture-out captures\capture-atacama-000.n8rocap.jsonl ^
+    --capture-max-samples 100000
+
+:: then, in a prompt that has also run setup.cmd
+n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db --run-ms 200000
+```
+
+The bridge records until the sample budget is reached, then unsubscribes, stops the pump,
+writes the whole file from its own thread, and exits 0. **The budget is what ends the run** —
+there is no signal handling until M7, so a bridge interrupted before the budget writes no
+file. 100 000 samples is about 130 s of the reference scenario and about 48 MB of JSON Lines.
+
+Two things about the current recording strategy, both deliberate and both temporary. The
+subscription handler stays a courier: it copies each accepted sample into a bounded buffer
+and returns, and nothing reads that buffer until recording has stopped, so all IO, formatting
+and float conversion happen on our own thread. That trades memory for not yet having M5's
+writer thread and bounded queue, which is where BTB-BP-1 and BTB-BP-4 actually land. And
+`--capture-out` names a file directly; M5 replaces it with `--out-dir` / `--run-label` and
+the naming convention in the PRD.
 
 ## Notes on handling captures
 

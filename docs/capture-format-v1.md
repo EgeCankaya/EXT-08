@@ -1,0 +1,728 @@
+# `n8ro-capture/1` — capture format specification
+
+**Version string:** `n8ro-capture/1`
+**Status:** Draft until the EXT-08 M7 format freeze. Pre-freeze, this document may change;
+after it, a change is a version bump (see [Versioning and compatibility](#versioning-and-compatibility)).
+**Produced by:** EXT-08 Bus Telemetry Bridge (`n8ro-bridge`)
+**Platform baseline observed:** N8RO runtime 2.1.328
+
+This document is the whole contract. It is written to be sufficient on its own: a reader for
+this format can be implemented from this file with no access to the producer's source, and
+that is not an aspiration — the conformance reader in `tests/capture-reader/` was written
+from this document and is the check that it stays true.
+
+---
+
+## 1. What a capture is
+
+A capture is a durable, replayable record of what one N8RO simulation run published on the
+message bus, plus enough schema information to interpret every value in it without asking
+anyone.
+
+Two properties define it, and both are load-bearing:
+
+**It is self-describing.** The first record carries the runtime `MessageSchema` for every
+message type the file contains, verbatim — names, types, sizes, order, and the schema's
+identity hashes. A reader never needs a compiled-in field list, and a field the platform
+adds tomorrow appears in tomorrow's captures with no reader change.
+
+**Its only clock is simulation time.** No wall-clock value appears anywhere in a capture, in
+any record, for any reason. This is what makes two runs of the same scenario under the same
+configuration produce byte-identical files, and byte-identical files are what let a consumer
+prove that a difference between two runs came from the simulation rather than from the
+recorder. If you are looking for the wall-clock time at which something happened, it is in
+the producer's log, not here, and that is deliberate.
+
+---
+
+## 2. Container
+
+| Property | Value |
+|---|---|
+| Encoding | UTF-8, no byte-order mark |
+| Structure | JSON Lines — exactly one JSON object per line |
+| Line terminator | LF (`0x0A`). Never CRLF, on any platform |
+| Final byte | Every record line, including the last, is LF-terminated |
+| File extension | `.n8rocap.jsonl` by convention; nothing in the format depends on it |
+
+Each line is a complete, independent JSON object. No line spans a line break, no record is
+split, and there is no enclosing array. A reader can therefore process a capture streaming,
+one `getline` at a time, and can process a capture larger than memory.
+
+There are no blank lines and no comment lines. A reader encountering one may reject the file.
+
+---
+
+## 3. How to read a capture
+
+In this order. Steps 1 and 2 are mandatory before any other parsing.
+
+1. **Read the first line and parse it as JSON.** If it is not a JSON object, or its `type` is
+   not `header`, reject the file: this is not a capture.
+2. **Read `format_version`.** It is the object's first key, so a reader that wants to check
+   it without a full parse may. If it is not a version this reader implements, **reject the
+   file with a named error naming the version found and the versions supported, and stop.**
+   Do not attempt a partial parse. This is the entire compatibility mechanism and it is
+   deliberately blunt — partial parsing of an unknown format is how silently-wrong analysis
+   happens.
+3. **Build a schema table** from `header.schemas`, keyed by `message_name`.
+4. **Read the remaining lines in order.** Each is a record; dispatch on `type`.
+5. **Stop at the `trailer`.** It is the last record of a complete capture. A file whose last
+   line is not a `trailer` was truncated — the producer was killed, or the disk filled — and
+   a reader should say so rather than treat the file as complete. Everything before the
+   truncation point is still valid and may be used.
+
+A reader **must** ignore a record whose `type` it does not recognise rather than fail on it,
+*except* that within a given `format_version` the record vocabulary is closed (§4), so an
+unrecognised type in a version-matched file indicates a producer defect and should be
+reported.
+
+A reader **must** ignore unrecognised **keys** inside a record it does recognise. Adding a
+key to an existing record type is a non-breaking change (§13).
+
+---
+
+## 4. The record vocabulary
+
+Exactly eight record types exist in `n8ro-capture/1`. The set is closed: a ninth type is a
+new format version, not an addition.
+
+| `type` | Purpose | Occurrences |
+|---|---|---|
+| `header` | Format version, provenance, and the embedded schemas | Exactly one, first line |
+| `segment_open` | A scenario run begins | One per segment |
+| `segment_close` | That scenario run ends | Exactly one per `segment_open` |
+| `entity_add` | An entity occupancy opens | Zero or more |
+| `sample` | One published message, verbatim | Zero or more |
+| `entity_remove` | An entity occupancy closes | Zero or more |
+| `verdict` | The result of one declared condition | Zero or more |
+| `trailer` | The capture closes, with counters | Exactly one, last line |
+
+---
+
+## 5. The common envelope
+
+Every record except `header` begins with the same keys, in this order:
+
+| Key | Type | Present on | Meaning |
+|---|---|---|---|
+| `type` | string | all records | The record type, from the table above |
+| `sim_time_s` | number | all except `header` | Simulation time, in seconds, carried by the event or message that caused this record |
+| `segment` | number (integer) | all except `header` and `trailer` | The ordinal of the enclosing segment, from 0 |
+
+`header` has neither `sim_time_s` nor `segment`: it has no cause on the bus to take a time
+from, and it precedes every segment. `trailer` has `sim_time_s` but no `segment`: it closes
+the file, not a segment, and every segment it covers has already been closed by its own
+record.
+
+### 5.1 `sim_time_s` — read this before you sort anything
+
+`sim_time_s` is **the simulation time the record's cause carried**, not the time the record
+was written and not a time the producer computed. It is the value the platform published.
+
+Three properties of it will surprise a reader who assumes otherwise, and all three are
+observed platform behaviour rather than format choices:
+
+- **It is not monotonic across a segment boundary.** The engine's stop path resets the
+  simulation clock *before* it publishes the teardown events, so the `entity_remove` records
+  that end a run can carry `sim_time_s = 0.0` — sorting *before* every sample in the run they
+  end. **Never sort a capture by `sim_time_s` globally.** Sort within a segment if you must
+  sort at all; the file's own record order is the authoritative ordering.
+- **It is not unique.** Every entity publishes on the same simulation frame, so a 42-entity
+  scenario produces 42 records sharing one `sim_time_s` value.
+- **It carries accumulated floating-point error, and the capture preserves it exactly.**
+  Values such as `35.20000000000014` and `65.74999999999841` are real and correct — a 0.05 s
+  frame increment summed a few hundred times. They are not rounded, because rounding them
+  would destroy the exactness the capture exists to preserve.
+
+### 5.2 Record ordering
+
+Records appear in the order the producer received their causes, FIFO per topic. That order is
+part of the contract: it is what makes the capture a record of a run rather than a bag of
+observations. A reader should treat file order as authoritative and must not reorder records
+to make times monotonic.
+
+---
+
+## 6. Record: `header`
+
+The first line of every capture. Its keys appear in exactly this order.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `format_version` | string | `"n8ro-capture/1"`. **Always the first key**, so a reader can check it before parsing further |
+| `type` | string | `"header"`. Second key — see the note below the table |
+| `producer` | object | The tool that wrote the file — see §6.1 |
+| `platform` | object | The configuration the run was recorded under — see §6.2 |
+| `attached_mid_run` | boolean | See §6.3 |
+| `subscription` | object | The bus-side delivery policy in force — see §6.4 |
+| `schemas` | array of object | One entry per message type appearing in this file — see §6.5 |
+
+`header` carries `"type": "header"` like every other record, but it is the **second** key,
+not the first: `format_version` must come first so that an unknown version can be rejected
+before anything else is parsed, and that outranks the envelope's usual type-first shape. A
+reader can still dispatch every record in the file, header included, on `type`.
+
+### 6.1 `producer`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Tool name, e.g. `"n8ro-bridge"` |
+| `version` | string | Tool version, e.g. `"0.4.0"` |
+
+Informational. A reader must not change its behaviour based on it — that is what
+`format_version` is for. It exists so that a capture found on disk in six months can be
+traced to the build that wrote it.
+
+### 6.2 `platform`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `engine_config` | string | The engine configuration entry the producer connected through, e.g. `"SimEngineClient_SharedMemory"` |
+| `model_path` | string | Directory holding the schema and instance database the schemas were read from |
+| `schema_file` | string | Schema name within that database, e.g. `"N8roSimSchema"` |
+| `schema_version` | string | The model database's own schema version, as the database reports it. May be empty if the database declares none |
+| `runtime_version` | string | The N8RO runtime version, as the runtime's own version accessor reports it. **May be the literal `"unknown"`** — the SDK's accessor is compile-time and returns `"unknown"` when the release headers were built without a version defined, which is the case on the 2.1.328 SDK. `"unknown"` means "the runtime did not tell us", not "the producer failed" |
+
+Every value here is observed at run time, never compiled in. `model_path` is a filesystem
+path and is therefore host-specific; two captures of the same scenario recorded on hosts with
+different install locations will differ in this one field and nowhere else.
+
+### 6.3 `attached_mid_run`
+
+`true` when the producer attached to a simulation that had **already loaded a scenario**
+before the producer had received a single sample.
+
+Why it matters to a reader: the platform publishes its entity-creation events once, in a
+burst, at scenario load. A producer that attaches after that burst never sees the roster
+being built, so entities appear in `sample` records with no preceding `entity_add`, and the
+capture's own view of who is on the field is incomplete through no fault of the file.
+
+**A reader should treat `attached_mid_run: true` as a caveat on completeness**, not as an
+error. Entity identity in such a capture is still sound; the roster's origin is simply not in
+the file.
+
+### 6.4 `subscription`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `topic` | string | The bus topic the samples in this file were subscribed from, e.g. `"sim/entity/state"` |
+| `backpressure_policy` | string | `"KEEP_LATEST"`, `"FIFO_DROP"`, or `"BLOCK"` |
+| `queue_size` | number (integer) | The bus-side delivery queue depth, in messages |
+
+This records the delivery policy the capture was recorded under, because loss characteristics
+are a property of the capture and not of the release notes. `KEEP_LATEST` in particular is
+lossy in a way that matters to an analyst: under pressure it discards the *older* of two
+queued samples — the one already part of the run's history. A reader comparing two captures
+should compare this object before concluding anything about a difference between them.
+
+Bus-side loss, where the platform reports it, is in `trailer.bus_metrics`.
+
+### 6.5 `schemas`
+
+An array of schema envelopes, **sorted ascending by `message_name`**. One entry exists for
+each message type that appears as a `sample` record's `message` value. Message types the
+producer consumed but never wrote out verbatim — for example the entity-lifecycle event
+stream behind `entity_add` and `entity_remove` — are **not** listed, because no record in the
+file needs them to be interpreted.
+
+Each entry:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `message_name` | string | The platform's own name for the message type. This is the join key to a `sample` record's `message` |
+| `topic` | string | The bus topic this message type travels on |
+| `schema_hash` | number (integer) | The platform's schema hash. Two captures whose schemas share a `message_name` but differ in `schema_hash` were recorded against **different** versions of that message and must not be compared field-by-field without checking |
+| `message_id` | number (integer) | The platform's numeric message identifier |
+| `wire_version` | number (integer) | The packed wire-format version |
+| `fields` | array of object | The declared fields, **in declaration order** — see below |
+
+Each element of `fields`:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Field name. This is the key used inside a `sample` record's `fields` object |
+| `type` | string | One of `"int"`, `"double"`, `"string"`, `"bool"` |
+| `size` | number (integer) | Element count. `1` is a scalar; a value greater than `1` is a fixed-length array of `size` elements of `type` |
+
+**The order of `fields` is normative and is the single most important thing in the header.**
+It is the platform's own declaration order, copied verbatim from the runtime schema. It is
+the order in which a `sample` record's `fields` object is written, and a reader that wants to
+verify a capture's integrity should check that correspondence. It is *not* alphabetical, and
+it is not the order in which any human wrote the fields down.
+
+**A field declared here may never appear in any `sample` record.** That is legal and it is
+common — see §8.3.
+
+---
+
+## 7. Records: `segment_open` and `segment_close`
+
+A **segment** is one scenario run inside a capture. An operator who loads a scenario, runs
+it, reloads it and runs it again produces one capture with two segments — and without them a
+reader would have no way to tell that from a single long run, which would make every
+statistic computed over the file meaningless.
+
+### `segment_open`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"segment_open"` |
+| `sim_time_s` | number | Simulation time of the cause that opened the segment |
+| `segment` | number (integer) | The segment ordinal. Starts at 0; strictly increasing within a file; never reused |
+| `scenario` | string | The scenario name **as the platform reported it**, not as supplied on a command line. May be empty if the platform had not yet reported one |
+
+### `segment_close`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"segment_close"` |
+| `sim_time_s` | number | Simulation time of the cause that closed the segment |
+| `segment` | number (integer) | The ordinal of the segment being closed. Matches an earlier `segment_open` |
+| `scenario` | string | The same scenario name the matching `segment_open` carried |
+| `reason` | string | Why it closed — closed set below |
+
+`segment_close.reason` is one of:
+
+| Value | Meaning |
+|---|---|
+| `scenario_unloaded` | The platform unloaded or reloaded the scenario |
+| `host_lost` | The simulation host stopped publishing, exited, or died |
+| `shutdown` | The operator stopped the producer |
+| `size_limit` | The capture reached its configured size or record bound |
+
+### Segment rules
+
+- Exactly one `segment_close` per `segment_open`.
+- Segment ordinals strictly increase and are never reused within a file.
+- **No `sample` record appears outside an open segment.** If a reader sees one, the file is
+  malformed and the reader should say so.
+- `entity_add`, `entity_remove` and `verdict` records also carry `segment` and also fall
+  inside an open segment.
+- A capture may legitimately contain **zero** segments — if the producer attached, recorded
+  nothing, and closed, the file is `header` then `trailer`. That is a valid, complete,
+  empty capture.
+
+---
+
+## 8. Record: `sample`
+
+The bulk of a capture. One record per message the producer accepted, carrying every field
+that message actually contained, verbatim.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"sample"` |
+| `sim_time_s` | number | The simulation time this sample carried |
+| `segment` | number (integer) | Enclosing segment ordinal |
+| `entity` | string | Scenario entity name |
+| `occupancy` | number (integer) | Which tenure of that name this sample belongs to — see §8.1 |
+| `message` | string | The message type. Join to `header.schemas[].message_name` to get the field declaration |
+| `fields` | object | The message's contents — see §8.2 |
+
+### 8.1 `occupancy` — why a name is not an identity
+
+**A scenario entity name does not uniquely identify an entity across a run, and a reader that
+assumes it does will be wrong on any capture containing a scenario teardown or a kill.**
+
+The platform reuses names. Two observed cases, both real:
+
+- The engine's stop path deletes every live entity with reason `scenario_unload` and then
+  **immediately re-creates the entire roster under the same names.**
+- An entity destroyed mid-run can be re-created later under the name it had.
+
+An entity's identity in a capture is therefore the **pair** `(entity, occupancy)`.
+`occupancy` is a per-name generation counter starting at 1. It is opened by an `entity_add`
+and closed by the matching `entity_remove`, and every `sample` carries the occupancy that was
+open when it arrived.
+
+Consequences a reader must handle:
+
+- **Samples under a name may legitimately resume after that name's `entity_remove`** — under
+  a *higher* `occupancy`, and only after a new `entity_add` opened it. This is not corruption.
+- Within one `(entity, occupancy)` pair, **no `sample` ever appears after that pair's
+  `entity_remove`.** That invariant does hold, and it is the one worth asserting.
+- Group, join and aggregate on the pair, never on `entity` alone. Two tenures of one name are
+  two different things that happen to share a label.
+
+### 8.2 `fields` — verbatim, schema-ordered, and sparse
+
+`fields` is a JSON object whose keys are field names from the message's schema.
+
+Three rules, all normative:
+
+**Order.** The keys appear in the order `header.schemas[].fields` declares them, restricted to
+the fields actually present. This is a guarantee about the bytes on disk. A reader using an
+order-preserving JSON parse can verify it, and the conformance reader does. A reader using an
+ordinary hash-map parse loses the order harmlessly — the header still supplies it.
+
+**Verbatim.** Values are exactly as the platform published them. No unit conversion, no
+renaming, no rounding, no curation, no derived fields. If the platform publishes an angle in
+radians, the capture carries radians.
+
+**Sparse.** A field the schema declares but the publisher **did not send** is **absent from
+the object entirely**. It is not `null`, not `0`, not `""`. `header.schemas` still carries the
+full declaration, so a reader can always distinguish:
+
+- *declared and present* — the key is in `fields`
+- *declared and never sent* — the key is in the schema and in no `fields` object
+- *not declared at all* — the key is in neither, and a reader should reject a `fields` key
+  the schema does not declare as a producer defect
+
+This is not a hypothetical accommodation. On runtime 2.1.328 the entity-state message declares
+twelve fields and only eleven are ever published: `activeAnimation` appeared zero times in
+132 188 samples. A format that defaulted it would have invented 132 188 empty strings and
+reported them as data.
+
+### 8.3 Field-value encoding
+
+| Schema `type` | `size` | JSON encoding |
+|---|---|---|
+| `int` | 1 | JSON number, integral |
+| `double` | 1 | JSON number — see below |
+| `bool` | 1 | JSON `true` / `false` |
+| `string` | 1 | JSON string |
+| any | > 1 | JSON array of the corresponding scalar encoding |
+
+**Doubles are written in shortest round-trip form.** The text is the shortest decimal string
+that reads back as the identical IEEE-754 bit pattern. It is locale-independent and uniquely
+determined for a given double, so the same value always produces the same bytes on every host
+and every build.
+
+Two consequences for a reader, both important:
+
+- **A `double` field may be written without a fractional part.** `5` is a valid encoding of
+  `5.0`. **Parse any field the schema declares as `double` into a double**, whatever it looks
+  like on the line. A reader that types values from the JSON token rather than from the schema
+  will silently produce integers for round values.
+- **Reading the text back with a correctly-rounding parser recovers the exact original bits.**
+  Round-tripping a capture through parse-and-reserialise is lossless.
+
+**Non-finite doubles** have no JSON number spelling. Should the platform ever publish one, it
+is written as one of three quoted string tokens — `"nan"`, `"inf"`, `"-inf"` — and a reader
+**must** accept a string in a `double`-typed field when and only when it is one of those three.
+Nothing observed on this platform has produced one; the rule exists so that if it happens, the
+capture stays parseable and says so rather than emitting a bare `nan` and corrupting the file.
+
+**Array length.** A field with `size > 1` is a JSON array. Its length is normally `size`, but
+the length is the publisher's, so a reader must accept an array of any length and should report
+a mismatch rather than assume one.
+
+**Type mismatch.** A value is encoded from what the publisher actually sent, not coerced into
+the declared type. In practice they agree. If they ever disagree, the capture carries the fact
+rather than hiding it: a reader should tolerate the mismatch and report it.
+
+**Strings** are UTF-8. `"` and `\` are backslash-escaped; bytes below `0x20` use their short
+JSON escape where one exists and `\u00XX` otherwise; every other byte, including every byte of
+a multi-byte UTF-8 sequence, is written through unaltered.
+
+### 8.4 The envelope repeats two field values, on purpose
+
+`entity` duplicates the message's own entity-name field, and `sim_time_s` duplicates the
+message's own simulation-time field. This is not redundancy to be cleaned up:
+
+- The **envelope** values are what the producer keyed on. They are present on every record of
+  every type, so a reader can filter and segment a capture without knowing any message schema.
+- The **`fields`** values are the message's contents, verbatim, because `fields` promises to
+  be exactly what arrived, and dropping two of its entries because the envelope happens to
+  carry them would break that promise for the sake of a few bytes.
+
+They are always equal. A reader may use either; using the envelope is cheaper and works
+across message types.
+
+---
+
+## 9. Records: `entity_add` and `entity_remove`
+
+The roster's transitions. Together they bracket every occupancy (§8.1).
+
+### `entity_add`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"entity_add"` |
+| `sim_time_s` | number | Simulation time the creation event carried |
+| `segment` | number (integer) | Enclosing segment ordinal |
+| `entity` | string | Scenario entity name |
+| `occupancy` | number (integer) | The tenure this record opens. From 1, incrementing per name |
+
+### `entity_remove`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"entity_remove"` |
+| `sim_time_s` | number | Simulation time the deletion event carried |
+| `segment` | number (integer) | Enclosing segment ordinal |
+| `entity` | string | Scenario entity name |
+| `occupancy` | number (integer) | The tenure this record closes. Matches an earlier `entity_add` for the same name |
+| `reason` | string | Why the entity was removed, **verbatim from the platform** |
+
+`reason` values observed on runtime 2.1.328 are `destroyed`, `expended`, `commanded`,
+`despawned` and `scenario_unload`. **This list is not closed.** The producer records whatever
+string the platform sends, including a supplier-specific value it has never seen, because
+coercing an unrecognised reason to a known one destroys the only evidence that something new
+happened. **A reader must accept any string here** and must not switch exhaustively on the
+five above without a default branch.
+
+Note that `scenario_unload` removals arrive during teardown, after the simulation clock has
+been reset — so they carry `sim_time_s = 0.0`. See §5.1.
+
+---
+
+## 10. Record: `verdict`
+
+The result of evaluating one declared condition against the run.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"verdict"` |
+| `sim_time_s` | number | Simulation time at which the condition was decided |
+| `segment` | number (integer) | Enclosing segment ordinal |
+| `condition_id` | string | Stable identifier of the condition, from the condition file |
+| `met` | boolean | Whether the condition was satisfied |
+| `entities` | array of string | Scenario entity names the evaluation involved |
+| `values` | object | The values that decided it, sufficient to locate the causing samples. Keys and value types are condition-specific; a reader should treat this as an opaque object and render it rather than interpret it |
+
+---
+
+## 11. Record: `trailer`
+
+The last line of a complete capture.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `type` | string | `"trailer"` |
+| `sim_time_s` | number | Simulation time of the last record before it |
+| `end_reason` | string | Why the capture ended — closed set below |
+| `counts` | object | What this file contains |
+| `drops` | object | What the producer did not record, and why |
+| `bus_metrics` | object | What the platform's own decoder reported |
+
+`end_reason` is one of:
+
+| Value | Meaning |
+|---|---|
+| `shutdown` | The operator stopped the producer; the capture is complete to that point |
+| `host_lost` | The simulation host stopped publishing or died |
+| `size_limit` | A configured size or record bound was reached; recording stopped deliberately |
+| `replay_end` | The capture was produced by re-processing another capture, which ended |
+
+`counts` — **what is in this file**, not what happened on the bus:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `segments` | number (integer) | `segment_open` records in this file |
+| `samples` | number (integer) | `sample` records in this file |
+| `entities_added` | number (integer) | `entity_add` records in this file |
+| `entities_removed` | number (integer) | `entity_remove` records in this file |
+| `verdicts` | number (integer) | `verdict` records in this file |
+
+A reader should count the records itself and compare. A disagreement means the file was
+truncated, or the producer is defective; either way it is worth reporting.
+
+`drops` — **what the producer received but did not write**. All are producer-side:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `samples_not_recorded` | number (integer) | Samples dropped because the producer's own buffer or queue was full |
+| `samples_orphaned` | number (integer) | Samples for an entity name with no open occupancy — see below |
+| `samples_unnamed` | number (integer) | Samples carrying no entity-name field, so unkeyable |
+| `samples_untimed` | number (integer) | Samples carrying no simulation-time field, so unstampable |
+
+`samples_orphaned` is the diagnostic that matters most to a reader. A large orphan count with
+zero drops and no other error is the signature of a producer that attached *after* scenario
+load and missed the entity-creation burst; it usually accompanies `attached_mid_run: true`.
+It means the file is a partial view of the run, and it is the difference between a capture
+that is empty because nothing happened and one that is empty because nobody was watching.
+
+`bus_metrics` — the platform decoder's own counters, passed through:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema_hash_drops` | number (integer) | Messages discarded because their schema hash matched no registered schema |
+| `message_id_drops` | number (integer) | Messages discarded on message-id mismatch |
+| `decode_failures` | number (integer) | Messages that failed to decode |
+| `missing_schema_passthrough` | number (integer) | Messages passed through undecoded for want of a schema |
+| `legacy_payload_passthrough` | number (integer) | Messages passed through as legacy payloads |
+
+Any non-zero value in `bus_metrics` means the producer and the simulation host disagreed about
+a schema. A capture recorded under that condition may be missing entire message types silently
+— the platform drops them with a warning rather than an error. **A reader should surface a
+non-zero `bus_metrics` value prominently**; it is the difference between a quiet topic and a
+misconfigured one.
+
+---
+
+## 12. Worked example
+
+A three-record capture, reformatted across lines for reading. **In the file each record is one
+line**, with no whitespace between tokens.
+
+```json
+{"format_version":"n8ro-capture/1","type":"header",
+ "producer":{"name":"n8ro-bridge","version":"0.4.0"},
+ "platform":{"engine_config":"SimEngineClient_SharedMemory","model_path":"C:\\N8RO\\data\\db",
+             "schema_file":"N8roSimSchema","schema_version":"1.0.0","runtime_version":"unknown"},
+ "attached_mid_run":false,
+ "subscription":{"topic":"sim/entity/state","backpressure_policy":"KEEP_LATEST","queue_size":100},
+ "schemas":[{"message_name":"simEntityStateUpdate","topic":"sim/entity/state",
+             "schema_hash":2652370635,"message_id":1308183250,"wire_version":1,
+             "fields":[{"name":"simulationTime","type":"double","size":1},
+                       {"name":"scenarioEntityName","type":"string","size":1},
+                       {"name":"name","type":"string","size":1},
+                       {"name":"team","type":"string","size":1},
+                       {"name":"phase","type":"string","size":1},
+                       {"name":"health","type":"string","size":1},
+                       {"name":"presence","type":"string","size":1},
+                       {"name":"conditions","type":"int","size":1},
+                       {"name":"positionGeodetic","type":"double","size":3},
+                       {"name":"orientationYprRad","type":"double","size":3},
+                       {"name":"velocityNed","type":"double","size":3},
+                       {"name":"activeAnimation","type":"string","size":1}]}]}
+```
+
+```json
+{"type":"segment_open","sim_time_s":0.05,"segment":0,"scenario":"Atacama Air Defense"}
+```
+
+```json
+{"type":"sample","sim_time_s":35.20000000000014,"segment":0,
+ "entity":"TruckLauncher_07_Shahed_03","occupancy":1,"message":"simEntityStateUpdate",
+ "fields":{"simulationTime":35.20000000000014,"scenarioEntityName":"TruckLauncher_07_Shahed_03",
+           "name":"Air_UAV_Generic","team":"Red","phase":"operational","health":"nominal",
+           "presence":"active","conditions":0,
+           "positionGeodetic":[-23.5,-68.2,1204.5],
+           "orientationYprRad":[1.5707963267948966,0,0],
+           "velocityNed":[42.5,0,-1.25]}}
+```
+
+Everything the format is for is visible in that one sample record:
+
+- `fields` follows the header's declared order exactly — `simulationTime` first, `velocityNed`
+  last, alphabetical nowhere.
+- **`activeAnimation` is declared in the header and absent from `fields`.** The publisher did
+  not send it. It is not `""` and it is not `null`.
+- `conditions` is `0` — a JSON integer, because the schema declares it `int`.
+- `orientationYprRad` contains `0`, not `0.0`. It is a `double` field; parse from the schema.
+- `sim_time_s` is `35.20000000000014`, preserved to the bit.
+- `entity` and `occupancy` together, not `entity` alone, identify the thing being sampled.
+
+---
+
+## 13. Versioning and compatibility
+
+**The version string appears in exactly two places:** the title of this document and the
+`format_version` key of the `header` record. They must match, and a test checks it.
+
+**Reader rule.** An unrecognised `format_version` is a rejection with a named error, never a
+partial parse (§3, step 2).
+
+**What is a breaking change** — requires `n8ro-capture/2`:
+
+- Adding, removing or renaming a record type
+- Renaming or removing a key in an existing record type
+- Changing a key's type, unit, or meaning
+- Changing the closed vocabulary of `segment_close.reason` or `trailer.end_reason`
+- Changing the ordering guarantees of §8.2
+
+**What is not breaking** — stays `n8ro-capture/1`:
+
+- Adding a key to an existing record type. Readers ignore unknown keys (§3)
+- A message schema gaining, losing or reordering a field. The header describes it and readers
+  key off the header; this is the whole reason the header exists
+- A new `entity_remove.reason` value. That vocabulary is explicitly open (§9)
+
+**Old captures are never rewritten.** If `n8ro-capture/2` ships, files written under version 1
+remain valid under version 1, and this document remains their specification.
+
+---
+
+## 14. Determinism guarantees
+
+Two runs of the same scenario under the same configuration on the same host produce
+**byte-identical** capture files. A consumer may rely on this, and the value of relying on it
+is that any difference between two such files is attributable to the simulation rather than to
+the recorder.
+
+What the producer guarantees, and how:
+
+| Hazard | Guarantee |
+|---|---|
+| Wall-clock contamination | No wall-clock-derived value is written into any record, in any field, ever |
+| Field ordering | `sample.fields` follows the schema's declared field order, never a hash-map iteration order |
+| Schema ordering | `header.schemas` is sorted by `message_name` |
+| Float formatting | Shortest round-trip, locale-independent, uniquely determined per double |
+| Line endings | LF, written in binary mode, on every platform |
+| Container iteration | No container with unspecified iteration order is iterated anywhere on the writing path |
+
+**The one exception** is `platform.model_path`, which is a host filesystem path. Captures of
+the same scenario recorded on hosts with different install locations differ in that field and
+nowhere else. A consumer comparing across hosts should compare with that field excluded.
+
+Run labels in filenames are ordinals, never timestamps, for the same reason: two identical
+runs must be addressable as a pair.
+
+---
+
+## 15. Units and frames
+
+The capture applies **no unit conversion**. Values are recorded in whatever units the platform
+publishes them, and the authoritative statement of a field's meaning is the platform's own
+schema documentation, not this file.
+
+The following is **informative** — an observation of runtime 2.1.328's `simEntityStateUpdate`,
+recorded here because a reader will want it and should not have to guess. A reader must not
+depend on it: the header describes the fields, and a platform release may change any of this.
+
+| Field | Unit / frame |
+|---|---|
+| `simulationTime` | seconds since scenario start |
+| `positionGeodetic` | `[latitude °, longitude °, altitude m]` |
+| `orientationYprRad` | `[yaw, pitch, roll]` in **radians** — the unit is in the field name |
+| `velocityNed` | `[north, east, down]` in m/s |
+| `conditions` | a bitfield |
+| `scenarioEntityName` | the entity's unique name within a tenure — *not* a display name |
+| `name` | the entity **profile**, e.g. `Land_AirDefenseRadar_Generic` — *not* a display name |
+| `team`, `phase`, `health`, `presence` | platform enumeration strings |
+
+Two caveats worth carrying:
+
+- `phase` begins at `uninitialized` for a freshly created entity, before the platform's systems
+  have run a frame over it. That is not an error state.
+- Altitudes are **ellipsoidal** where the host's geoid grid is absent, and orthometric where it
+  is present. The capture does not record which; the producer's log does. Treat altitude with
+  that caveat.
+
+---
+
+## 16. Producer conformance
+
+This section describes **what the current producer emits**, as distinct from what this
+specification requires. It exists so that a reader author is never surprised by a real file,
+and it shrinks as the producer is completed.
+
+`n8ro-bridge` **0.4.0** (EXT-08 milestone M4) emits:
+
+| Record | Status |
+|---|---|
+| `header` | Complete |
+| `segment_open` / `segment_close` | **Partial.** Exactly one segment, ordinal 0, opened on the first sample and closed when recording stops. The producer does not yet watch scenario load/unload events, so a scenario reload during recording is **not** yet split into two segments |
+| `sample` | Complete |
+| `entity_add` / `entity_remove` | **Not yet emitted.** The producer maintains the roster internally and stamps every sample with its correct `occupancy`, but does not yet write the roster transitions out. `trailer.counts.entities_added` and `entities_removed` are therefore `0` |
+| `verdict` | **Not yet emitted.** `trailer.counts.verdicts` is `0` |
+| `trailer` | Complete. `end_reason` is always `size_limit` at this version, because the record budget is what ends a run |
+
+A reader written from this specification reads a 0.4.0 capture correctly without special
+casing — every record it contains is fully conformant, and the gaps are absences rather than
+deviations. The two things such a reader cannot do on a 0.4.0 file are reconstruct the roster
+independently of the samples, and distinguish two scenario runs within one file.
+
+---
+
+## 17. Provenance
+
+The behaviours this document describes as observed — name reuse across occupancies, the
+teardown clock reset, the declared-but-never-published field, the locale hazard in float
+formatting — were measured on runtime 2.1.328 against the `Atacama Air Defense` scenario and
+are recorded with their numbers in the producer's `notes.md`. Where this specification says
+"observed", there is a measurement behind it.
