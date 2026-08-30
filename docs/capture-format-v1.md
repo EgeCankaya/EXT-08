@@ -687,33 +687,52 @@ published messages, it produces the same bytes — on every host, every build, e
 the same run recorded on hosts with different install locations differ there and nowhere
 else; compare with that field excluded.
 
-### What the producer cannot guarantee
+### What the producer cannot guarantee: the publisher's own repeatability
 
-**Two captures of the same scenario are not necessarily byte-identical, and on the reference
-platform they are not.** A capture is a record of what was *published*. If the publisher does
-not publish the same thing twice, the captures differ, and no property of the recorder can
-change that.
+A capture is a record of what was *published*. If the publisher does not publish the same
+thing twice, two captures differ, and no property of the recorder can change that. **Whether
+your publisher is repeatable is a question about your host, and it must be answered before
+you rely on a byte comparison.**
 
-Measured on runtime 2.1.328, two runs of `Atacama Air Defense` recorded under identical
-configuration:
+On the host this producer was developed against, the answer is no. Two runs of
+`Atacama Air Defense` recorded under identical configuration on runtime 2.1.328:
 
 - The **headers were byte-identical**, the record counts equal, and the first 30 789 records
   identical.
-- They then diverged, because **the simulation host skipped different frames in each run.**
-  `n8ro-sim-local` paces against the wall clock, and under load it does not publish every
-  frame: over one 130-second window it published 2 577 of the 2 601 frames a 0.05 s tick
-  would give — about **1 % of frames never published at all** — and a different 1 % each run.
+- They then diverged, because **the host skipped different frames in each run.** Over one
+  130-second window it published 2 577 of the 2 601 frames a 0.05 s tick would give — about
+  **1 % of frames never published at all**, a different 1 % each run.
 
-A capture is faithful to its run either way. But a consumer diffing two captures is measuring
-*the publisher's* repeatability as well as its own, and on a wall-clock-paced host the
-publisher's repeatability is the weaker of the two by a wide margin.
+**Read that as a fact about one host binary, not about the platform.** The measurement was
+taken against `n8ro-sim-local.exe`, a *test driver* that hosts an engine and paces it against
+the wall clock for a wall-clock run budget (`--run-ms`). Frame skipping is the expected
+behaviour of wall-clock pacing under load. It says nothing about a headless, fixed-step host
+in a closed configuration — the shipped `n8ro-sim-app.exe` — which **has not been measured
+here and may well be fully repeatable.**
 
-**If you are building a determinism self-test**, this is the load-bearing consequence: run it
-against a publisher whose publication schedule is deterministic, or compare on content rather
-than bytes — for example, per-`(entity, occupancy)` value sequences keyed by `sim_time_s`,
-which are stable across runs where the raw byte stream is not. Establishing whether a headless
-or fixed-step host publishes deterministically is worth doing before committing to a
-byte-comparison strategy; it has not been established here.
+### If you are building a determinism self-test
+
+The distinction above is the whole of the practical advice, so it is worth stating directly:
+
+1. **Establish your host's repeatability first, as its own step**, before building anything
+   that depends on it. Run the same configuration twice against the host you will actually
+   use, capture both, and compare. This is cheap, and it is the difference between a self-test
+   that measures your harness and one that measures the host's pacing.
+2. **Use a closed configuration.** Anything externally timed that feeds the simulation makes a
+   run reproducible only as far as that input is. *This producer is not such an input* — it
+   subscribes and never publishes — but its backpressure policy matters: a recorder configured
+   to **block** the bus would stall the publisher and change the run it is recording. This
+   producer never uses `BLOCK` for that reason, and `header.subscription.backpressure_policy`
+   records what it did use, so a capture always states whether the recorder could have
+   perturbed the run.
+3. **If your host does not turn out to be repeatable**, compare on content rather than bytes —
+   for example per-`(entity, occupancy)` value sequences keyed by `sim_time_s`, which are
+   stable across runs where the raw byte stream is not.
+4. **When two captures do differ, find the first differing record rather than reporting only
+   that they differ.** The header, the record counts and a long identical prefix are all
+   diagnostic: identical headers with divergence deep in the sample stream points at the
+   publisher, whereas a difference in the header or in a counter points at the recorder. That
+   is exactly how the measurement above was attributed.
 
 ### Known loss, and the fact that no counter reports it
 

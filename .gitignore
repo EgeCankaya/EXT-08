@@ -31,3 +31,8 @@ captures/
 *.n8rocap.jsonl
 build.log
 buildtests.log
+
+# n8ro-sim-local, run from the repo root rather than a scratch directory, drops a copy of the
+# schema database and a logger file into its working directory. Run artifacts, never ours.
+data/
+logs/

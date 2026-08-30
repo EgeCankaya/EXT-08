@@ -1069,3 +1069,77 @@ while a loss path exists that no counter reports.
   both. That leaves compiling in a constant or parsing `components.xml`, and either would put
   a number nobody observed into a field documented as observed. `"unknown"` is the accurate
   answer. Recorded here so nobody re-derives it.
+
+## M4 postscript — reading [S2] directly, and correcting an over-broad claim
+
+Rev 5 rewrote BTB-CAP-3, a requirement that traces to **[S2] constraint 2**, from measurement
+alone — without reading the constraint's own wording. Doing that afterwards found the rewrite
+was right in scope and wrong in one claim.
+
+### What [S2] actually says about determinism
+
+> *"The simulation is deterministic by contract: the same scenario, the same inputs and the
+> same ordering produce the same outputs, on every run and every machine."*
+
+and it makes the check a **hard gate**, not an acceptance nicety:
+
+> *"Prove determinism — the same-configuration self-test above. **Do not build further until
+> it passes.**"*
+
+Its acceptance criterion is byte-level: *"two identical runs produce identical captures, and
+the tool checks this itself."*
+
+### The correction
+
+Rev 5 said byte-identity is "not achievable on this platform and never was". **That is not
+what was measured.** The measurement was against `n8ro-sim-local.exe` — a *test driver* that
+paces an engine against the wall clock for a wall-clock budget (`--run-ms`). Frame skipping is
+what wall-clock pacing does under load. It says nothing about `n8ro-sim-app.exe`, the headless
+host, which is what a campaign actually runs — and which [S2] is explicit about:
+
+> *"Campaign runs are for the closed configuration."*
+
+So the honest position is not "the platform is nondeterministic". It is: **the one host we
+measured is not repeatable, the host that matters has never been measured, and the difference
+between those two statements is the whole of EXT-17's step-4 gate.** Narrowed in
+`docs/capture-format-v1.md` §14 and in BTB-CAP-3; the open question is now **R8**, and it is
+half an hour of work once OQ-2 gives up the invocation.
+
+The recorder-side half of rev 5 stands unchanged and was never in doubt: given the same
+published stream, this producer emits the same bytes, and the two leaks it found — a
+scheduler-dependent drop counter and a race-decided flag — were real and are fixed.
+
+### [S2] confirms ADR-4 from the other side
+
+> *"Anything externally timed feeding the simulation. If a live feed or an external bridge is
+> active, runs are reproducible only as far as that input is."*
+
+EXT-08 *is* an external bridge. It is not an input — it subscribes and never publishes — but a
+recorder that selected `BLOCK` would stall the bus and become one, breaking the determinism
+its own consumer gates on. ADR-4 rejected `BLOCK` on EXT-08's own reasoning; [S2] reaches the
+same rejection independently. **Worth carrying into M5's backpressure decision**: the bus-side
+policy is not only about our loss, it is about whether a campaign run is reproducible at all
+with us attached.
+
+### [S2] has the same defect [S1] does
+
+It lists `include\n8ro-sim\infrastructure\EntityStateSample.h` as the surface for "what a run
+publishes". **That file does not exist in 2.1.328** — the finding that cost M3 its budget, in a
+second brief, independently. Both documents describe an API this release does not ship.
+
+For EXT-17 that is good news rather than bad: the entity picture EXT-08 already owns (ADR-1)
+consumes a decoded `StreamValueMap` and is fed just as easily from a stored capture as from the
+bus, which is exactly the seam ADR-1 said it was keeping. EXT-17 does not need the missing
+header; it needs the capture format, which it has.
+
+### Two things in [S2] our own work already answers
+
+- *"A diff between two runs identifies the first point of divergence, not just that they
+  differ"* (acceptance criterion 6). The M4 follow-up did exactly this — identical headers,
+  equal record counts, an identical 30 789-record prefix, then the first differing line — and
+  that attribution is what separated "the publisher skipped a frame" from "the recorder lost
+  one". Reusable as a method.
+- *"A page of notes on determinism — what you had to do to make comparison meaningful, and
+  anything you saw that you could not explain. The last part is the one to write carefully."*
+  The M4 follow-up section above is that page, and the 19 unexplained samples (R7) are that
+  last part.
