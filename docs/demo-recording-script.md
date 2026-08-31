@@ -361,6 +361,12 @@ stays `0.8.0`. Verified after the change: three unit suites pass (72 / 93 / 18 c
 failures), the mutation harness still reports 16 mutations and 0 survivors, replay of the sample
 capture still yields 5 met / 2 not met, and the 60-second rehearsal capture still `CONFORMS`.
 
+> *Those counts are **as of the shoot**, and are kept as the record of what was verified then.
+> Both suites have grown since: BTB-CAP-6 added golden bytes and six mutations at PRD rev 11,
+> and BTB-CAP-4's schema-growth check landed at rev 13. Current expected values are in the
+> README's §"Reproducing the evidence" — **72 / 93 / 29 checks and 22 mutations** — and that is
+> the list to run against, not this one.*
+
 ---
 
 ## 10. What the takes produced
