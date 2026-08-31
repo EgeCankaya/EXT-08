@@ -21,6 +21,12 @@ A capture is a durable, replayable record of what one N8RO simulation run publis
 message bus, plus enough schema information to interpret every value in it without asking
 anyone.
 
+A capture is normally one file, and one run normally produces one capture. A run recorded
+under a byte bound with rotation enabled produces a numbered *set* of them instead — and every
+member of that set is a capture in the full sense of this section, self-describing and
+independently readable. §6.6 and §6.7 are the whole of what a reader needs to know about
+that, and a reader that ignores both still reads every file correctly.
+
 Two properties define it, and both are load-bearing:
 
 **It is self-describing.** The first record carries the runtime `MessageSchema` for every
@@ -48,7 +54,7 @@ and that is deliberate.
 | Structure | JSON Lines — exactly one JSON object per line |
 | Line terminator | LF (`0x0A`). Never CRLF, on any platform |
 | Final byte | Every record line, including the last, is LF-terminated |
-| File extension | `.n8rocap.jsonl` by convention; nothing in the format depends on it |
+| File extension | `.n8rocap.jsonl` by convention; nothing in the format depends on it. A rotated part interposes `.partNNN` before it (§6.7), which is still convention and still nothing the format depends on |
 
 Each line is a complete, independent JSON object. No line spans a line break, no record is
 split, and there is no enclosing array. A reader can therefore process a capture streaming,
@@ -194,6 +200,9 @@ The first line of every capture. Its keys appear in exactly this order.
 | `attached_mid_run` | boolean | See §6.3 |
 | `sample_form` | string | Whether the samples in this file are as-published or predicted — see §6.3a. **Optional; added at producer 0.8.0.** Absent means unknown, not "predicted" |
 | `subscription` | object | The bus-side delivery policy in force — see §6.4 |
+| `limits` | object | The size bound this file was recorded under, and what the producer does on reaching it — see §6.6. **Optional; added at producer 0.9.0.** Absent means unknown, not "unbounded" |
+| `part` | number (integer) | Which part of a rotated set this file is; `0` for a capture that was never rotated — see §6.7. **Optional; added at producer 0.9.0.** Absent means `0` |
+| `continues_from` | string | Filename of the previous part. **Present only on parts after the first** — see §6.7 |
 | `schemas` | array of object | One entry per message type appearing in this file — see §6.5 |
 
 `header` carries `"type": "header"` like every other record, but it is the **second** key,
@@ -280,6 +289,86 @@ should compare this object before concluding anything about a difference between
 
 Bus-side loss, where the platform reports it, is in `trailer.bus_metrics`.
 
+### 6.6 `limits`
+
+The size bound in force while this file was written, and the action the producer takes on
+reaching it. Written into the file because **a capture that stops early and a capture whose
+run ended look identical from the outside** — and the difference decides whether the analysis
+you are about to do is valid.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `max_bytes` | number (integer) | Maximum size of this file in bytes. `0` means no byte bound was configured |
+| `max_samples` | number (integer) | Maximum number of `sample` records **in the whole run**, across every part. `0` means no record bound was configured |
+| `on_size_limit` | string | `"stop"` or `"rotate"` — see below |
+
+`on_size_limit` is the producer's documented end-of-space behaviour:
+
+| Value | Meaning |
+|---|---|
+| `"stop"` | On reaching `max_bytes`, the producer closes this capture with a well-formed `trailer` carrying `end_reason: "size_limit"` and stops recording. The run's remaining data is not captured anywhere |
+| `"rotate"` | On reaching `max_bytes`, the producer closes this file the same way and **continues into a new part** — see §6.7 |
+
+`max_samples` always stops; it never rotates. It is a record-count safety bound rather than a
+size bound, and it counts across the whole run rather than per part.
+
+**A record is never split.** The bound is checked against a record's full length *before* the
+record is written, and space is reserved in advance for the `segment_close`, any end-of-run
+`verdict` records, and the `trailer`. So a file that reached its limit is a complete, valid
+capture ending in a trailer — never a line cut in half. This is the guarantee the key exists
+to make checkable: a reader finding `end_reason: "size_limit"` knows the file is intact and
+the *run* is what was truncated.
+
+**`max_bytes` bounds each part, not the set.** A rotated run of 40 parts at `max_bytes:
+104857600` occupies about 4 GB in total. The bound is a file-size bound, which is what
+matters to a reader opening one, and rotation is by definition unbounded in aggregate — an
+operator wanting a total bound wants `"stop"`.
+
+### 6.7 `part` and `continues_from` — rotated captures
+
+When `on_size_limit` is `"rotate"`, one run produces a numbered set of files:
+
+```
+capture-atacama-air-defense-000.n8rocap.jsonl           part 0
+capture-atacama-air-defense-000.part001.n8rocap.jsonl   part 1
+capture-atacama-air-defense-000.part002.n8rocap.jsonl   part 2
+```
+
+**Every part is a complete, independently valid capture.** Each has its own `header` with its
+own full `schemas` array, its own segments numbered from 0, its own counts, and its own
+`trailer`. A reader that knows nothing about rotation reads any part correctly and completely;
+it simply does not know the part has siblings. That is deliberate — the linkage is three
+optional keys, and nothing about reading one file depends on them.
+
+The set is walkable in either direction:
+
+- `header.part` — the ordinal. `0`, or absent, means this is a first part.
+- `header.continues_from` — the **bare filename** of the previous part, absent on part 0.
+- `trailer.continued_in` — the bare filename of the next part, absent on the last part (§11).
+
+They are filenames rather than paths: the parts of a set are written to one directory by
+construction, and an absolute path would make the file non-portable and leak the producing
+host's layout into an artifact that crosses a repository boundary.
+
+**How to tell the last part from a truncated one.** The last part of a completed run carries
+the run's real ending — `end_reason: "shutdown"` or `"host_lost"` — and **no** `continued_in`.
+A part in the middle carries `end_reason: "size_limit"` **and** a `continued_in`. A part
+carrying `size_limit` with no `continued_in` is a run that stopped at its limit, either
+because `on_size_limit` was `"stop"` or because the producer could not open the next part;
+its own log says which.
+
+**Stitching a set.** Read the parts in `part` order and concatenate their record streams,
+skipping each part's `header` and `trailer` after the first. Two rules matter:
+
+1. **Segment ordinals restart at 0 in every part.** They are unique *within a file*, which is
+   all §7 promises. A segment cut by a rotation appears as a `segment_close` with
+   `reason: "size_limit"` at the end of one part and a `segment_open` at the start of the
+   next — one segment split across two files, not two segments. Any statistic computed per
+   segment across a set must key on `(part, segment)`, never on `segment` alone.
+2. **`counts` in each `trailer` is that file's own.** The run's totals are the sum across
+   parts. Nothing in any part states the set's total, because no part knows it — part 0's
+   trailer is written long before the run ends.
+
 ### 6.5 `schemas`
 
 An array of schema envelopes, **sorted ascending by `message_name`**. One entry exists for
@@ -356,7 +445,13 @@ statistic computed over the file meaningless.
 ### Segment rules
 
 - Exactly one `segment_close` per `segment_open`.
-- Segment ordinals strictly increase and are never reused within a file.
+- Segment ordinals strictly increase and are never reused within a file. **Within a file** is
+  the whole of the promise: in a rotated set (§6.7) they restart at 0 in every part, so a
+  statistic computed per segment across a set must key on `(part, segment)`.
+- A segment closed with `reason: "size_limit"` in a part that also carries
+  `trailer.continued_in` was **cut by the file bound, not ended by the run** — it continues as
+  the first segment of the next part. Everywhere else, a `segment_close` means the segment is
+  over.
 - **No `sample` record appears outside an open segment.** If a reader sees one, the file is
   malformed and the reader should say so.
 - `entity_add`, `entity_remove` and `verdict` records also carry `segment` and also fall
@@ -578,6 +673,7 @@ The last line of a complete capture.
 | `counts` | object | What this file contains |
 | `drops` | object | What the producer did not record, and why |
 | `bus_metrics` | object | What the platform's own decoder reported |
+| `continued_in` | string | Filename of the next part of a rotated set. **Present only when there is one** (§6.7); its presence means this file ends but the run does not. **Added at producer 0.9.0** |
 
 `end_reason` is one of:
 
@@ -585,7 +681,7 @@ The last line of a complete capture.
 |---|---|
 | `shutdown` | The operator stopped the producer; the capture is complete to that point |
 | `host_lost` | The simulation host stopped publishing or died |
-| `size_limit` | A configured size or record bound was reached; recording stopped deliberately |
+| `size_limit` | A configured size or record bound was reached (§6.6). With a `continued_in` beside it, recording *continued into the next part*; without one, recording stopped here |
 | `replay_end` | The capture was produced by re-processing another capture, which ended |
 
 `counts` — **what is in this file**, not what happened on the bus:
@@ -600,6 +696,18 @@ The last line of a complete capture.
 
 A reader should count the records itself and compare. A disagreement means the file was
 truncated, or the producer is defective; either way it is worth reporting.
+
+**In a rotated set these are per part**, not per run (§6.7). Summing them across the set gives
+the run's totals; no single file states them.
+
+**One caveat on an intermediate part's `drops` and `bus_metrics`.** The trailer of a part that
+was closed by a rotation is written mid-run, by the producer's writer thread, at a moment when
+the platform's own counters cannot safely be read from that thread. Those two objects are
+therefore **as of the producer's last status poll** rather than the instant of the rotation —
+at most a second or so stale, and understating rather than inventing, since every counter in
+them is cumulative and rising. **The last part's trailer is exact**, as every unrotated
+capture's has always been. If you need a run's true final counters, read them from the last
+part.
 
 `drops` — **what the producer received but did not write**. All are producer-side:
 
@@ -734,7 +842,12 @@ partial parse (§3, step 2).
 
 **What is not breaking** — stays `n8ro-capture/1`:
 
-- Adding a key to an existing record type. Readers ignore unknown keys (§3)
+- Adding a key to an existing record type. Readers ignore unknown keys (§3). Producer 0.9.0
+  is the worked example: `header.limits`, `header.part`, `header.continues_from` and
+  `trailer.continued_in` were all added at once, for bounded and rotated captures, and the
+  version did not move. Rotation needed no new record type and no new `end_reason` or
+  `segment_close.reason` value — `"size_limit"` was already in both closed sets — which is
+  precisely why it fits under this rule rather than the one above it
 - A message schema gaining, losing or reordering a field. The header describes it and readers
   key off the header; this is the whole reason the header exists
 - A new `entity_remove.reason` value. That vocabulary is explicitly open (§9)
@@ -785,6 +898,28 @@ the producer cancelling its subscriptions and the bus actually stopping delivery
 scheduler-dependent, can never be zero, and are **not** counted here. They are not losses;
 they are arrivals after the end of recording, which is what the `end_reason` already records.
 They go to the producer's log. §16 has the detail.
+
+### What a size bound does to a byte comparison
+
+A byte bound (§6.6) does not introduce run-to-run variation of its own: it is enforced against
+a record's exact length before that record is written, so given the same published messages
+the producer cuts at the same record every time, and a rotated set is as reproducible as the
+single file it replaces.
+
+Two practical consequences for anyone comparing captures:
+
+- **Compare like for like.** Two runs recorded under different `max_bytes`, or one bounded and
+  one not, will differ where the bound falls. `header.limits` is in the file so this is
+  checkable before the comparison rather than mysterious after it.
+- **Compare a set as a set.** Concatenate the parts in `part` order per §6.7's stitching rules
+  before comparing, and key per-segment work on `(part, segment)`. Comparing part 3 of one run
+  against part 3 of another is meaningful only if both runs cut at the same place, which is
+  exactly what the publisher's schedule does not guarantee.
+
+The one exception is the one already documented above: an intermediate part's `drops` and
+`bus_metrics` are as of the producer's last status poll (§11), which puts them in the same
+category as the drop counters generally — scheduler-dependent, and zero whenever a byte
+comparison is meaningful in the first place.
 
 ### What the producer cannot guarantee: the publisher's own repeatability
 
@@ -1033,6 +1168,7 @@ It goes to the producer's log.
 | 0.6.0 | `verdict` records are emitted, completing the eight-type vocabulary. Nothing about the format changed — no key renamed, none retyped, no type added that was not already specified — so this is still `n8ro-capture/1` |
 | 0.7.0 | Clean interruption: `end_reason: "shutdown"` is reachable, verified over twenty scripted interrupt-and-verify cycles. No format change |
 | 0.8.0 | `header.sample_form` added, recording that the file contains as-published samples (§6.3a). The answer was previously stated only in the producer's README, which does not travel with the capture. Adding a key to an existing record type is non-breaking (§13), so the format version does not move and every earlier file stays valid |
+| 0.9.0 | Bounded and rotated captures. A real byte bound on a capture file, with the operator's stop-or-rotate choice and both bounds stated in the file: `header.limits` (§6.6), plus `header.part` / `header.continues_from` and `trailer.continued_in` for a rotated set (§6.7). Four keys added to two existing record types; no record type, no `end_reason` value and no `segment_close.reason` value is new, so the format version does not move and every earlier file stays valid. A capture recorded with no bound is byte-for-byte what 0.8.0 wrote, but for the added header keys |
 
 ---
 

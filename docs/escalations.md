@@ -6,12 +6,25 @@ finds them re-derived somewhere else can see they were raised.
 
 Neither blocks EXT-08. The first blocks **EXT-17** outright.
 
+> **Both were sent to the brief's author on 2026-08-31** by this project's DRI, and both remain
+> open pending a reply. Nothing below has changed as a result; the status lines say "raised"
+> rather than "open" so a later reader can tell "nobody has been told" from "told, awaiting an
+> answer".
+>
+> **E-1's substance has separately been resolved downstream, and that is the outcome it was
+> written to produce.** EXT-17's PRD keys its determinism gate on content rather than bytes
+> (its CR-DET-1), marks the deviation from its own brief as a named deviation rather than
+> laundering it into a client requirement, records it as its ADR-1, and carries the ruling
+> request as its own OQ-2. So the recommendation has been adopted by the project that was
+> blocked; what is still outstanding is the brief author's ruling, which would either confirm
+> that or require a host change or a waiver.
+
 ---
 
 ## E-1 — EXT-17's determinism gate cannot pass byte-for-byte, and it is a hard stop
 
 **To:** whoever owns EXT-17's brief and its acceptance criteria
-**Status:** open — needs a ruling before EXT-17 begins
+**Status:** raised with the brief's author 2026-08-31; awaiting a reply. Needed before EXT-17 passes its milestone 4 — though EXT-17 has adopted the content reading in the meantime and named it as its own decision (its ADR-1 and OQ-2)
 **Evidence:** `docs/capture-format-v1.md` §14; PRD risk R8; `tests/determinism/compare_captures.py`
 
 ### What the brief requires
@@ -84,7 +97,7 @@ picture.
 ## E-2 — `EntityStateSample.h` does not exist, and two briefs send implementers to it
 
 **To:** whoever authors the EXT-* briefs
-**Status:** open — a correction to the source documents, not to any code
+**Status:** raised with the brief's author 2026-08-31; awaiting a reply. A correction to the source documents, not to any code
 **Evidence:** PRD ADR-1 and OQ-1; §"Prior art and lessons learned"
 
 ### The claim, in two documents
@@ -139,11 +152,19 @@ the implementer without an answer.
 
 For completeness, since a reader may expect them here:
 
-- **The 5-minute demo recording** is shot; its edit is outstanding. All seven beats were
-  captured on 2026-08-31 following `docs/demo-recording-script.md`. Never a decision, and not
-  one now either.
-- **BTB-CAP-6** (byte-limited capture, P2) is unimplemented. It is a known, recorded gap inside
-  EXT-08's own scope — see `docs/decisions-m5-m7.md` D-37.
-- **OQ-2's mentor confirmation.** The headless invocation is demonstrated to work
-  (`tests/host-driver/`); whether it is the intended production shape is still worth a person's
-  confirmation, as `[S2]` itself asks. Not blocking.
+- **The 5-minute demo recording** is shot and **published as its four takes**, linked from the
+  README with a beat-by-take map. All seven beats were captured on 2026-08-31 following
+  `docs/demo-recording-script.md`. Never a decision, and not one now either.
+- **BTB-CAP-6** (byte-limited capture, P2) **is now implemented** — see `docs/decisions-m5-m7.md`
+  D-38 to D-41 and PRD rev 11. It was a known, recorded gap inside EXT-08's own scope, never a
+  decision for anyone else, and it is closed. Worth one line here for EXT-17's author, since it
+  touches the shared contract: the capture format **stays frozen at `n8ro-capture/1`**. Four
+  keys were added to two existing record types, which §13 makes non-breaking, and every capture
+  written before it remains valid and unchanged. A reader that ignores `header.limits`,
+  `header.part`, `header.continues_from` and `trailer.continued_in` is still a correct reader.
+- **OQ-2's mentor confirmation.** **Closed in EXT-08 at PRD rev 12** (D-42). The headless
+  invocation is demonstrated to work (`tests/host-driver/`), which was the half that was ever
+  this project's; whether it is the intended production shape is a question about the
+  platform's documentation and is carried as **EXT-17's OQ-3**, where the host is actually run
+  in production and where `[S2]` asks its own reader to confirm it. Never blocking here, and
+  nothing EXT-08 ships changes with the answer.

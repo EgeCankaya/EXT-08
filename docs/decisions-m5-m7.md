@@ -539,18 +539,157 @@ Recorded plainly rather than left for the project owner to discover.
 > **This list is as it stood at the close of M7.** The first entry has since been partly
 > discharged — see the note under it, and PRD rev 10.
 
-- **~~The 5-minute demo recording (BTB-DOC-2).~~ Shot on 2026-08-31; only the edit remains.**
+- **~~The 5-minute demo recording (BTB-DOC-2).~~ Shot on 2026-08-31 and published as its four
+  takes** — [linked from the README](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing), with a beat-by-take map. Every beat the
+  requirement names is on camera; what does not exist is a single assembled cut, which the
+  README states rather than implies. Original entry follows.
   All seven beats were captured across four takes against producer 0.8.0, following
   `docs/demo-recording-script.md`, which is both the shooting script and the record of what was
   filmed. Shooting it also exposed and fixed a reporting defect in the run summary and the
   conformance reader (PRD rev 10 (b)); no capture byte changed and the format stays frozen.
-- **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
-  count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
-  stop-or-rotate choice, and neither is stated in the `header` as the FR requires. It is P2 and
-  M7's budget went to shutdown, the two spikes and the evidence pack. **This is the one
-  P1-or-P2 requirement left unimplemented.**
-- **The PRD's CLI table does not list `--capture-max-samples`.** It exists and is documented.
-  Either the table should gain it or CAP-6 should absorb it — a one-line PRD edit either way,
-  and not one to make unilaterally.
-- **OQ-2's mentor confirmation.** The invocation is demonstrated to work; whether it is the
-  intended production shape is still a question for a person.
+- **~~BTB-CAP-6, the byte-limited capture (P2).~~ Built; see D-38 to D-41 and PRD rev 11.**
+  As it stood at M7: `--capture-max-samples` bounded a run by record count, which is a safety
+  bound and not CAP-6 — there was no size limit in bytes, no stop-or-rotate choice, and neither
+  was stated in the `header` as the FR requires. It was P2 and M7's budget went to shutdown,
+  the two spikes and the evidence pack. **It was the one P1-or-P2 requirement left
+  unimplemented, and it no longer is: every requirement in the PRD is now built.**
+- **~~The PRD's CLI table does not list `--capture-max-samples`.~~ Resolved, in two steps.**
+  Rev 9 added it to the table with a note distinguishing it from the then-unimplemented CAP-6.
+  Rev 11 answered the question this bullet actually asked — whether the table should gain the
+  flag or CAP-6 absorb it — with **both, and they are different bounds**: CAP-6 is
+  `--capture-max-bytes`, per file, with a stop-or-rotate choice; `--capture-max-samples` counts
+  records, run-wide, and always stops. Neither absorbed the other. See D-38.
+- **~~OQ-2's mentor confirmation.~~ Closed — see D-42.** The invocation is demonstrated to
+  work, which was the half that was ever EXT-08's; the "intended production shape" half is
+  carried downstream as EXT-17's OQ-3.
+
+---
+
+## BTB-CAP-6 — the bounded capture
+
+Built after M7 closed, against the FR and UAC-BTB-CAP-6 as written. The five decisions below
+are the ones that were not already made by the requirement.
+
+### D-38 — `--capture-max-bytes` is a second bound, not a replacement for the record bound
+
+D-13 and D-28 both flagged the question and both declined to answer it: either the PRD's CLI
+table gains `--capture-max-samples`, or CAP-6 absorbs it when it is built. Now that it is
+built, **neither. They are different bounds and both are kept.**
+
+|  | `--capture-max-bytes` | `--capture-max-samples` |
+|---|---|---|
+| Measures | bytes | `sample` records |
+| Scope | one file | the whole run, across every part |
+| At the limit | stop **or** rotate, operator's choice | always stops |
+
+Absorbing the record bound into CAP-6 would have meant either dropping it — it is the only way
+to end a run at a repeatable place, which is what the determinism and demo work uses it for —
+or redefining it as per-file, which would silently turn an existing documented run bound into a
+per-file quota. Keeping both costs one option and one row in `header.limits`.
+
+The counter that keys the record bound therefore had to move from the per-file count to a
+run-wide one. That is a real bug if missed: `counts_` resets at every rotation, so a
+`--capture-max-samples 100000` run with rotation on would have recorded 100 000 samples *per
+part*, forever.
+
+### D-39 — the stop-or-rotate choice is the operator's, not this project's
+
+The FR permits either and requires that the choice be documented. The PRD's own quality-gate
+notes flagged that it does not choose between them and asked whether the design should.
+
+It should not, and both are built. Which one is right depends on whether the run's tail or the
+host's free space matters more, and that is a property of the run, not of the recorder — an
+overnight campaign wants `rotate`, a bounded-disk CI box wants `stop`. Compiling in either
+would have made the other unreachable for no gain. The choice is `--on-size-limit`, it defaults
+to `stop` (the conservative one: bounded total disk, which is the failure the FR's customer
+scenario is about), and it is written into `header.limits.on_size_limit` so the file states
+which was in force.
+
+### D-40 — every part of a rotated set is a complete capture, and the linkage is three optional keys
+
+The alternative shape — a set of continuation files that are fragments, with one header at the
+front and one trailer at the end — is smaller and would have been a **format version bump**,
+because a fragment is not a valid `n8ro-capture/1` file and every reader would need to know
+about rotation before it could read one.
+
+So each part carries its own `header` with its own full `schemas` array, its own segments
+numbered from 0, its own `counts`, and its own `trailer`. The cost is a repeated schema table
+per part — about 1 KB against a bound that must be at least 16 KB and is realistically
+megabytes. What it buys is that **the whole feature fits under spec §13's non-breaking rule**:
+four added keys on two existing record types, no new record type, and no new value in any
+closed vocabulary — `size_limit` was already in both `trailer.end_reason` and
+`segment_close.reason`, which is worth noticing, because it means the format anticipated this
+requirement at M4 and the freeze was never in the way.
+
+A reader that ignores `header.part`, `header.continues_from` and `trailer.continued_in` reads
+every part correctly and completely. It simply does not know they are siblings.
+
+Two consequences a consumer has to know, and §6.7 states both: **segment ordinals restart at 0
+in each part** (so anything per-segment across a set keys on `(part, segment)`), and a segment
+cut by a rotation appears as a `segment_close` with `reason: "size_limit"` in one part and a
+`segment_open` in the next — one segment split, not two segments.
+
+### D-41 — the bound is checked before the write, against a reserve
+
+"Never silently truncate" is the requirement's actual content, and it is not something a bound
+gives you for free — checking after a write can only report a breach, and letting the trailer
+be the record that does not fit turns a size limit into exactly the corrupt file the FR exists
+to prevent.
+
+So: the record's line is rendered first, its exact length is known, and the check is
+`bytesWritten + len + 1 + kCloseReserveBytes > maxBytes`. **8192 bytes** are held back from the
+first record onward for the `segment_close`, any end-of-run `verdict` records and the
+`trailer` — measured at ~520 bytes for a trailer with every counter present, ~110 for a
+segment_close, and a few hundred per verdict. Structural records never go through the check;
+they are what the reserve is for. A record is therefore written whole or not at all.
+
+Three details that only show up once it is running:
+
+- **A rotation resets the segment ordinal, so a record cannot be rendered once and reused.**
+  The admission helper takes a *render callable* and calls it again after a rotation. Rendering
+  once and writing that line into the next part would put `"segment":3` into a file whose only
+  segment is 0 — malformed, and unrepairable by any reader.
+- **Rotating needs a guard against rotating forever.** If a fresh part cannot hold one record
+  after its own header, the run stops with a named error rather than producing an endless run
+  of header-and-trailer files. `--capture-max-bytes` also has a floor of 16384 at parse time,
+  so the ordinary version of this mistake is caught before the run starts.
+- **An intermediate part's trailer is written mid-run, by the writer thread**, when the main
+  thread is not there to supply the platform's counters. `RecordQueue::counters()` is
+  mutex-guarded and would be safe to call from there, but nothing establishes that for
+  `MessageBusPacked::metricsSnapshot()` or `IMessageBus::getStatistics()`. Reaching into the
+  SDK off the main thread to fill in a counter would trade a real invariant for a cosmetic one,
+  so main caches its own reading at each status poll and the writer reads the cache. The cost
+  is that an intermediate part's `drops` and `bus_metrics` are as of the last poll rather than
+  the instant of the rotation — stale by at most a second, understating rather than inventing,
+  and **stated in spec §11** so no reader is misled. The last part's trailer is exact, as it
+  has always been.
+
+### D-42 — OQ-2 is closed on the half that was ours, and the other half goes downstream
+
+OQ-2 asked two questions wearing one number: *what is the headless invocation*, and *is it the
+intended production shape*. They have different owners and only the first was ever EXT-08's.
+
+**The first is answered and demonstrated.** `n8ro-sim-app.exe --sim-config SimEngineHost_*
+--model-path <dir> --schema-file <name>`, taking no scenario argument — load and start are
+separate publishes on `sim/scenario/command` and `sim/engine/command`. `tests/host-driver/`
+drives it end to end, and it is what made the R8 determinism experiment possible at all. If it
+did not work, none of the M7 evidence would exist.
+
+**The second is a question about the platform's documentation**, not about anything this
+project produces. Nothing EXT-08 ships changes with the answer: the bridge subscribes and never
+publishes, the host driver lives in `tests/` for exactly that reason (ADR-4), and no capture
+byte, no requirement and no interface depends on whether the invocation is blessed or merely
+functional.
+
+It is therefore closed here and carried where it bites: **EXT-17's OQ-3 asks the same question**,
+with a decision target of that project's M2, and EXT-17 is the project that actually has to run
+the host in production. `[S2]` asks its own reader to confirm the invocation with a mentor,
+which is an instruction to EXT-17's implementer as much as to this one.
+
+What would reverse this: a mentor saying the invocation is *not* the intended shape and naming
+a different one. That would change EXT-17's driver and this project's `tests/host-driver/`,
+neither of which is a shipped interface — which is the measure of how little was riding on it.
+
+The general point, because it recurred: **an open question kept open because its answer lives in
+another organisation is not diligence, it is a document that never closes.** The test is whether
+anything this project ships would change with the answer. Here, nothing does.

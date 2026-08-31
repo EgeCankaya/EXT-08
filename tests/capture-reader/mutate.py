@@ -156,6 +156,54 @@ def m_crlf(lines):
     return lines          # handled specially: written with CRLF terminators
 
 
+# --- BTB-CAP-6: the bound and the rotation linkage (spec 6.6, 6.7) -----------------------
+
+def m_bad_on_size_limit(lines):
+    """header.limits.on_size_limit outside the closed set (spec 6.6)."""
+    record = json.loads(lines[0])
+    record["limits"] = {"max_bytes": 0, "max_samples": 0, "on_size_limit": "truncate"}
+    return [dumps(record)] + lines[1:]
+
+
+def m_limits_missing_max_bytes(lines):
+    """A limits object that states an action but not the bound it applies to (spec 6.6)."""
+    record = json.loads(lines[0])
+    record["limits"] = {"max_samples": 0, "on_size_limit": "stop"}
+    return [dumps(record)] + lines[1:]
+
+
+def m_continues_from_on_part_zero(lines):
+    """A first part that claims a predecessor (spec 6.7)."""
+    record = json.loads(lines[0])
+    record["part"] = 0
+    record["continues_from"] = "capture-something-000.n8rocap.jsonl"
+    return [dumps(record)] + lines[1:]
+
+
+def m_part_without_continues_from(lines):
+    """A continuation part with no back-link, so the set cannot be walked (spec 6.7)."""
+    record = json.loads(lines[0])
+    record["part"] = 2
+    record.pop("continues_from", None)
+    return [dumps(record)] + lines[1:]
+
+
+def m_continues_from_is_a_path(lines):
+    """A linkage key carrying a host path rather than a bare filename (spec 6.7)."""
+    record = json.loads(lines[0])
+    record["part"] = 1
+    record["continues_from"] = "C:\\captures\\capture-something-000.n8rocap.jsonl"
+    return [dumps(record)] + lines[1:]
+
+
+def m_continued_in_without_size_limit(lines):
+    """A file that says it continues but did not end on its size bound (spec 6.7, 11)."""
+    record = json.loads(lines[-1])
+    record["end_reason"] = "shutdown"
+    record["continued_in"] = "capture-something-000.part001.n8rocap.jsonl"
+    return lines[:-1] + [dumps(record)]
+
+
 MUTATIONS = [
     ("unknown format_version is rejected outright", m_unknown_version),
     ("format_version is not the first key", m_version_not_first),
@@ -173,6 +221,13 @@ MUTATIONS = [
     ("a record type outside the closed vocabulary", m_unknown_record_type),
     ("header with no schemas array", m_missing_schemas),
     ("CRLF line endings", m_crlf),
+    ("header.limits.on_size_limit outside the closed set", m_bad_on_size_limit),
+    ("header.limits states an action but not the bound", m_limits_missing_max_bytes),
+    ("a first part that claims a predecessor", m_continues_from_on_part_zero),
+    ("a continuation part with no back-link", m_part_without_continues_from),
+    ("continues_from carrying a path, not a filename", m_continues_from_is_a_path),
+    ("continued_in on a file that did not end on its size bound",
+     m_continued_in_without_size_limit),
 ]
 
 

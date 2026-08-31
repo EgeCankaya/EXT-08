@@ -75,7 +75,17 @@ constexpr const char* kProducerName = "n8ro-bridge";
 // makes the answer a property of the artifact. Adding a key to an existing record type is
 // non-breaking (spec section 13), so this stays n8ro-capture/1 and every 0.7.0 file remains
 // valid - absent means unknown, exactly as `events_not_recorded` does.
-constexpr const char* kProducerVersion = "0.8.0";
+//
+// 0.9.0 is BTB-CAP-6: a real byte bound on the capture, with the stop-or-rotate choice made
+// by the operator and stated in the file. Three keys are added - `header.limits`,
+// `header.part` / `header.continues_from`, and `trailer.continued_in` - and nothing is
+// renamed, retyped or removed. `end_reason: "size_limit"` and `segment_close.reason:
+// "size_limit"` were both already in the format's closed sets, so no vocabulary moves and
+// **this stays n8ro-capture/1** (spec section 13). The linkage keys are deliberately the only
+// thing that ties a rotated set together: each part is a complete, independently valid
+// capture with its own header, its own schemas and its own trailer, so a reader that ignores
+// them still reads every part correctly - it just does not know they are siblings.
+constexpr const char* kProducerVersion = "0.9.0";
 
 // What kind of sample this capture contains, per [S1]'s "Published or predicted - pick
 // deliberately". It is a constant rather than a setting because there is nothing to choose on
@@ -107,10 +117,37 @@ struct SubscriptionInfo {
     std::uint64_t queueSize = 0;
 };
 
+// What BTB-CAP-6 requires the file to state about its own bound: the limit, and the action
+// taken on reaching it. Both are written into the `header` because the FR asks for exactly
+// that - an analyst holding a capture that stops early must be able to tell a run that ended
+// from a run that was cut, without the command line that produced it.
+//
+// `maxBytes` is the real CAP-6 bound. `maxSamples` is the record-count safety bound that has
+// existed since M4 (D-13, D-28); it is stated here too, because it can also end a capture and
+// a file that does not say so is the same silent truncation from the reader's side.
+// Zero means unbounded, for both.
+struct SizeLimitInfo {
+    std::uint64_t maxBytes = 0;
+    std::uint64_t maxSamples = 0;
+    // "stop" or "rotate" - the closed set, and the operator's choice. Always written, even
+    // when both bounds are 0, because "no bound was configured" is itself worth stating.
+    std::string onSizeLimit = "stop";
+};
+
 struct HeaderInfo {
     PlatformInfo platform;
     SubscriptionInfo subscription;
     bool attachedMidRun = false;
+    SizeLimitInfo limits;
+    // Which part of a rotated set this file is. 0 for every capture that never rotated, which
+    // is every capture this producer wrote before 0.9.0 - so absent, like 0, means "not a
+    // continuation", and a reader needs no special case for an older file.
+    std::uint64_t part = 0;
+    // Filename of the part before this one. Empty (and omitted) on part 0. A bare filename,
+    // never a path: the parts of a set live in one directory by construction, and writing an
+    // absolute path into a capture would make the file non-portable and leak the producing
+    // host's directory layout into a cross-repo artifact.
+    std::string continuesFrom;
     // One entry per message type that appears as a `sample` record's `message`. Sorted by
     // messageName on write, so the header's bytes do not depend on registry iteration.
     std::vector<n8ro::sim::MessageSchema> schemas;
@@ -200,9 +237,14 @@ struct TrailerBusMetrics {
     double simTimeS, std::uint64_t segment, const std::string& entity, std::uint64_t occupancy,
     const std::string& reason);
 
+// `continuedIn` names the next part of a rotated set, and is written only when there is one -
+// so its presence is the reader's signal that this file is not the end of the run. It cannot
+// live in the header: the header is the first line, and whether a rotation will happen is not
+// known until the limit is actually reached.
 [[nodiscard]] std::string writeTrailer(
     double simTimeS, const std::string& endReason, const TrailerCounts& counts,
-    const TrailerDrops& drops, const TrailerBusMetrics& busMetrics);
+    const TrailerDrops& drops, const TrailerBusMetrics& busMetrics,
+    const std::string& continuedIn = std::string());
 
 // Which of a schema's declared fields the run ever actually published.
 //

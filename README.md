@@ -4,7 +4,7 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 through M7 — complete, bar one P2 requirement. The demo recording is shot and awaiting its cut**: all seven BTB-DOC-2 beats were captured against this build, following [`docs/demo-recording-script.md`](docs/demo-recording-script.md). The bridge registers the packed schemas, resolves **four** topics
+**Status: M1 through M7 — complete. Every requirement in the PRD is implemented, and the demo recording is [published as four takes](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** covering all seven BTB-DOC-2 beats, shot following [`docs/demo-recording-script.md`](docs/demo-recording-script.md). The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
 subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
 streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
@@ -22,8 +22,9 @@ conformance reader in `tests/capture-reader/` was written from it alone — it l
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
-A live run ends on host loss, on Ctrl-C with a clean drain, or on a record budget if you set
-one. Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
+A live run ends on host loss, on Ctrl-C with a clean drain, or on a size or record bound if you
+set one — see [Bounding a capture](#bounding-a-capture), which is also where the stop-or-rotate
+choice lives. Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
 [Backpressure](#backpressure) for the values and why they are those values.
 
 **`docs/capture-format-v1.md` is frozen.** It is a cross-repo contract consumed by EXT-17;
@@ -32,16 +33,11 @@ an edit.
 
 **What is not here**, stated plainly rather than left to be discovered:
 
-- **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
-  count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
-  stop-or-rotate choice, and neither is stated in the `header` as the requirement asks.
-- **The cut of the 5-minute demo recording (BTB-DOC-2).** The material exists: all seven beats
-  the requirement names — start-before-simulator, a scenario load, a reload producing two
-  segments, an entity removal, a verdict firing, the backpressure demonstration, and a Ctrl-C
-  with a clean tail — were recorded across four takes against this build.
-  [`docs/demo-recording-script.md`](docs/demo-recording-script.md) is the script they were shot
-  from and names the command behind every beat. What is outstanding is the edit and a link to
-  the finished file from [Reproducing the evidence](#reproducing-the-evidence).
+- **A single edited cut of the demo.** The recording is published as its **four source takes**
+  rather than one assembled file — see [The demo recording](#the-demo-recording). All seven
+  beats BTB-DOC-2 names are on camera and the take-by-take map below says where each one is, so
+  the requirement's acceptance criterion is met; what does not exist is a single five-minute
+  file with titles between the beats.
 
 `docs/decisions-m5-m7.md` records every judgment call made across M5–M7, with what it turned on
 and what would reverse it.
@@ -166,7 +162,9 @@ with `end_reason: host_lost`, prints a run summary and exits 0.
 | `--engine-state-message` | message instance name the host-loss heartbeat is resolved *from*. Default `simEngineState`. Optional |
 | `--queue-size` | handler-to-writer queue bound, in sample records. Default `8192`. Optional |
 | `--overflow-policy` | `drop_newest` (default) or `drop_oldest`. Optional |
-| `--capture-max-samples` | stop after this many `sample` records and close with `end_reason: size_limit`. Default `0`, meaning no bound — a live run ends on host loss. Optional |
+| `--capture-max-bytes` | maximum size of **one capture file**, in bytes (BTB-CAP-6). Default `0`, meaning no bound. Minimum 16384 when set. The limit and the action below are written into the capture's own `header`. Optional |
+| `--on-size-limit` | what happens on reaching `--capture-max-bytes`: `stop` (default) or `rotate`. See [Bounding a capture](#bounding-a-capture). Optional |
+| `--capture-max-samples` | stop after this many `sample` records **across the whole run** and close with `end_reason: size_limit`. Default `0`, meaning no bound — a live run ends on host loss. A record-count safety bound; it always stops, never rotates. Optional |
 | `--conditions` | JSON file of declared conditions. Without it the bridge records but judges nothing. Optional |
 | `--replay` | offline mode: re-judge a stored capture with no simulator, no bus and no client. Requires `--conditions`, and is mutually exclusive with `--config` |
 
@@ -191,6 +189,57 @@ reasoning that keeps wall-clock out of the capture itself (ADR-3).
 The file is opened when the scenario name becomes known rather than at startup, since the name
 is part of it. A bridge started before the simulator therefore creates nothing until a host
 appears, which is also the honest behaviour: no host, no run, no artifact.
+
+### Bounding a capture
+
+An unattended run on a finite disk needs a bound, and a capture cut off by ENOSPC halfway
+through a line is unreadable by every reader. `--capture-max-bytes` is the bound; `--on-size-limit`
+is what happens when a run reaches it (BTB-CAP-6).
+
+```cmd
+:: stop at 100 MB with a clean, complete, explicitly-truncated capture
+--capture-max-bytes 104857600
+
+:: or keep recording, into numbered continuation files of 100 MB each
+--capture-max-bytes 104857600 --on-size-limit rotate
+```
+
+| | `stop` (default) | `rotate` |
+|---|---|---|
+| At the limit | closes the capture and ends the run | closes this file and continues into the next |
+| Total disk used | bounded by `--capture-max-bytes` | unbounded — the bound is per file |
+| The run's tail | not recorded anywhere | recorded, in later parts |
+| Files produced | one | `capture-<scenario>-<label>.n8rocap.jsonl`, then `.part001`, `.part002`, … |
+
+**No line is ever cut.** The bound is checked against a record's exact length *before* the
+record is written, and 8 KiB is reserved up front for the `segment_close`, the end-of-run
+`verdict` records and the `trailer`. A capture that reached its limit is a complete, valid
+file ending in a well-formed trailer carrying `end_reason: size_limit` — which is the whole
+point of the requirement, and the difference between an analyst finding a closed capture and
+an analyst finding a corrupt one.
+
+**Every part of a rotated set is a complete capture.** Each carries its own `header` with its
+own full schema table, its own segments numbered from 0, its own counts and its own trailer.
+The conformance reader accepts any part on its own, and so should anything you write. The set
+is tied together by three optional keys — `header.part`, `header.continues_from` and
+`trailer.continued_in` — documented in [`docs/capture-format-v1.md`](docs/capture-format-v1.md)
+§6.7, along with the rules for stitching parts back into one stream. **Segment ordinals restart
+in each part**, so anything computed per segment across a set has to key on `(part, segment)`.
+
+The bound in force is recorded in the file, as `header.limits` (spec §6.6):
+
+```json
+"limits":{"max_bytes":104857600,"max_samples":0,"on_size_limit":"rotate"}
+```
+
+That is there because a capture that stops early and a capture whose run ended look identical
+from the outside, and the difference decides whether the analysis you are about to do is valid.
+An unbounded capture states that it is unbounded rather than saying nothing.
+
+`--capture-max-samples` is the older, separate, record-count safety bound (D-13). It counts
+across the whole run rather than per part, and it always stops. Both bounds appear in
+`header.limits`, because either can end a capture and a file that does not say so is the same
+silent truncation from a reader's side.
 
 ### Backpressure
 
@@ -526,8 +575,9 @@ referee_test.exe
 non-determinism sources R4 names, because all three are ours and all three are easy to
 reintroduce: unordered-map iteration, locale-dependent float formatting, and unordered output
 containers. It also carries **golden lines** — the exact bytes of an `entity_remove`, a
-`segment_open` and the header's opening keys — so that after the format freeze, changing a
-record's spelling means editing a test that says "these bytes".
+`segment_open`, the header's opening keys, the `limits` and rotation keys a bounded capture
+carries (spec §6.6, §6.7), and a trailer with and without `continued_in` — so that after the
+format freeze, changing a record's spelling means editing a test that says "these bytes".
 
 The locale check is the one that earns its keep. `%.17g` is round-trip exact and *silently*
 locale-dependent, and this machine's locale is comma-decimal, so the test runs for real rather
@@ -542,7 +592,7 @@ cl /std:c++17 /EHsc /W4 /O2 ^
 determinism_test.exe
 ```
 
-18 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
+24 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
 — is `tests\determinism\replay_hashes.ps1`; see [Reproducing the
 evidence](#reproducing-the-evidence).
 
@@ -637,16 +687,48 @@ over them.
 
 Each of these assumes a shell that has run `C:\N8RO\setup.cmd`.
 
+### The demo recording
+
+**[Four takes, on Google Drive.](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** Shot 2026-08-31 following
+[`docs/demo-recording-script.md`](docs/demo-recording-script.md), which is both the shooting
+script and the record of what each take produced. Every beat BTB-DOC-2 names is on camera:
+
+| Beat | Take | What proves it on screen |
+|---|---|---|
+| Start before the simulator | 1, step 2 | `waiting for a simulation host`, with no simulator running |
+| A scenario load | 1, step 4 | `attached:` then `capture opened:`, roster filling to `live=42` |
+| A reload producing two segments | 1, step 6 | `segments=2` in the run summary |
+| An entity removal | 1, step 4 | `rm=` climbing in the status line |
+| A verdict firing | 1 step 6, and take 2 | verdict count in the summary; five met and two not met on replay |
+| The backpressure demonstration | 3 | `samplesDropped=` non-zero, `eventsDropped=0`, and the capture still CONFORMS |
+| Ctrl-C with a clean tail | 4 | exit 0 and a `shutdown` trailer as the last line |
+
+Two things to know before watching, both of which look like faults and are not:
+
+- **The takes were shot against producer 0.8.0**, and this repository now builds **0.9.0**. The
+  difference is BTB-CAP-6 — the byte bound and the rotation option — which none of the seven
+  beats exercises. Every command in the takes behaves identically on 0.9.0; the only visible
+  difference is the `producer.version` string inside a capture header, and the two extra keys
+  beside it. Nothing was re-shot to change a version string.
+- **The install runs terrain degraded** — no elevation service and no geoid grid — so terminal 2
+  floods with `n8ro-sim.scripting.navigation` errors throughout. Pre-existing, documented, and
+  deliberately not fixed for the camera: every measurement in the PRD, `notes.md` and
+  `docs/capture-format-v1.md` §14 was taken in this configuration, and provisioning terrain
+  would make the recording show a different system than the evidence describes.
+
+The captures the shoot produced are committed in `captures/` under the `demo`, `overload` and
+`ctrlc` labels, so every number visible on screen can be re-checked against a file here.
+
 ### The four unit suites — no simulator needed
 
 ```cmd
 build\tests\entity_picture_test.exe     :: 72 checks - the roster and ADR-6
 build\tests\referee_test.exe            :: 93 checks - the three condition kinds
-build\tests\determinism_test.exe        :: 18 checks - R4's three hazards, and the locale
+build\tests\determinism_test.exe        :: 24 checks - R4's three hazards, the locale, golden bytes
 build\tests\capture_reader.exe docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
     --spec docs\capture-format-v1.md     :: the format spec, checked against a real file
 python tests\capture-reader\mutate.py docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
-    build\tests\capture_reader.exe docs\capture-format-v1.md   :: 16 mutations, 0 survivors
+    build\tests\capture_reader.exe docs\capture-format-v1.md   :: 22 mutations, 0 survivors
 ```
 
 The build lines for each are in the file's own header comment, and in [Tests](#tests) above.

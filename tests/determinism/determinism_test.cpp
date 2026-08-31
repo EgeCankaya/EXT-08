@@ -141,6 +141,13 @@ capture::HeaderInfo headerInfo() {
     info.subscription.topic = "sim/entity/state";
     info.subscription.backpressurePolicy = "FIFO_DROP";
     info.subscription.queueSize = 1024;
+    // BTB-CAP-6. A bound and a rotation position, so the golden lines below cover the keys
+    // that carry them rather than only the keys that predate them.
+    info.limits.maxBytes = 104857600;
+    info.limits.maxSamples = 0;
+    info.limits.onSizeLimit = "rotate";
+    info.part = 2;
+    info.continuesFrom = "capture-atacama-air-defense-000.part001.n8rocap.jsonl";
     // Deliberately out of alphabetical order: the header sorts by message name, and this is
     // what would catch that sort being removed.
     n8ro::sim::MessageSchema second = entityStateSchema();
@@ -321,6 +328,46 @@ void testKnownBytes() {
     check(header.rfind("{\"format_version\":\"n8ro-capture/1\",\"type\":\"header\"", 0) == 0,
           "format_version is the first key of the header, so an unknown version is rejected "
           "before anything else is parsed");
+
+    // BTB-CAP-6's three header keys, spelled exactly as docs/capture-format-v1.md 6.6 and
+    // 6.7 specify them. They are what a bounded capture states about its own bound, and they
+    // cross the repo boundary like every other key here.
+    check(header.find("\"limits\":{\"max_bytes\":104857600,\"max_samples\":0,"
+                      "\"on_size_limit\":\"rotate\"}") != std::string::npos,
+          "header.limits is spelled exactly as the format specification says (spec 6.6)");
+    check(header.find("\"part\":2,\"continues_from\":"
+                      "\"capture-atacama-air-defense-000.part001.n8rocap.jsonl\"") !=
+              std::string::npos,
+          "header.part and header.continues_from likewise, and in that order (spec 6.7)");
+
+    // The ordinary case: no bound configured, and no continuation. `part` is still written -
+    // absent and 0 mean the same thing to a reader, but writing it costs nine bytes and
+    // removes a case from every reader that would otherwise have to handle both.
+    capture::HeaderInfo plain = headerInfo();
+    plain.limits = capture::SizeLimitInfo{};
+    plain.part = 0;
+    plain.continuesFrom.clear();
+    const std::string plainHeader = capture::writeHeader(plain);
+    check(plainHeader.find("\"limits\":{\"max_bytes\":0,\"max_samples\":0,"
+                           "\"on_size_limit\":\"stop\"}") != std::string::npos,
+          "an unbounded capture still states that it is unbounded, rather than saying nothing");
+    check(plainHeader.find("\"continues_from\"") == std::string::npos,
+          "continues_from is omitted on a first part, not written empty (spec 6.7)");
+
+    // A trailer that continues, and one that does not. `continued_in` is the last key and is
+    // present only when there is a next part - its absence is how a reader knows a file ends
+    // the run rather than merely ending.
+    const capture::TrailerCounts counts{1, 6, 0, 0, 0};
+    const std::string continued = capture::writeTrailer(
+        1.5, "size_limit", counts, capture::TrailerDrops{}, capture::TrailerBusMetrics{},
+        "capture-atacama-air-defense-000.part003.n8rocap.jsonl");
+    check(continued.find("\"continued_in\":\"capture-atacama-air-defense-000.part003."
+                         "n8rocap.jsonl\"}") != std::string::npos,
+          "trailer.continued_in is the last key of a rotated part's trailer (spec 11)");
+    const std::string terminal = capture::writeTrailer(
+        1.5, "host_lost", counts, capture::TrailerDrops{}, capture::TrailerBusMetrics{});
+    check(terminal.find("continued_in") == std::string::npos,
+          "and is absent entirely from the trailer that ends a run");
 }
 
 void testNoWallClock() {

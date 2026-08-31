@@ -629,6 +629,72 @@ int validate(const std::string& capturePath, const std::string& specPath) {
                 }
             }
 
+            // Spec 6.6: optional, added at producer 0.9.0, and absent means unknown rather
+            // than unbounded. When it is present it has to be complete and its action has to
+            // be in the closed set - a file that states a bound it cannot be checked against
+            // is worse than one that states none.
+            const Value* limits = record.member("limits");
+            if (limits != nullptr) {
+                if (!limits->isObject()) {
+                    report.fail(1, "spec 6.6", "header.limits is not an object");
+                } else {
+                    long long ignored = -1;
+                    for (const char* required : {"max_bytes", "max_samples"}) {
+                        if (!readIntegerMember(*limits, required, ignored)) {
+                            report.fail(1, "spec 6.6",
+                                        std::string("header.limits is missing `") + required +
+                                            "` or it is not an integer");
+                        }
+                    }
+                    const Value* action = limits->member("on_size_limit");
+                    if (action == nullptr || !action->isString() ||
+                        (action->text != "stop" && action->text != "rotate")) {
+                        report.fail(1, "spec 6.6",
+                                    "header.limits.on_size_limit is not one of stop / rotate");
+                    }
+                    long long maxBytes = 0;
+                    if (readIntegerMember(*limits, "max_bytes", maxBytes) && maxBytes > 0) {
+                        report.note("recorded under a byte bound of " +
+                                    std::to_string(maxBytes) + " bytes, on_size_limit=" +
+                                    (action != nullptr && action->isString() ? action->text
+                                                                             : "?") +
+                                    " - this file may be part of a longer run (spec 6.6)");
+                    }
+                }
+            }
+
+            // Spec 6.7: the rotation linkage. `part` absent means 0; `continues_from` is
+            // present exactly when `part` is not 0.
+            long long part = 0;
+            const bool hasPart = readIntegerMember(record, "part", part);
+            if (hasPart && part < 0) {
+                report.fail(1, "spec 6.7", "header.part is negative");
+            }
+            const Value* continuesFrom = record.member("continues_from");
+            if (continuesFrom != nullptr && !continuesFrom->isString()) {
+                report.fail(1, "spec 6.7", "header.continues_from is not a string");
+            } else if (continuesFrom != nullptr && part == 0) {
+                report.fail(1, "spec 6.7",
+                            "header.continues_from is present but header.part is 0 - a first "
+                            "part continues from nothing");
+            } else if (continuesFrom == nullptr && part > 0) {
+                report.fail(1, "spec 6.7",
+                            "header.part is " + std::to_string(part) +
+                                " but header.continues_from is absent - the set cannot be "
+                                "walked backwards");
+            } else if (continuesFrom != nullptr &&
+                       continuesFrom->text.find_first_of("/\\") != std::string::npos) {
+                report.fail(1, "spec 6.7",
+                            "header.continues_from is a path, not a bare filename: \"" +
+                                continuesFrom->text + "\"");
+            }
+            if (part > 0) {
+                report.note("this is part " + std::to_string(part) +
+                            " of a rotated set, continuing " + continuesFrom->text +
+                            " - the run's earlier records are in the previous parts "
+                            "(spec 6.7)");
+            }
+
             const Value* attached = record.member("attached_mid_run");
             if (attached != nullptr && !attached->isBool()) {
                 report.fail(1, "spec 6.3", "header.attached_mid_run is not a boolean");
@@ -879,6 +945,32 @@ int validate(const std::string& capturePath, const std::string& specPath) {
                 report.fail(lineNumber, "spec 11",
                             "trailer.end_reason \"" + endReason->text +
                                 "\" is outside the closed set");
+            }
+
+            // Spec 6.7: `continued_in` names the next part, and only a file closed by its
+            // size bound can have one. A file that says it continues for any other reason is
+            // making a claim its own end_reason contradicts.
+            const Value* continuedIn = record.member("continued_in");
+            if (continuedIn != nullptr && !continuedIn->isString()) {
+                report.fail(lineNumber, "spec 11", "trailer.continued_in is not a string");
+            } else if (continuedIn != nullptr) {
+                if (endReason == nullptr || !endReason->isString() ||
+                    endReason->text != "size_limit") {
+                    report.fail(lineNumber, "spec 6.7, 11",
+                                "trailer.continued_in is present but end_reason is not "
+                                "size_limit - only a file closed by its size bound continues");
+                }
+                if (continuedIn->text.find_first_of("/\\") != std::string::npos) {
+                    report.fail(lineNumber, "spec 6.7",
+                                "trailer.continued_in is a path, not a bare filename: \"" +
+                                    continuedIn->text + "\"");
+                }
+                report.note("this file is continued in " + continuedIn->text +
+                            " - it is not the end of the run (spec 6.7)");
+            } else if (endReason != nullptr && endReason->isString() &&
+                       endReason->text == "size_limit") {
+                report.note("closed at its size limit with no continuation - the run went on "
+                            "past what this file records (spec 6.6)");
             }
 
             // Spec section 11: counts describe this file, and a reader should count for
