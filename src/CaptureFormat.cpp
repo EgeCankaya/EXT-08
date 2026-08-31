@@ -152,6 +152,11 @@ std::string writeHeader(const HeaderInfo& info) {
 
     appendBoolMember(out, "attached_mid_run", info.attachedMidRun);
 
+    // [S1] acceptance criterion 3: "you can say how you know they are not predictions". This is
+    // how - stated in the file rather than in a document beside it. Constant by construction on
+    // this release; see kSampleFormPublished.
+    appendStringMember(out, "sample_form", kSampleFormPublished);
+
     appendKey(out, "subscription");
     out.push_back('{');
     appendStringMember(out, "topic", info.subscription.topic);

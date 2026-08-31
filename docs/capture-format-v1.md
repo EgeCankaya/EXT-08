@@ -192,6 +192,7 @@ The first line of every capture. Its keys appear in exactly this order.
 | `producer` | object | The tool that wrote the file — see §6.1 |
 | `platform` | object | The configuration the run was recorded under — see §6.2 |
 | `attached_mid_run` | boolean | See §6.3 |
+| `sample_form` | string | Whether the samples in this file are as-published or predicted — see §6.3a. **Optional; added at producer 0.8.0.** Absent means unknown, not "predicted" |
 | `subscription` | object | The bus-side delivery policy in force — see §6.4 |
 | `schemas` | array of object | One entry per message type appearing in this file — see §6.5 |
 
@@ -238,6 +239,30 @@ capture's own view of who is on the field is incomplete through no fault of the 
 **A reader should treat `attached_mid_run: true` as a caveat on completeness**, not as an
 error. Entity identity in such a capture is still sound; the roster's origin is simply not in
 the file.
+
+### 6.3a `sample_form`
+
+Which of the two forms of entity state the `sample` records carry. The platform distinguishes
+them and they are **not interchangeable**:
+
+| Value | Meaning |
+|---|---|
+| `"published"` | Each sample is a state the engine actually produced, carrying the simulation time it was published at. Irregular by nature — an entity is published when its state has left what a recipient could have predicted, or when its heartbeat falls due |
+| `"predicted"` | Each sample is a published state carried forward to some later instant. Position and velocity have been advanced; orientation and every discrete field are the last published values, unchanged |
+
+**Every capture this producer has ever written is `"published"`**, and on runtime 2.1.328 it
+could not be otherwise: `SimulationEngineClient` exposes no prediction accessor, so everything
+reaching a subscriber arrived as an engine publication. The key exists anyway, for two reasons.
+
+First, **a predicted series is a smooth curve the engine never computed.** Anything that
+analyses a run, feeds a regression baseline, or travels back into the simulation must use the
+published form; recording a predicted one produces a file that looks better than the truth and
+is not it. A consumer should be able to establish which it holds without knowing the producer.
+
+Second, **absence is not an answer.** A file written before producer 0.8.0 omits this key, and
+a reader must treat it as *unknown* rather than assuming either value — `header.producer.version`
+is what tells you the file predates the field. A reader that requires published data should
+reject `"predicted"`, accept `"published"`, and decide for itself what to do with absent.
 
 ### 6.4 `subscription`
 
@@ -645,6 +670,7 @@ line**, with no whitespace between tokens.
  "platform":{"engine_config":"SimEngineClient_SharedMemory","model_path":"C:\\N8RO\\data\\db",
              "schema_file":"N8roSimSchema","schema_version":"1.0.0","runtime_version":"unknown"},
  "attached_mid_run":false,
+ "sample_form":"published",
  "subscription":{"topic":"sim/entity/state","backpressure_policy":"KEEP_LATEST","queue_size":100},
  "schemas":[{"message_name":"simEntityStateUpdate","topic":"sim/entity/state",
              "schema_hash":2652370635,"message_id":1308183250,"wire_version":1,
@@ -1006,6 +1032,7 @@ It goes to the producer's log.
 | 0.5.0 | The writer thread and the bounded queue. `segment_open` / `segment_close` are driven by scenario events, `entity_add` / `entity_remove` are emitted, `drops.samples_not_recorded` carries a real overflow count, and `drops.events_not_recorded` joins it. `end_reason: "host_lost"` is reachable. The bus subscription moved off the `KEEP_LATEST` default to `FIFO_DROP` with a queue of 1024, which `header.subscription` records. Every record type emitted was already specified and only keys were added, so the format version does not move |
 | 0.6.0 | `verdict` records are emitted, completing the eight-type vocabulary. Nothing about the format changed — no key renamed, none retyped, no type added that was not already specified — so this is still `n8ro-capture/1` |
 | 0.7.0 | Clean interruption: `end_reason: "shutdown"` is reachable, verified over twenty scripted interrupt-and-verify cycles. No format change |
+| 0.8.0 | `header.sample_form` added, recording that the file contains as-published samples (§6.3a). The answer was previously stated only in the producer's README, which does not travel with the capture. Adding a key to an existing record type is non-breaking (§13), so the format version does not move and every earlier file stays valid |
 
 ---
 

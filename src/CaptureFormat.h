@@ -66,7 +66,24 @@ constexpr const char* kProducerName = "n8ro-bridge";
 // is what makes BTB-REF-4 a test rather than a claim. Nothing about the format changed: every
 // record type emitted was already specified and no key was renamed or retyped, so this is
 // still n8ro-capture/1.
-constexpr const char* kProducerVersion = "0.7.0";
+//
+// 0.8.0 adds `header.sample_form`. [S1] asks for records whose provenance is stateable - "you
+// can say how you know they are not predictions" - and until now the answer lived in the
+// README and in this release's lack of a prediction API, not in the file. That is an argument
+// about the platform, and it does not travel with the capture: a reader on a later release
+// that *does* ship a predicted form finds nothing in a v1 file to distinguish the two. The key
+// makes the answer a property of the artifact. Adding a key to an existing record type is
+// non-breaking (spec section 13), so this stays n8ro-capture/1 and every 0.7.0 file remains
+// valid - absent means unknown, exactly as `events_not_recorded` does.
+constexpr const char* kProducerVersion = "0.8.0";
+
+// What kind of sample this capture contains, per [S1]'s "Published or predicted - pick
+// deliberately". It is a constant rather than a setting because there is nothing to choose on
+// this release: `SimulationEngineClient` exposes no prediction accessor, so every value here
+// arrived off the bus as an engine publication. If a release ever ships a predicted form, this
+// becomes a real discriminator and the constant becomes a variable - which is the whole reason
+// to write it down now, while the answer is still unambiguous.
+constexpr const char* kSampleFormPublished = "published";
 
 // Every value here is observed, not asserted. `runtimeVersion` comes from the SDK's own
 // getN8roVersion(), which reports "unknown" when the release headers were compiled without

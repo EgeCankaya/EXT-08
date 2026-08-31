@@ -351,7 +351,7 @@ The system SHALL stamp every capture record with the simulation time carried by 
 
 **Acceptance criteria:**
 - No call to any wall-clock or steady-clock source appears in the capture-writing path. Log lines may carry wall-clock time; capture records may not.
-- Records carry the published simulation time. **How we know these are not predictions:** release 2.1.328 ships no predicted-sample API — `EntityStateSample.h` does not exist and `SimulationEngineClient` exposes no prediction accessor. Every value in the capture arrives off the bus as an engine publication. The README states this and cites the release.
+- Records carry the published simulation time. **How we know these are not predictions:** release 2.1.328 ships no predicted-sample API — `EntityStateSample.h` does not exist and `SimulationEngineClient` exposes no prediction accessor. Every value in the capture arrives off the bus as an engine publication. **The capture states this in its own header** as `sample_form: "published"` (format spec §6.3a, producer 0.8.0), so the answer travels with the file instead of living only in a document beside it; the README and the spec both carry the reasoning and cite the release.
 - The determinism harness (M7) is the enforcing test.
 
 **Trace:** UAC-BTB-CAP-2

@@ -42,7 +42,19 @@ an edit.
 `docs/decisions-m5-m7.md` records every judgment call made across M5–M7, with what it turned on
 and what would reverse it.
 
-### Two things to know before you compare or trust a capture
+### Three things to know before you compare or trust a capture
+
+**Every sample in a capture is as-published, never predicted — and the file says so.** The
+platform distinguishes a *published* sample (a state the engine actually produced, carrying the
+simulation time it was published at) from a *predicted* one (a published state carried forward,
+its position and velocity advanced by arithmetic the engine never performed). A recorder must
+use the first; a predicted series is a smooth curve nobody computed. On runtime 2.1.328 there is
+nothing to get wrong — `SimulationEngineClient` exposes no prediction accessor, so everything
+reaching a subscriber arrived as an engine publication — but the header now records
+`sample_form: "published"` (producer 0.8.0) so the answer travels with the file rather than
+living here. A capture written before 0.8.0 omits the key; read that as *unknown*, not as
+"predicted", and check `producer.version`.
+
 
 **Two live runs of one scenario are not byte-identical — and the simulation is still
 reproducible.** Measured on both hosts: the wall-clock-paced `n8ro-sim-local` skips ~1% of
@@ -740,6 +752,7 @@ the format spec carries the producer version history.
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
 docs/capture-format-v1.md                the cross-repo contract EXT-17 is handed
 docs/decisions-m5-m7.md                  every judgment call made in M5–M7, and why
+docs/escalations.md                      the two findings this project cannot close itself
 notes.md                                 what the bus actually carries (graded deliverable)
 src/main.cpp                             CLI, wiring, the lifecycle loop, the run summary
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and all four topics from the registry
