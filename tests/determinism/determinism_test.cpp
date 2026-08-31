@@ -306,6 +306,76 @@ void testOrderedContainers() {
           "a verdict's values come out of an ordered map, in key order");
 }
 
+// BTB-CAP-4's central promise, and the half of UAC-BTB-CAP-4 that is checkable without a
+// simulator: adding a field to a message's schema makes it appear in new captures **with no
+// code change**. The other half - a real engine publishing a real new field - cannot be
+// staged here, because we cannot make the host publish a field its build does not have. What
+// this does test is the whole of what EXT-08 controls: the writer is driven by
+// MessageSchema::fields and never by a compiled-in list.
+void testSchemaGrowth() {
+    section("BTB-CAP-4: a field added to the schema appears, with no code change");
+
+    n8ro::sim::MessageSchema grown = entityStateSchema();
+    n8ro::sim::FieldSchema added;
+    added.name = "fuelFraction";     // deliberately not last alphabetically, and not first
+    added.size = 1;
+    // Inserted in the MIDDLE of the declaration, not appended. Appending would pass even on a
+    // writer that emitted a hard-coded prefix and then whatever was left over; inserting only
+    // passes if field order really does come from the schema vector.
+    grown.fields.insert(grown.fields.begin() + 3, added);
+
+    n8ro::sim::StreamValueMap values;
+    fillPayload(values, false);
+    n8ro::sim::StreamValue fuel;
+    fuel.data = 0.375;
+    values["fuelFraction"] = fuel;
+
+    CaptureRecord record;
+    record.kind = RecordKind::Sample;
+    record.subject = "RedUAV_N_01";
+    record.occupancy = 1;
+    record.simTimeS = 12.5;
+    record.values = values;
+
+    const std::string line = capture::writeSample(record, 0, grown);
+    check(line.find("\"fuelFraction\":0.375") != std::string::npos,
+          "a schema-declared field the publisher sent appears in the sample record");
+
+    // In schema order. Inserted at index 3, the declaration now reads
+    //   simulationTime, scenarioEntityName, name, fuelFraction, team, phase, ...
+    // so the new field must land between `name` and `team`.
+    //
+    // Searched inside the `fields` object rather than the whole line: the envelope repeats
+    // two of the message's own values on purpose (spec 8.4), so a find() over the whole
+    // record can match an envelope key and compare positions across two different objects.
+    const std::size_t fieldsAt = line.find("\"fields\":{");
+    check(fieldsAt != std::string::npos, "the record carries a `fields` object");
+    const std::string fields = fieldsAt == std::string::npos ? std::string()
+                                                            : line.substr(fieldsAt);
+    const std::size_t nameAt = fields.find("\"name\"");
+    const std::size_t fuelAt = fields.find("\"fuelFraction\"");
+    const std::size_t teamAt = fields.find("\"team\"");
+    check(nameAt != std::string::npos && fuelAt != std::string::npos &&
+              teamAt != std::string::npos && nameAt < fuelAt && fuelAt < teamAt,
+          "and in the position the schema declares it - between `name` and `team`, not "
+          "appended to the end");
+
+    // The converse, and the reason BTB-CAP-4's rule is "verbatim" rather than "complete":
+    // a declared field the publisher did not send is ABSENT, never defaulted. This is the
+    // activeAnimation case - twelve declared, eleven ever published (notes.md, M3).
+    check(line.find("activeAnimation") == std::string::npos,
+          "a declared field the publisher did not send is absent, not defaulted to a zero");
+
+    // And the header still carries the full declaration, so a reader can tell the two apart.
+    capture::HeaderInfo info = headerInfo();
+    info.schemas.clear();
+    info.schemas.push_back(grown);
+    const std::string header = capture::writeHeader(info);
+    check(header.find("\"fuelFraction\"") != std::string::npos &&
+              header.find("\"activeAnimation\"") != std::string::npos,
+          "header.schemas declares both - the sent field and the never-sent one (spec 8.2)");
+}
+
 void testKnownBytes() {
     section("the exact bytes, so a change to them is a deliberate act");
 
@@ -399,6 +469,7 @@ int main() {
     testLocaleIndependence();
     testOrderedContainers();
     testKnownBytes();
+    testSchemaGrowth();
     testNoWallClock();
 
     std::printf("\n%d checks, %d failures\n", gChecks, gFailures);
