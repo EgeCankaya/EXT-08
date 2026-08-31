@@ -82,14 +82,24 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
-**M1 through M7 are delivered. The project is complete**, bar BTB-CAP-6 (P2, the byte-limited
-capture) and the 5-minute demo recording, which needs a person. `docs/decisions-m5-m7.md` D-37
-is the complete list of what is not delivered and why.
+**M1 through M7 are delivered, and every requirement in the PRD is implemented.** BTB-CAP-6
+(the byte-limited capture) was built after M7 closed — `--capture-max-bytes` plus
+`--on-size-limit stop|rotate`, both stated in `header.limits`; see PRD rev 11 and D-38 to D-41.
+**Every deliverable is also met** (PRD rev 12): the demo recording is published as its four
+takes and linked from the README, and OQ-2 is closed (D-42) — its "intended production shape"
+half is carried as EXT-17's OQ-3. The only things still outstanding are the two findings in
+`docs/escalations.md`, both sent to the brief's author on 2026-08-31 and awaiting a reply;
+neither is EXT-08's to close, and E-1's substance is already adopted downstream in EXT-17's PRD.
+`docs/decisions-m5-m7.md` D-37 is the list as it stood at M7's close, with the discharged items
+struck through.
 
 **`docs/capture-format-v1.md` is FROZEN.** After the M7 freeze, a change to what it specifies is
 a version bump and a downstream change for EXT-17 — not an edit. Adding a key to an existing
-record is still non-breaking (spec §13); renaming one, retyping one, changing a unit, or adding
-a record type is not. `tests/determinism/determinism_test.cpp` carries golden lines for exactly
+record is still non-breaking (spec §13); renaming one, retyping one, changing a unit, changing a
+closed vocabulary, or adding a record type is not. **BTB-CAP-6 is the worked example**: it added
+four keys across `header` and `trailer` (§6.6, §6.7) and the format did not move, because
+`size_limit` was already in the closed sets for `trailer.end_reason` and `segment_close.reason`.
+Check the freeze against §13 *before* writing code, not after. `tests/determinism/determinism_test.cpp` carries golden lines for exactly
 this reason: changing the spelling of a record now means editing a test that says "these bytes".
 
 **OQ-1 is decided: we own the entity picture permanently** (PRD rev 3, ADR-1). It is not a

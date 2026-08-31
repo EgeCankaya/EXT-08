@@ -1720,7 +1720,7 @@ Plus a set of **golden lines** — the exact bytes of an `entity_remove`, a `seg
 the header's opening keys. After the format freeze those are the friction that makes changing
 the spelling a deliberate act rather than an accident.
 
-18 checks, and the locale one is the one that earns its keep.
+24 checks, and the locale one is the one that earns its keep.
 
 ### The evidence pack, and the one deliverable that is not here
 
@@ -1736,8 +1736,79 @@ It contains the whole story in one file: `RedUAV_N_01` created, destroyed at t =
 re-created at occupancy 2 in the teardown segment; both segments; and the seven verdicts,
 including the two never-met ones.
 
-**The 5-minute demo recording (BTB-DOC-2) is the one deliverable not in the repository.** It
-needs a person and a screen recorder. Everything it is supposed to show is scripted and
-runnable — start-before-simulator, a reload producing two segments, an entity removal, a
-verdict firing, the backpressure demonstration and a clean Ctrl-C — and the README says which
-command produces each.
+**The 5-minute demo recording (BTB-DOC-2) is the one deliverable that is not a file in this
+repository** — it is [four takes published at a link](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing), because a screen
+recording is not a thing to commit. Everything it shows is scripted and runnable —
+start-before-simulator, a reload producing two segments, an entity removal, a verdict firing,
+the backpressure demonstration and a clean Ctrl-C — and the README maps each beat to its take
+and says which command produces it.
+
+That it was shootable in an afternoon is the observation worth keeping. Nothing had to be
+staged and no take needed a special build, because every beat was already a command someone
+could run from the README. **A demo that needs choreography is usually telling you the evidence
+is thin**; this one needed a screen recorder and a script naming which existing command to type.
+
+---
+
+## BTB-CAP-6 — what building the bounded capture turned up
+
+The last unbuilt requirement, built after M7 closed. Three things here were not obvious in
+advance, and two of them are the kind that only appear once a thing runs.
+
+### The format had already made room for this, at M4
+
+The freeze was the first thing checked, before any code, because a version bump is a
+downstream change for EXT-17 and not an edit. It turned out not to be close:
+`trailer.end_reason` and `segment_close.reason` **both already carried `size_limit` in their
+closed sets**, written at M4 when nothing could produce one. §13 makes an added key
+non-breaking, so the whole requirement — a bound, an action, and a rotation linkage — lands as
+four added keys on two existing record types and the format stays `n8ro-capture/1`.
+
+That is worth writing down as a general observation rather than a lucky break: **the M4
+decision to write closed vocabularies that named values the producer could not yet emit is
+what kept a P2 requirement from becoming a cross-repo version bump eight days later.** The
+cost at the time was two table rows.
+
+### A rotation resets the segment ordinal, and a record rendered before the check carries the old one
+
+The obvious shape for the admission check is: render the record, measure it, decide. That is
+wrong the moment rotation exists, and wrong in a way that produces a *malformed* file rather
+than a wrong-looking one — a record rendered in part 0's segment 3 and then written into part
+1, whose only segment is 0, points at a segment its own file does not contain. No reader could
+repair it and the conformance reader would reject the part.
+
+The fix is that the admission helper takes a render *callable* and calls it a second time after
+a rotation. Cheap, and invisible in the ordinary case. It was found by reasoning about the
+call, not by a test — which is the argument for having written the segment rules down in §7
+precisely enough to reason against.
+
+### The thread that writes an intermediate trailer is not the thread that owns the counters
+
+Every trailer before this one was written at teardown, by main, after the writer thread had
+been joined — so `drops` and `bus_metrics` were exact by construction and nobody had to think
+about it. A rotation writes a trailer **mid-run, on the writer thread**, and the platform's
+counters live behind `MessageBusPacked::metricsSnapshot()` and `IMessageBus::getStatistics()`,
+for which nothing in the release establishes thread safety.
+
+`RecordQueue::counters()` is mutex-guarded and would have been safe; the SDK's two are the
+question. Reaching into them off the main thread to make a counter exact would have traded a
+real invariant for a cosmetic one, so main caches its own reading at each status poll and the
+writer reads the cache. An intermediate part's counters are therefore as of the last poll —
+at most a second stale, understating rather than inventing, since every counter in them is
+cumulative — and spec §11 says so out loud. The last part's trailer is still exact.
+
+**The general shape of this, which is the transferable part:** adding a second caller to a
+piece of state is where an SDK's undocumented thread-safety becomes your problem, and the
+honest move is usually to move the *data* to the safe thread rather than the *call* to the
+unsafe one.
+
+### What it measures out at
+
+A live run against the reference scenario at a deliberately small 300 000-byte bound: **36
+parts, every one under the bound, all 36 `CONFORMS` on their own**, the `continues_from` /
+`continued_in` chain consistent end to end, and each part's `counts` matching the records
+actually in it. The parts land at ~292.2 KB — the bound less the 8 KiB reserve, less whatever
+the last record that did not fit would have been — which is the reserve doing exactly what it
+is for. The stop path closes at 293 285 bytes of a 300 000 bound with seven verdicts and a
+well-formed trailer, and live-versus-replay verdicts over that size-limited capture are still
+byte-identical.

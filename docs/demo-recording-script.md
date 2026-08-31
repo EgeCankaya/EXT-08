@@ -1,9 +1,18 @@
 # EXT-08 — shooting script for the 5-minute demo recording (BTB-DOC-2)
 
-> **Shot on 2026-08-31 against producer 0.8.0.** All seven beats below were captured across
-> four takes; what remains of BTB-DOC-2 is the edit and a link to the finished file from
-> `README.md` §"Reproducing the evidence". This document is kept as the record of what was
-> filmed and how to reshoot any take. Results are in §10.
+> **Shot on 2026-08-31 against producer 0.8.0, and [published as its four takes](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing).**
+> All seven beats below were captured; the README's §"Reproducing the evidence" links them with
+> a beat-by-take map. **BTB-DOC-2 is delivered** — its criterion is that the recording *shows*
+> the seven beats, and it does. There is no single assembled cut, and the README says so rather
+> than implying otherwise.
+>
+> The takes predate producer **0.9.0** (BTB-CAP-6), which none of the seven beats exercises —
+> every command below behaves identically on 0.9.0, and the only visible difference is the
+> `producer.version` string in a capture header and the two keys beside it. Nothing was reshot
+> to change a version string.
+>
+> This document is kept as the record of what was filmed and how to reshoot any take. Results
+> are in §10.
 
 BTB-DOC-2 was the last undelivered P1 requirement. Everything it must show is scripted and
 runnable, which is what made it shootable in an afternoon.

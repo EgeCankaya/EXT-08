@@ -66,6 +66,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -130,6 +131,7 @@ constexpr const char* kUsage =
     "                   --out-dir <dir> [--run-label <label>]\n"
     "                   [--entity-state-message <name>] [--engine-state-message <name>]\n"
     "                   [--queue-size <n>] [--overflow-policy <drop_newest|drop_oldest>]\n"
+    "                   [--capture-max-bytes <n>] [--on-size-limit <stop|rotate>]\n"
     "                   [--capture-max-samples <n>] [--conditions <file>]\n"
     "       n8ro-bridge --replay <capture> --conditions <file> [--out-dir <dir>]\n"
     "\n"
@@ -154,9 +156,19 @@ constexpr const char* kUsage =
     "                           Overflow is counted into trailer.drops.samples_not_recorded.\n"
     "  --overflow-policy        drop_newest (default) or drop_oldest. block is not offered;\n"
     "                           ask for it to be told why.\n"
+    "  --capture-max-bytes      maximum size of one capture file, in bytes (BTB-CAP-6).\n"
+    "                           Default 0, meaning no bound. The limit and the action below\n"
+    "                           are written into the capture's own header. A record is\n"
+    "                           either written whole or not at all - no line is ever cut.\n"
+    "  --on-size-limit          what to do on reaching --capture-max-bytes: stop (default)\n"
+    "                           closes the capture with a well-formed trailer carrying\n"
+    "                           end_reason=size_limit; rotate closes this part the same way\n"
+    "                           and continues into a numbered .partNNN continuation file.\n"
+    "                           Each part is a complete, independently valid capture.\n"
     "  --capture-max-samples    stop after this many sample records and close the capture\n"
     "                           with end_reason=size_limit. Default 0, meaning no bound -\n"
-    "                           a live run ends on host loss.\n"
+    "                           a live run ends on host loss. A record-count safety bound,\n"
+    "                           counted across the whole run; it always stops, never rotates.\n"
     "  --conditions             JSON file of declared conditions. Verdicts are written into\n"
     "                           the capture and into verdicts-<scenario>-<run-label>.jsonl\n"
     "                           beside it. Without it the bridge records but judges nothing.\n"
@@ -175,6 +187,8 @@ struct Options {
     std::size_t queueSize = kDefaultQueueSize;
     OverflowPolicy overflowPolicy = OverflowPolicy::DropNewest;
     std::size_t captureMaxSamples = 0;   // 0 = unbounded
+    std::uint64_t captureMaxBytes = 0;   // 0 = unbounded (BTB-CAP-6)
+    SizeLimitAction onSizeLimit = SizeLimitAction::Stop;
     std::string conditionsPath;
     std::string replayPath;
 
@@ -240,6 +254,16 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
             if (!parseCount(arg, value, true, out.captureMaxSamples, error)) {
                 return false;
             }
+        } else if (arg == "--capture-max-bytes") {
+            std::size_t bytes = 0;
+            if (!parseCount(arg, value, true, bytes, error)) {
+                return false;
+            }
+            out.captureMaxBytes = static_cast<std::uint64_t>(bytes);
+        } else if (arg == "--on-size-limit") {
+            if (!parseSizeLimitAction(value, out.onSizeLimit, error)) {
+                return false;
+            }
         } else if (arg == "--conditions") {
             out.conditionsPath = value;
         } else if (arg == "--replay") {
@@ -287,6 +311,18 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
     }
     if (out.outDir.empty()) {
         error = "--out-dir is required";
+        return false;
+    }
+    // A bound smaller than the space held back to close a file cannot be honoured: the header
+    // alone would exceed it, and every part would be a header and a trailer. Named here
+    // rather than discovered as a directory full of empty captures.
+    if (out.captureMaxBytes != 0 &&
+        out.captureMaxBytes < 2 * CaptureWriter::kCloseReserveBytes) {
+        error = "--capture-max-bytes must be at least " +
+                std::to_string(2 * CaptureWriter::kCloseReserveBytes) +
+                " bytes; a capture's header is a few kilobytes on its own and " +
+                std::to_string(CaptureWriter::kCloseReserveBytes) +
+                " bytes are reserved to close the file cleanly";
         return false;
     }
     if (out.entityStateMessage.empty() || out.engineStateMessage.empty()) {
@@ -412,16 +448,40 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                      const n8ro::sim::MessageBusPackedMetricsSnapshot& metrics,
                      const n8ro::core::IMessageBus::Statistics& busStats, EndReason endReason) {
     std::printf("\n=== run summary =========================================================\n");
-    std::printf("capture     %s\n", writer.path().empty() ? "(none written)" : writer.path().c_str());
+    const std::vector<std::string>& parts = writer.parts();
+    if (parts.size() <= 1) {
+        std::printf("capture     %s\n",
+                    writer.path().empty() ? "(none written)" : writer.path().c_str());
+    } else {
+        // A rotated run. The count comes first, because an operator told only about the last
+        // part would think the rest had been lost. The list is elided in the middle rather
+        // than printed whole: an overnight run can produce hundreds of parts, and a summary
+        // that scrolls its own first line off the screen has stopped being a summary. The
+        // names are derivable - they are the first name with .partNNN interposed - and the
+        // set is walkable from `continued_in` in any case.
+        constexpr std::size_t kPartsShownEachEnd = 3;
+        std::printf("capture     %zu parts, each a complete capture:\n", parts.size());
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (parts.size() > 2 * kPartsShownEachEnd + 1 && i == kPartsShownEachEnd) {
+                std::printf("            ... %zu more ...\n",
+                            parts.size() - 2 * kPartsShownEachEnd);
+                i = parts.size() - kPartsShownEachEnd - 1;
+                continue;
+            }
+            std::printf("            part %03zu  %s\n", i, parts[i].c_str());
+        }
+    }
     std::printf("end_reason  %s\n", endReasonName(endReason));
+    // Run-wide. The trailer's own `counts` is per file, which is what the format specifies
+    // it to mean; an operator asking what a run recorded means the whole run.
     std::printf("records     %llu written (segments=%llu samples=%llu entity_add=%llu "
                 "entity_remove=%llu verdicts=%llu)\n",
                 static_cast<unsigned long long>(writer.recordsWritten()),
-                static_cast<unsigned long long>(writer.counts().segments),
-                static_cast<unsigned long long>(writer.counts().samples),
-                static_cast<unsigned long long>(writer.counts().entitiesAdded),
-                static_cast<unsigned long long>(writer.counts().entitiesRemoved),
-                static_cast<unsigned long long>(writer.counts().verdicts));
+                static_cast<unsigned long long>(writer.runCounts().segments),
+                static_cast<unsigned long long>(writer.runCounts().samples),
+                static_cast<unsigned long long>(writer.runCounts().entitiesAdded),
+                static_cast<unsigned long long>(writer.runCounts().entitiesRemoved),
+                static_cast<unsigned long long>(writer.runCounts().verdicts));
     // Per segment, min to max. Not first-written to last-written: a complete live run ends
     // with a teardown reload whose clock has been reset (spec 5.1), so a file-wide
     // first-to-last pair reads 0.0 -> 0.0 on every such run and hides the whole run behind
@@ -456,10 +516,20 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                     writer.lastRecordSimTimeS());
         for (const auto& span : spans) {
             if (span.samples == 0) {
-                std::printf("            segment %llu: no samples\n",
-                            static_cast<unsigned long long>(span.ordinal));
-            } else {
+                std::printf("            segment %llu: no samples%s\n",
+                            static_cast<unsigned long long>(span.ordinal),
+                            parts.size() <= 1 ? "" : " (see part above)");
+            } else if (parts.size() <= 1) {
                 std::printf("            segment %llu: %llu samples, %.6f -> %.6f s\n",
+                            static_cast<unsigned long long>(span.ordinal),
+                            static_cast<unsigned long long>(span.samples), span.minSimTimeS,
+                            span.maxSimTimeS);
+            } else {
+                // Ordinals restart at 0 in each part, so the part has to be named with them
+                // or two different segments read as one.
+                std::printf("            part %03llu segment %llu: %llu samples, "
+                            "%.6f -> %.6f s\n",
+                            static_cast<unsigned long long>(span.part),
                             static_cast<unsigned long long>(span.ordinal),
                             static_cast<unsigned long long>(span.samples), span.minSimTimeS,
                             span.maxSimTimeS);
@@ -513,10 +583,10 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                 static_cast<unsigned long long>(writer.counts().unloadNoiseIgnored));
 
     std::printf("\n-- after the end, not loss (log only, never in the file) ------------------\n");
-    std::printf("shutdown window  samples=%llu events=%llu   past the budget: samples=%llu\n",
+    std::printf("shutdown window  samples=%llu events=%llu   past a bound: records=%llu\n",
                 static_cast<unsigned long long>(queue.samplesAfterClose),
                 static_cast<unsigned long long>(queue.structuralAfterClose),
-                static_cast<unsigned long long>(writer.samplesAfterBudget()));
+                static_cast<unsigned long long>(writer.recordsPastBound()));
 
     std::printf("\n-- handler cost (BTB-BP-1: p50<20us p95<100us p99<500us) ------------------\n");
     std::printf("entity-state %s\n", stateTiming.summary().c_str());
@@ -707,8 +777,24 @@ int run(const Options& options) {
     // reader ever needs them to interpret a line.
     header.schemas.push_back(resolution.entityState);
 
+    // An intermediate part's trailer is written by the writer thread, mid-run, when nothing
+    // is there to hand it the platform's counters. This is where they come from instead: the
+    // main loop already reads them once per status line, and stores the reading here.
+    //
+    // It is a cache rather than a direct read on purpose. RecordQueue::counters() is
+    // mutex-guarded and would be safe to call from the writer thread, but nothing establishes
+    // that for MessageBusPacked::metricsSnapshot() or IMessageBus::getStatistics(), and
+    // reaching into the SDK off the main thread to fill in a counter would trade a real
+    // invariant for a cosmetic one. The cost is that a rotated part's `bus_metrics` and
+    // `drops` are as of the last status poll rather than the instant of the rotation - stated
+    // in docs/capture-format-v1.md section 11 so a reader is not misled by it. The final
+    // part's trailer is exact, as it has always been.
+    std::mutex busSnapshotMutex;
+    TrailerState busSnapshot;
+
     CaptureWriter writer(
         outDir, options.runLabel, header, resolution.entityState, options.captureMaxSamples,
+        options.captureMaxBytes, options.onSizeLimit,
         // attached_mid_run, evaluated once when the file is opened. Derived from what the
         // message stream contained - did samples arrive for entities whose creation we never
         // saw - and never from a clock or a status tick (BTB-CAP-3).
@@ -720,7 +806,12 @@ int run(const Options& options) {
         },
         // Only used to name the file when the bridge attached mid-run and has therefore never
         // seen a scenario_loaded. A local read on the client; nothing here touches the bus.
-        [&client] { return client->getLoadedScenarioName().value_or(std::string{}); });
+        [&client] { return client->getLoadedScenarioName().value_or(std::string{}); },
+        // Runs on the writer thread, at a rotation. Reads only the cache above.
+        [&busSnapshotMutex, &busSnapshot] {
+            const std::lock_guard<std::mutex> lock(busSnapshotMutex);
+            return busSnapshot;
+        });
 
     if (!conditions.empty()) {
         // Driven on the writer thread, from the same record stream in the same order, so a
@@ -980,6 +1071,28 @@ int run(const Options& options) {
             const n8ro::sim::MessageBusPackedMetricsSnapshot metrics = packed.metricsSnapshot();
             const n8ro::core::IMessageBus::Statistics busStats = bus->getStatistics();
             const QueueCounters qc = queue.counters();
+
+            // Feed the rotation-trailer cache from the reading just taken. Free - these four
+            // objects were fetched for the status line regardless.
+            {
+                TrailerState fresh;
+                fresh.drops.samplesNotRecorded = qc.samplesDropped;
+                fresh.drops.eventsNotRecorded = qc.structuralDropped;
+                fresh.drops.samplesOrphaned = snap.counters.samplesOrphaned;
+                fresh.drops.samplesUnnamed = snap.counters.samplesUnnamed;
+                fresh.drops.samplesUntimed = snap.counters.samplesUntimed;
+                fresh.busMetrics.schemaHashDrops = metrics.schemaHashDrops;
+                fresh.busMetrics.messageIdDrops = metrics.messageIdDrops;
+                fresh.busMetrics.decodeFailures = metrics.decodeFailures;
+                fresh.busMetrics.missingSchemaPassthrough = metrics.missingSchemaPassthrough;
+                fresh.busMetrics.legacyPayloadPassthrough = metrics.legacyPayloadPassthrough;
+                fresh.busMetrics.messagesDropped = busStats.messagesDropped;
+                fresh.busMetrics.droppedByBackpressure = busStats.droppedByBackpressure;
+                fresh.busMetrics.droppedByQueueOverflow = busStats.droppedByQueueOverflow;
+                fresh.busMetrics.droppedByRateLimiting = busStats.droppedByRateLimiting;
+                const std::lock_guard<std::mutex> lock(busSnapshotMutex);
+                busSnapshot = fresh;
+            }
 
             const std::string engineState = client->getEngineState();
             const std::optional<std::string> scenario = client->getLoadedScenarioName();

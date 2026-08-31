@@ -164,6 +164,23 @@ std::string writeHeader(const HeaderInfo& info) {
     appendUintMember(out, "queue_size", info.subscription.queueSize);
     out.push_back('}');
 
+    // BTB-CAP-6: "the limit and the chosen action are stated in the README and in the
+    // `header`". Both bounds are written whether or not they are set, because 0 is a fact
+    // about the run - it says the file ends where the run ended and not where a budget did.
+    appendKey(out, "limits");
+    out.push_back('{');
+    appendUintMember(out, "max_bytes", info.limits.maxBytes);
+    appendUintMember(out, "max_samples", info.limits.maxSamples);
+    appendStringMember(out, "on_size_limit", info.limits.onSizeLimit);
+    out.push_back('}');
+
+    // Rotation linkage. `part` is always written; `continues_from` only when there is a
+    // previous part, so its absence on part 0 is the ordinary case rather than a missing key.
+    appendUintMember(out, "part", info.part);
+    if (!info.continuesFrom.empty()) {
+        appendStringMember(out, "continues_from", info.continuesFrom);
+    }
+
     // Sorted by message name. The registry's own order is not specified, and a header whose
     // bytes depend on it would break byte-for-byte comparison of two identical runs on a
     // detail that has nothing to do with the simulation (BTB-CAP-3).
@@ -270,7 +287,8 @@ std::string writeEntityRemove(double simTimeS, std::uint64_t segment, const std:
 
 std::string writeTrailer(double simTimeS, const std::string& endReason,
                          const TrailerCounts& counts, const TrailerDrops& drops,
-                         const TrailerBusMetrics& busMetrics) {
+                         const TrailerBusMetrics& busMetrics,
+                         const std::string& continuedIn) {
     std::string out;
     openRecord(out, "trailer");
     appendDoubleMember(out, "sim_time_s", simTimeS);
@@ -313,6 +331,14 @@ std::string writeTrailer(double simTimeS, const std::string& endReason,
     appendUintMember(out, "dropped_by_queue_overflow", busMetrics.droppedByQueueOverflow);
     appendUintMember(out, "dropped_by_rate_limiting", busMetrics.droppedByRateLimiting);
     out.push_back('}');
+
+    // Last key, and written only when a next part exists. A reader that finds it knows this
+    // trailer ends a file and not the run - which is the difference between a capture that
+    // stopped and a capture that was cut, and the only place that difference can be recorded
+    // (BTB-CAP-6).
+    if (!continuedIn.empty()) {
+        appendStringMember(out, "continued_in", continuedIn);
+    }
 
     out.push_back('}');
     return out;
