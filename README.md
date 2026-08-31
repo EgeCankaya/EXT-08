@@ -577,7 +577,7 @@ reintroduce: unordered-map iteration, locale-dependent float formatting, and uno
 containers. It also carries **golden lines** — the exact bytes of an `entity_remove`, a
 `segment_open`, the header's opening keys, the `limits` and rotation keys a bounded capture
 carries (spec §6.6, §6.7), and a trailer with and without `continued_in` — so that after the
-format freeze, changing a record's spelling means editing a test that says "these bytes".
+format freeze, changing a record's spelling means editing a test that says "these bytes". It also carries **BTB-CAP-4's schema-growth check**: a field inserted into the middle of a schema must appear in the `sample` record in the position the schema declares, with no code change — which is the half of UAC-BTB-CAP-4 that needs no simulator.
 
 The locale check is the one that earns its keep. `%.17g` is round-trip exact and *silently*
 locale-dependent, and this machine's locale is comma-decimal, so the test runs for real rather
@@ -592,7 +592,7 @@ cl /std:c++17 /EHsc /W4 /O2 ^
 determinism_test.exe
 ```
 
-24 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
+29 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
 — is `tests\determinism\replay_hashes.ps1`; see [Reproducing the
 evidence](#reproducing-the-evidence).
 
@@ -724,7 +724,7 @@ The captures the shoot produced are committed in `captures/` under the `demo`, `
 ```cmd
 build\tests\entity_picture_test.exe     :: 72 checks - the roster and ADR-6
 build\tests\referee_test.exe            :: 93 checks - the three condition kinds
-build\tests\determinism_test.exe        :: 24 checks - R4's three hazards, the locale, golden bytes
+build\tests\determinism_test.exe        :: 29 checks - R4's hazards, the locale, golden bytes, CAP-4
 build\tests\capture_reader.exe docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
     --spec docs\capture-format-v1.md     :: the format spec, checked against a real file
 python tests\capture-reader\mutate.py docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^

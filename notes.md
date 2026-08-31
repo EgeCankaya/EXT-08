@@ -1720,7 +1720,7 @@ Plus a set of **golden lines** — the exact bytes of an `entity_remove`, a `seg
 the header's opening keys. After the format freeze those are the friction that makes changing
 the spelling a deliberate act rather than an accident.
 
-24 checks, and the locale one is the one that earns its keep.
+29 checks, and the locale one is the one that earns its keep.
 
 ### The evidence pack, and the one deliverable that is not here
 
