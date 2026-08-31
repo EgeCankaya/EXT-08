@@ -56,6 +56,7 @@
 #include <messaging/packed/MessageBusPacked.h>
 #include <messaging/packed/MessageBusPackedSchemaRegistry.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -421,11 +422,58 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                 static_cast<unsigned long long>(writer.counts().entitiesAdded),
                 static_cast<unsigned long long>(writer.counts().entitiesRemoved),
                 static_cast<unsigned long long>(writer.counts().verdicts));
-    std::printf("sim_time    samples %.6f -> %.6f s; last record %.6f s\n",
-                writer.firstSampleSimTimeS(), writer.lastSampleSimTimeS(),
-                writer.lastRecordSimTimeS());
-    std::printf("            (a last record of 0.0 is a teardown boundary - the engine resets "
-                "the clock before publishing those. Spec 5.1)\n");
+    // Per segment, min to max. Not first-written to last-written: a complete live run ends
+    // with a teardown reload whose clock has been reset (spec 5.1), so a file-wide
+    // first-to-last pair reads 0.0 -> 0.0 on every such run and hides the whole run behind
+    // its own teardown.
+    const auto& spans = writer.segmentSpans();
+    bool anySamples = false;
+    bool anyZeroSpanSegment = false;
+    double runMin = 0.0;
+    double runMax = 0.0;
+    for (const auto& span : spans) {
+        if (span.samples == 0) {
+            continue;
+        }
+        if (span.minSimTimeS == 0.0 && span.maxSimTimeS == 0.0) {
+            anyZeroSpanSegment = true;
+        }
+        if (!anySamples) {
+            runMin = span.minSimTimeS;
+            runMax = span.maxSimTimeS;
+            anySamples = true;
+        } else {
+            runMin = (std::min)(runMin, span.minSimTimeS);
+            runMax = (std::max)(runMax, span.maxSimTimeS);
+        }
+    }
+    if (!anySamples) {
+        std::printf("sim_time    no samples recorded; last record %.6f s\n",
+                    writer.lastRecordSimTimeS());
+    } else {
+        std::printf("sim_time    samples %.6f -> %.6f s across %zu segment%s; last record %.6f s\n",
+                    runMin, runMax, spans.size(), spans.size() == 1 ? "" : "s",
+                    writer.lastRecordSimTimeS());
+        for (const auto& span : spans) {
+            if (span.samples == 0) {
+                std::printf("            segment %llu: no samples\n",
+                            static_cast<unsigned long long>(span.ordinal));
+            } else {
+                std::printf("            segment %llu: %llu samples, %.6f -> %.6f s\n",
+                            static_cast<unsigned long long>(span.ordinal),
+                            static_cast<unsigned long long>(span.samples), span.minSimTimeS,
+                            span.maxSimTimeS);
+            }
+        }
+    }
+    // Only when the file actually contains the thing being explained. A run ended by Ctrl-C
+    // has no teardown reload and no reset clock, and a note about one there describes a
+    // record the reader is not looking at.
+    if (anyZeroSpanSegment || writer.lastRecordSimTimeS() == 0.0) {
+        std::printf("            (a segment spanning 0.0 -> 0.0, and a last record of 0.0, are the "
+                    "teardown\n             boundary - the engine resets the clock before "
+                    "publishing those. Spec 5.1)\n");
+    }
     std::printf("entities    %zu names seen, %zu occupancies open at exit\n", snap.roster.size(),
                 snap.liveCount);
     std::printf("removals    %s\n", formatCountsByName(snap.removalsByReason).c_str());

@@ -536,8 +536,14 @@ segments; all seven verdicts including the two never-met ones.
 
 Recorded plainly rather than left for the project owner to discover.
 
-- **The 5-minute demo recording (BTB-DOC-2).** Needs a person and a screen recorder. Everything
-  it is meant to show is scripted and runnable, and the README names the command for each beat.
+> **This list is as it stood at the close of M7.** The first entry has since been partly
+> discharged — see the note under it, and PRD rev 10.
+
+- **~~The 5-minute demo recording (BTB-DOC-2).~~ Shot on 2026-08-31; only the edit remains.**
+  All seven beats were captured across four takes against producer 0.8.0, following
+  `docs/demo-recording-script.md`, which is both the shooting script and the record of what was
+  filmed. Shooting it also exposed and fixed a reporting defect in the run summary and the
+  conformance reader (PRD rev 10 (b)); no capture byte changed and the format stays frozen.
 - **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
   count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
   stop-or-rotate choice, and neither is stated in the `header` as the FR requires. It is P2 and

@@ -4,7 +4,7 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 through M7 — complete, bar one P2 requirement and the demo recording.** The bridge registers the packed schemas, resolves **four** topics
+**Status: M1 through M7 — complete, bar one P2 requirement. The demo recording is shot and awaiting its cut**: all seven BTB-DOC-2 beats were captured against this build, following [`docs/demo-recording-script.md`](docs/demo-recording-script.md). The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
 subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
 streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
@@ -35,9 +35,13 @@ an edit.
 - **BTB-CAP-6, the byte-limited capture (P2).** `--capture-max-samples` bounds a run by record
   count, which is a safety bound and not CAP-6: there is no size limit in bytes, no
   stop-or-rotate choice, and neither is stated in the `header` as the requirement asks.
-- **The 5-minute demo recording (BTB-DOC-2).** It needs a person and a screen recorder.
-  Everything it should show is scripted and runnable — see [Reproducing the
-  evidence](#reproducing-the-evidence) for the command behind each beat.
+- **The cut of the 5-minute demo recording (BTB-DOC-2).** The material exists: all seven beats
+  the requirement names — start-before-simulator, a scenario load, a reload producing two
+  segments, an entity removal, a verdict firing, the backpressure demonstration, and a Ctrl-C
+  with a clean tail — were recorded across four takes against this build.
+  [`docs/demo-recording-script.md`](docs/demo-recording-script.md) is the script they were shot
+  from and names the command behind every beat. What is outstanding is the edit and a link to
+  the finished file from [Reproducing the evidence](#reproducing-the-evidence).
 
 `docs/decisions-m5-m7.md` records every judgment call made across M5–M7, with what it turned on
 and what would reverse it.
@@ -627,7 +631,9 @@ the capture format are in [`notes.md`](notes.md).
 
 Everything the project claims is re-runnable with one command. The scripts are in the
 repository so a result is checkable rather than asserted, and so the 5-minute demo recording
-(the one deliverable that needs a person) has a script to follow.
+had a script to follow: [`docs/demo-recording-script.md`](docs/demo-recording-script.md) is
+that script — four takes, the command behind each of BTB-DOC-2's seven beats, and what to say
+over them.
 
 Each of these assumes a shell that has run `C:\N8RO\setup.cmd`.
 
