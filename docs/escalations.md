@@ -139,8 +139,9 @@ the implementer without an answer.
 
 For completeness, since a reader may expect them here:
 
-- **The 5-minute demo recording** is not delivered. It needs a person and a screen recorder, not
-  a decision. Every beat it should show is scripted and the README names the command for each.
+- **The 5-minute demo recording** is shot; its edit is outstanding. All seven beats were
+  captured on 2026-08-31 following `docs/demo-recording-script.md`. Never a decision, and not
+  one now either.
 - **BTB-CAP-6** (byte-limited capture, P2) is unimplemented. It is a known, recorded gap inside
   EXT-08's own scope — see `docs/decisions-m5-m7.md` D-37.
 - **OQ-2's mentor confirmation.** The headless invocation is demonstrated to work

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -515,8 +516,20 @@ int validate(const std::string& capturePath, const std::string& specPath) {
     // no sample for an (entity, occupancy) pair after that pair's entity_remove.
     std::set<std::pair<std::string, long long>> closedOccupancies;
 
-    double firstSimTime = 0.0;
-    double lastSimTime = 0.0;
+    // Sample simulation time, min to max, per segment.
+    //
+    // Deliberately not first-record-to-last-record. Every record carries `sim_time_s`, and a
+    // complete run's first and last records are segment boundaries - the last of which follows
+    // a teardown reload whose clock has been reset to 0 (spec 5.1). A first-to-last pair
+    // therefore reads "0 -> 0" for a file holding a whole run, which tells a reader the
+    // opposite of the truth. Per segment, over `sample` records only, says what the file
+    // actually holds and shows the clock reset as its own segment.
+    struct SampleSpan {
+        std::uint64_t samples = 0;
+        double minSimTime = 0.0;
+        double maxSimTime = 0.0;
+    };
+    std::map<long long, SampleSpan> sampleSpans;
     bool haveSimTime = false;
     std::set<std::string> entities;
     std::set<std::pair<std::string, long long>> occupancies;
@@ -723,15 +736,13 @@ int validate(const std::string& capturePath, const std::string& specPath) {
         const Value* simTimeValue = record.member("sim_time_s");
         double simTime = 0.0;
         bool simTimeNonFinite = false;
+        bool simTimeOk = false;
         if (simTimeValue == nullptr || !readDoubleValue(*simTimeValue, simTime, simTimeNonFinite)) {
             report.fail(lineNumber, "spec 5", "record of type `" + type +
                                                   "` has no readable `sim_time_s`");
         } else {
-            if (!haveSimTime) {
-                firstSimTime = simTime;
-                haveSimTime = true;
-            }
-            lastSimTime = simTime;
+            simTimeOk = true;
+            haveSimTime = true;
         }
 
         long long segment = -1;
@@ -746,6 +757,18 @@ int validate(const std::string& capturePath, const std::string& specPath) {
         }
 
         scanForWallClock(record, type, lineNumber, report, wallClockHits);
+
+        if (type == "sample" && simTimeOk) {
+            SampleSpan& span = sampleSpans[segment];
+            if (span.samples == 0) {
+                span.minSimTime = simTime;
+                span.maxSimTime = simTime;
+            } else {
+                span.minSimTime = std::min(span.minSimTime, simTime);
+                span.maxSimTime = std::max(span.maxSimTime, simTime);
+            }
+            ++span.samples;
+        }
 
         if (type == "segment_open") {
             ++totals.segmentOpen;
@@ -1167,8 +1190,40 @@ int validate(const std::string& capturePath, const std::string& specPath) {
               << " entity_remove=" << totals.entityRemove << " sample=" << totals.sample
               << " verdict=" << totals.verdict << " trailer=" << totals.trailer << "\n";
     std::cout << "  lines    " << lineNumber << "\n";
-    if (haveSimTime) {
-        std::printf("  sim_time %.10g -> %.10g s\n", firstSimTime, lastSimTime);
+    if (haveSimTime && !sampleSpans.empty()) {
+        bool first = true;
+        bool anyZeroSpanSegment = false;
+        double runMin = 0.0;
+        double runMax = 0.0;
+        for (const auto& entry : sampleSpans) {
+            if (entry.second.samples == 0) {
+                continue;
+            }
+            if (entry.second.minSimTime == 0.0 && entry.second.maxSimTime == 0.0) {
+                anyZeroSpanSegment = true;
+            }
+            if (first) {
+                runMin = entry.second.minSimTime;
+                runMax = entry.second.maxSimTime;
+                first = false;
+            } else {
+                runMin = std::min(runMin, entry.second.minSimTime);
+                runMax = std::max(runMax, entry.second.maxSimTime);
+            }
+        }
+        std::printf("  sim_time %.10g -> %.10g s over %zu segment(s), samples only\n", runMin,
+                    runMax, sampleSpans.size());
+        for (const auto& entry : sampleSpans) {
+            std::printf("           segment %lld: %llu samples, %.10g -> %.10g s\n", entry.first,
+                        static_cast<unsigned long long>(entry.second.samples),
+                        entry.second.minSimTime, entry.second.maxSimTime);
+        }
+        // Only when such a segment is actually present. A capture ended by Ctrl-C mid-run has
+        // no teardown reload, and explaining one there points at a record that is not here.
+        if (anyZeroSpanSegment) {
+            std::printf("           (a segment spanning 0 -> 0 is the teardown reload; the engine "
+                        "resets\n            the clock before publishing those - spec 5.1)\n");
+        }
     }
     std::cout << "  entities " << entities.size() << " distinct names, " << occupancies.size()
               << " distinct (name, occupancy) pairs\n";

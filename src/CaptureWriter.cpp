@@ -207,6 +207,9 @@ void CaptureWriter::openSegment(const std::string& scenario, double simTimeS) {
     segmentOpen_ = true;
     currentScenario_ = scenario;
     ++counts_.segments;
+    // One span per segment, opened empty. It stays empty if the segment carries no samples,
+    // which the summary reports as such rather than as a 0.0 -> 0.0 range it never observed.
+    segmentSpans_.push_back(SegmentSpan{segmentOrdinal_, 0, 0.0, 0.0});
     emit(capture::writeSegmentOpen(simTimeS, segmentOrdinal_, currentScenario_));
     flushStaging();
 }
@@ -345,11 +348,17 @@ void CaptureWriter::apply(const CaptureRecord& record) {
             presence_.note(record.values);
             ++counts_.samples;
             samplesWritten_.fetch_add(1);
-            if (!haveFirstSample_) {
-                firstSampleSimTimeS_ = record.simTimeS;
-                haveFirstSample_ = true;
+            if (!segmentSpans_.empty()) {
+                SegmentSpan& span = segmentSpans_.back();
+                if (span.samples == 0) {
+                    span.minSimTimeS = record.simTimeS;
+                    span.maxSimTimeS = record.simTimeS;
+                } else {
+                    span.minSimTimeS = (std::min)(span.minSimTimeS, record.simTimeS);
+                    span.maxSimTimeS = (std::max)(span.maxSimTimeS, record.simTimeS);
+                }
+                ++span.samples;
             }
-            lastSampleSimTimeS_ = record.simTimeS;
             emit(capture::writeSample(record, segmentOrdinal_, stateSchema_));
             lastRecordSimTimeS_ = record.simTimeS;
             lastDataSimTimeS_ = record.simTimeS;

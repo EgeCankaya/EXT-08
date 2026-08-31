@@ -133,9 +133,23 @@ public:
     [[nodiscard]] const WriterCounts& counts() const { return counts_; }
     [[nodiscard]] bool failed() const { return failed_; }
     [[nodiscard]] std::vector<std::string> neverPublishedFields() const;
-    [[nodiscard]] double firstSampleSimTimeS() const { return firstSampleSimTimeS_; }
-    [[nodiscard]] double lastSampleSimTimeS() const { return lastSampleSimTimeS_; }
     [[nodiscard]] double lastRecordSimTimeS() const { return lastRecordSimTimeS_; }
+
+    // The simulation-time span of the samples in one segment, min to max.
+    //
+    // Reported per segment rather than as a single file-wide first-to-last pair. A complete
+    // live run always ends with a teardown reload whose clock has been reset to 0 (spec 5.1),
+    // so the last sample written is 0.0 on every such run and a "first written -> last
+    // written" line reads 0.0 -> 0.0 however long the run was - hiding the entire run behind
+    // its own teardown. min/max per segment says what actually happened and makes the reset
+    // visible as its own segment.
+    struct SegmentSpan {
+        std::uint64_t ordinal = 0;
+        std::uint64_t samples = 0;
+        double minSimTimeS = 0.0;
+        double maxSimTimeS = 0.0;
+    };
+    [[nodiscard]] const std::vector<SegmentSpan>& segmentSpans() const { return segmentSpans_; }
 
     // Turns a scenario name into the filename component: lowercase, runs of anything outside
     // [a-z0-9] collapsed to one hyphen, ends trimmed. Total, deterministic, and derived from
@@ -185,9 +199,7 @@ private:
 
     capture::FieldPresence presence_;
     WriterCounts counts_;
-    double firstSampleSimTimeS_ = 0.0;
-    double lastSampleSimTimeS_ = 0.0;
-    bool haveFirstSample_ = false;
+    std::vector<SegmentSpan> segmentSpans_;
     double lastRecordSimTimeS_ = 0.0;
 
     // The last record that carried data rather than a boundary. End-of-run verdicts are
