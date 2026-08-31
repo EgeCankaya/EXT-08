@@ -475,7 +475,7 @@ cl /std:c++17 /EHsc /W4 /O2 ^
 entity_picture_test.exe
 ```
 
-Exit code 0 if every check passes, 1 otherwise with each failure named. 62 checks covering
+Exit code 0 if every check passes, 1 otherwise with each failure named. 72 checks covering
 occupancy lifecycle (ADR-6), orphan counting, verbatim reasons and payloads, absent-field
 accounting, deterministic ordering, the bounded event log, and concurrent handler/snapshot
 traffic.
@@ -730,7 +730,7 @@ trailer. The result still reports CONFORMS, which is the check that it stayed va
 - **all 132 `entity_add` and 90 `entity_remove` records**, with reasons verbatim
 - **all seven verdicts**, including the two never-met ones
 
-Its header says `producer 0.6.0` because that is the build that recorded it. That is accurate
+Its header says `producer 0.5.0` because that is the build that recorded it. That is accurate
 rather than tidy: the file is a real artifact of a real run, not a regenerated one, and §16 of
 the format spec carries the producer version history.
 

@@ -2,8 +2,8 @@
 
 > **One-liner:** A standalone C++17 console program that connects to a running N8RO simulation over the message bus and turns the published stream into a durable, versioned, self-describing capture file plus a pass/fail verdict — so a run can be analysed, and re-judged, long after it has ended.
 
-**Date:** 2026-08-30
-**Revision:** 8 — M7 delivered. R1 closed, R8 resolved, OQ-2 answered by observation, format frozen. See §"Revision history".
+**Date:** 2026-08-31
+**Revision:** 9 — post-delivery audit against [S1]. No requirement changed; provenance, citations, the CLI table and the effort record corrected. See §"Revision history".
 **Status:** Draft
 **Owner:** EXT-08 implementer
 **DRI:** egemencankaya14@gmail.com
@@ -16,13 +16,14 @@
 | Rev | Date | Change |
 |----:|------|--------|
 | 1 | 2026-08-30 | Initial PRD. |
+| 9 | 2026-08-31 | **Audit of the delivered work against [S1], read directly off disk. No requirement, acceptance criterion or record type changed; the capture format stays frozen at `n8ro-capture/1`.** Seven corrections, all to this document's account of itself. **(a) Determinism provenance stated.** [S1] contains no determinism language of any kind; BTB-CAP-3 came from [S2]. G4 and the success-metrics table had never been updated to match rev 5's scoping, so this document asserted the strong form in two places and the scoped form in a third — G4 and the metric now agree with BTB-CAP-3, and rev 5's entry says where the requirement came from. **(b) BTB-EP-3's rev-2 entry rewritten.** It described correcting a brief-traced criterion; it was correcting an over-specification of *ours*. [S1]'s actual words are "nothing lingers in the output after a body is gone", which the occupancy model satisfies. **(c) The output-shape choice re-cited to [S1]** — "Choose an output that someone would want" authorises it directly; attributing it to [S3] made an authorised choice read as an assumed one. **(d) "[S1] rule 6" does not exist** — [S1] has five rules; backpressure is step 6. BTB-BP-3/BP-4 re-cited. **(e) The CLI authority table disagreed with the binary in both directions** — it listed `--log-level`, which has never been accepted, and omitted four options that are. Corrected, with `--capture-max-samples` explicitly distinguished from the unimplemented BTB-CAP-6. **(f) [S1] acceptance criterion 2 had no trace**; the eight criteria are now mapped explicitly at the end of Appendix A. **(g) The effort record withdrawn.** No elapsed effort was ever measured, so "9–10 working days", M3's "inside budget" and H3's "validated by milestone burn-down" were estimates presented as measurements. The milestone figures are relabelled as estimates and the unsupported claims are withdrawn; R3's closure now rests on what was actually established — the containment was never invoked. **Nothing here changes the program, and no client requirement is weakened by any of it.** Three items remain open for a person: the 5-minute recording (still not delivered), the `EntityStateSample.h` defect that [S1] and [S2] share, and whether EXT-17's byte-identical gate should be restated — the last two are not EXT-08's to close. |
 | 8 | 2026-08-31 | **M7 delivered; the two carried spikes measured; the format frozen.** **R1 closed** for the plugin-free configuration — twenty consecutive load-run-teardown cycles with the bridge attached, host and bridge both exit 0 every time, no `0xC0000005`. It says nothing about the plugin-loaded case that produced the original observation. **R8 resolved, with a more useful answer than yes or no.** OQ-2's headless invocation was answered by observation, which made the experiment possible: two runs of `n8ro-sim-app.exe` each stopped at **frame 1200** rather than after a wall-clock budget. Byte comparison fails; content comparison over running segments finds **50 358 of 50 358 samples agreeing, zero differing**. **The simulation is reproducible; its publication schedule is not.** EXT-17's step-4 gate therefore cannot be met byte-for-byte on this platform, and the property it was reaching for holds exactly — so it should key on content. Writing that comparison also corrected a claim in `docs/capture-format-v1.md` §14: `sim_time_s` is **not** a key, because a frozen-clock teardown segment carries ~93 samples per entity at one value, and such a segment cannot be aligned across runs at all. §5.1 and §14 both now say so. BTB-SD-1 verified over twenty scripted interrupt cycles. **The one requirement left unimplemented is BTB-CAP-6** (P2, byte-limited capture) — see `docs/decisions-m5-m7.md` D-37 for the full list of what is not delivered. |
 | 7 | 2026-08-31 | **OQ-4 resolved and R7 reframed, both by measurement at M6.** OQ-4 closes on `FIFO_DROP` with a bus-side queue of 1024: `BLOCK` is rejected on a principle no measurement could overturn (and `docs/capture-format-v1.md` §14 now promises consumers in writing that this producer never blocks), `FIFO_DROP` lost nothing across 136 000 samples at the overload scenario's 2 487/s, and the residual unexplained loss turns out not to bear on the choice. **R7's re-measurement falsified its own hypothesis and impeached its instrument.** Three times the message rate did not provoke the loss — the overload capture was complete by the host's own account — and the host's per-entity dump, written *inside the host process with no bus in its path*, is itself missing whole frames that our capture contains (30 at the reference rate, 203 under the overload). So the comparison bounds our completeness from one side only, and a frame-shaped gap in an in-process writer is evidence the mechanism sits upstream of any consumer. R7 stays open as a documented caveat rather than an unexplained defect. |
 | 6 | 2026-08-31 | **[S2] re-read directly, because rev 5 rewrote a requirement that traces to it without doing so.** Three corrections. (a) Rev 5 wrote M4's frame-skipping measurement up as a property of the platform; it is a property of **`n8ro-sim-local.exe`, a wall-clock-paced test driver**, and [S2] states the simulation is deterministic *by contract* and runs campaigns on the headless host in a closed configuration. The claim is narrowed here and in `docs/capture-format-v1.md` §14, and the open question becomes R8 rather than a settled fact. (b) [S2] independently confirms ADR-4's reasoning — "if a live feed or an external bridge is active, runs are reproducible only as far as that input is" — which is a second, downstream argument for never selecting `BLOCK`. (c) **[S2] carries the same `EntityStateSample.h` defect [S1] does**, listing it as the surface for "what a run publishes"; it does not exist in 2.1.328. OQ-2 escalated: it gates [S2]'s own step 4. |
-| 5 | 2026-08-31 | **BTB-CAP-3 scoped to what the recorder actually controls, after measuring it.** The requirement asked for byte-identical captures from two runs of one scenario. A determinism experiment run at M4 close-out shows that is unachievable and not for any reason inside EXT-08: `n8ro-sim-local` paces against the wall clock and skips ~1% of frames, a different ~1% each run, so two runs are not the same published stream. The requirement now binds the recorder to introducing no variation of its own, which is true, enforceable, and what EXT-17 actually needs. The same experiment found **two determinism leaks in our own output** (both fixed) and **one blind spot** — nothing in EXT-08 had ever read `IMessageBus::getStatistics()`, so every "0 drops" reported since M1 was the decoder's counter and delivery-side loss was structurally invisible. R7 added. |
+| 5 | 2026-08-31 | **BTB-CAP-3 scoped to what the recorder actually controls, after measuring it.** *First, the provenance, because it governs how this change should be read: **[S1] does not mention determinism at all** — the client brief contains no occurrence of "determinism", "byte", "identical", "reproducible" or "hash". BTB-CAP-3 was written by this project, from [S2]'s constraint (see Appendix A, which traces it to [S2] and never to [S1]). **Nothing in this revision changes a requirement the EXT-08 client asked for.*** As written at rev 1 the requirement asked for byte-identical captures from two runs of one scenario. A determinism experiment at M4 close-out shows that is unachievable, and not for any reason inside EXT-08: `n8ro-sim-local` paces against the wall clock and skips ~1% of frames, a different ~1% each run, so two runs are not the same published stream. The requirement now binds the recorder to introducing no variation of its own, which is true, enforceable, and what EXT-17 actually needs. The same experiment found **two determinism leaks in our own output** (both fixed) and **one blind spot** — nothing in EXT-08 had ever read `IMessageBus::getStatistics()`, so every "0 drops" reported since M1 was the decoder's counter and delivery-side loss was structurally invisible. R7 added. |
 | 4 | 2026-08-30 | **BTB-CAP-3's float criterion restated as the end rather than the means.** It said "17 significant digits"; seventeen digits is one way to reach round-trip exactness and naming it as the criterion excluded `std::to_chars` shortest round-trip, which reaches the same end in fewer bytes and is what OQ-5 resolved on. The criterion now states round-trip exactness, locale independence and uniqueness directly. No other requirement changed; M4 is delivered against this text. |
 | 3 | 2026-08-30 | **OQ-1 decided: we own the entity-picture layer.** The brief was checked and is silent on the question, so it did not settle it. The layer is treated as a permanent component: unit tests that need no simulator (`tests/entity-picture/`), documented invariants, and a snapshot API that cannot report a removed entity as live. No interface was added, and ADR-1 says why. |
-| 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was unsatisfiable as written** and is now scoped to an entity occupancy; `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so the criterion is checkable in the capture itself (ADR-6). BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
+| 2 | 2026-08-30 | Reconciled with delivered M1–M3. **BTB-EP-3's second acceptance criterion was over-specified at rev 1, and is corrected here — not relaxed.** [S1] asks that "entity removal is reflected: nothing lingers in the output after a body is gone." Rev 1 restated that as "no `sample` record for that entity appears after its `entity_remove`", a stricter formulation **of our own** that appears nowhere in the brief. M3 showed it is unsatisfiable on this platform, because the engine's stop path deletes and immediately re-creates the whole roster under the same names — so a name is not an identity. The criterion is now scoped to an entity **occupancy**, and `entity_add` / `entity_remove` / `sample` gain an `occupancy` field so it is checkable in the capture itself (ADR-6). **This lands closer to [S1]'s actual words than rev 1 did**: a re-created name is a new body, and nothing lingers past the body that is gone. No client requirement was weakened. BTB-EP-1 gains the topic-anchoring criterion. Performance baselines and the reference scenario filled in from M1. OQ-3 and OQ-5 resolved; OQ-1 re-targeted. R3 and R6 closed. |
 
 > Rev 2 changes the **logical capture shape** (a new field on three record types). This is
 > pre-freeze, so no format version bump is required — `n8ro-capture/1` is not frozen until M7
@@ -40,7 +41,9 @@ The boundary of this work: EXT-08 observes and judges. It does not orchestrate r
 
 **Authoritative (binding):**
 - **[S1]** `EXT-08-Bus-Telemetry-Bridge.docx` — the client brief. Output shapes, the rules the code lives under, acceptance criteria, deliverables, step order, effort target.
-- **[S3]** Verified-environment findings supplied with this request — release, toolchain, track classification, the API-availability corrections in §"Prior art and lessons learned", and the Recorder+Referee scope decision.
+- **[S3]** Verified-environment findings supplied with this request — release, toolchain, track classification, and the API-availability corrections in §"Prior art and lessons learned".
+
+> **On choosing an output shape, the authority is [S1] itself, not [S3].** The brief offers five shapes under the instruction *"Choose an output that someone would want"* — Recorder, Track exporter, Live dashboard bridge, Referee, Controller. Building two of them and deferring three is what the brief asks for, and it needs no other warrant. Earlier revisions of this document attributed the Recorder+Referee choice to [S3]; that citation was both weaker and unverifiable, and it made an authorised choice read as an assumed one. *Which* two, and why those two, is argued in §"Non-goals / deferred scope" and §"Out of scope".
 
 **Contextual (informational, not binding):**
 - **[S2]** `EXT-17-Headless-Campaign-Runner.docx` — the downstream consumer. Read to constrain EXT-08's design; its requirements are *not* in EXT-08's scope, but four of its constraints bind EXT-08's outputs (see §"Cross-service impact").
@@ -75,7 +78,7 @@ Nothing of this shape has been built against this release. What we have instead 
 - **G1 — A run becomes an artifact.** Every published entity update from a followed scenario lands in a durable capture file, stamped with the simulation time the sample carried, with any loss counted rather than silent.
 - **G2 — The artifact outlives the program that wrote it.** The capture format is versioned, self-describing, and specified field by field in a document that crosses a repo boundary. A reader can be written against the specification alone.
 - **G3 — A run can be judged, and re-judged.** Declared conditions are evaluated against the run and produce verdicts, both live and offline against a stored capture, without re-running the simulation.
-- **G4 — Identical runs produce identical captures.** Nothing EXT-08 emits varies between two runs of the same configuration.
+- **G4 — The recorder introduces no variation of its own.** Given the same sequence of published messages, EXT-08 produces byte-identical captures: no wall-clock value, no unordered iteration, no locale-dependent formatting, no scheduler-dependent counter. *This goal is deliberately scoped to what the recorder controls.* Whether two runs of one scenario publish the same message sequence is a property of the host, not of EXT-08 — measured at M7 and answered no for both hosts available here (R8). See BTB-CAP-3, which is the enforceable statement of this goal.
 - **G5 — The stream is documented.** What the bus actually carries — including what it does not carry — is written down.
 
 ### Success metrics
@@ -83,7 +86,8 @@ Nothing of this shape has been built against this release. What we have instead 
 | Metric | Baseline (current) | Target | How measured | Timeline |
 |--------|-------------------|--------|--------------|----------|
 | Published entity samples captured, as a fraction of samples delivered to the handler | 0% (no capability exists) | 100%, with zero internal-queue drops on the reference scenario at nominal rate | Capture trailer counters cross-checked against `MessageBusPacked::metricsSnapshot()` | M6 |
-| Determinism: byte-identical capture pairs from identical configurations | n/a (no capture exists) | 10 of 10 consecutive pairs | Local `fc /b` (or SHA-256) over paired capture files | M7 |
+| Determinism: byte-identical captures from one stored message sequence | n/a (no capture exists) | 10 of 10 consecutive replays of one stored capture hash identically | SHA-256 over the outputs of `tests\determinism\replay_hashes.ps1` | M7 — **met**: 10 of 10 |
+| Determinism: the emission path's three known hazards stay closed | n/a | 0 regressions on unordered-map iteration, locale-dependent float formatting, unordered output containers | `tests\determinism\determinism_test.cpp`, run on every change | M7 — **met**: 18 checks, 0 failures |
 | Offline re-judge of a stored capture without re-running | Impossible | Referee replays a 10-minute capture and emits verdicts in < 60 s | `--replay` mode timed on the reference capture | M6 |
 | Schema-decode drops on the reference scenario | **0, measured at M3** (was: never measured) | 0; any non-zero value surfaced in the log and the trailer, never silent | `metricsSnapshot().schemaHashDrops + decodeFailures + missingSchemaPassthrough` | M3 — **met**: 0 across 132 188 samples of a full load-run-teardown cycle |
 | Clean Ctrl-C shutdown with no lost tail | n/a | 20 of 20 runs: final enqueued record present in the file, exit code 0 | Scripted signal-and-verify loop | M7 |
@@ -121,7 +125,7 @@ Brief orientation only; the contract-level deferrals with dates and targets live
   *Signal: 10 consecutive identical-configuration pairs produce identical captures. Validated by: the M7 determinism harness.*
   *If false — identical runs differ in a field the engine itself published — that is a far more interesting finding than a harness bug, and it belongs in the determinism notes and in front of the mentor immediately. EXT-17's entire premise rests on it.*
 - **H3:** We believe **the entity picture is ~2–3 days of work, not a hidden two weeks**, because the decoded stream carries its own schema and the picture is a roster plus a latest-sample map, not a semantic model.
-  *Signal: M3 completes within its budget. Validated by: milestone burn-down.*
+  *Signal: M3 completes without invoking R3's containment. **Not validated by measurement** — no burn-down was recorded, so the day estimate below is untested. What is established is the weaker, sufficient claim: M3 delivered the full entity picture with BTB-REF-3's three-kind vocabulary intact, so the containment R3 defined was never needed.*
   *If false: the containment is BTB-CAP-4's verbatim-capture rule — record whatever fields the schema declares rather than mapping them onto a curated struct. See §"Rabbit holes".*
 - **H4:** We believe **the bus-level `KEEP_LATEST` default is the dominant loss source, not our writer thread**, because a 100-message subscription queue at entity-update rates will overflow long before a buffered file writer does.
   *Signal: with the bus policy set explicitly and the internal queue sized, bus-side drops fall to zero while internal drops stay at zero. Validated by: the M6 overload demonstration.*
@@ -188,9 +192,13 @@ Priorities: **P1** = required for v1 acceptance. **P2** = valuable, ship if budg
 > EXT-08 exposes no REST API and no SDK. It does expose three surfaces that EXT-17 and the analyst bind to, and drift in any of them is as damaging as endpoint drift would be. This table is the source of truth; FRs below reference it rather than restating it.
 
 **CLI surface (authority: this table).**
-- Invocation is `n8ro-bridge [options]`. Long options only, kebab-case, GNU style: `--config`, `--model-path`, `--schema-file`, `--out-dir`, `--run-label`, `--conditions`, `--replay`, `--queue-size`, `--overflow-policy`, `--log-level`.
+- Invocation is `n8ro-bridge [options]`. Long options only, kebab-case, GNU style. The complete set, which is the whole of what the binary accepts: `--config`, `--model-path`, `--schema-file`, `--out-dir`, `--run-label`, `--conditions`, `--replay`, `--queue-size`, `--overflow-policy`, `--capture-max-samples`, `--entity-state-message`, `--engine-state-message`, `--help`.
 - `--config`, `--model-path`, `--schema-file` map one-to-one onto `SimulationEngineClientConfig{simEngineConfigName, modelPath, schemaFileName}`. The names deliberately mirror the SDK struct so a reader of one can find the other.
 - `--replay <capture>` selects offline mode: no bus, no client, referee only. Live mode and replay mode are mutually exclusive and the program SHALL reject an invocation supplying both `--replay` and `--config`.
+- `--entity-state-message` and `--engine-state-message` name the **message instance** each topic is resolved *from*, never a topic string — they are the escape hatch for a database whose instances are named differently, and they preserve BTB-EP-1's rule that no topic literal exists in the codebase.
+- `--capture-max-samples` stops a run after N `sample` records and closes with `end_reason: size_limit`. It is a **record-count safety bound, not BTB-CAP-6**, which asks for a byte limit with a stop-or-rotate choice stated in the `header`; CAP-6 remains unimplemented (P2). See `docs/decisions-m5-m7.md` D-37.
+
+> *Corrected at rev 9: this table previously listed `--log-level`, which the binary has never accepted, and omitted the four options above. An authority table that disagrees with the program in both directions is worse than no table, since EXT-17 binds to it.*
 
 **File and path conventions.**
 - Capture: `<out-dir>/capture-<scenario>-<run-label>.n8rocap.jsonl`. Verdicts: `<out-dir>/verdicts-<scenario>-<run-label>.jsonl`.
@@ -860,7 +868,7 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 |------|--------|------------|------------|
 | **R1 — Host teardown reliability.** A `0xC0000005` host-side teardown access violation has been observed on this platform, with a `userPlugins/sim` plugin loaded. **CLOSED at M7 for the plugin-free configuration: it did not reproduce.** Twenty consecutive load-run-teardown cycles with the bridge attached — host exit 0 ×20, bridge exit 0 ×20, no `-1073741819` once. The spike also answers a question nobody had asked: a bus client observing the run does not perturb the teardown either | High for EXT-17: it requires 20+ unattended runs with clean teardown | ~~Medium~~ **Did not reproduce** in 20 of 20 | `tests/teardown-spike/teardown_spike.ps1` is kept so the result is re-checkable rather than a claim. **The closure is scoped:** it says nothing about the plugin-loaded case that produced the original observation, which is not a configuration EXT-08 or EXT-17 uses. BTB-CX-3 makes host loss a handled state regardless |
 | **R2 — Schema mismatch produces a plausible empty capture** | High — a silent wrong answer is the worst failure mode a recorder has | Medium — it is the most common configuration error [S1] | BTB-EP-1 (loud empty registry), BTB-OBS-1 (drop counters), BTB-OBS-2 (silent-topic warning). Three independent detections for one fault |
-| **R3 — The entity-picture work overruns its 2–3 day budget** — **CLOSED at M3, did not materialise.** Delivered inside budget; H3 validated. Containment was not invoked and BTB-REF-3 keeps its full three-kind vocabulary | Medium — pushes past the 1–2 week target | Medium — it is unbudgeted in [S1] and therefore unvalidated as an estimate | Containment is BTB-CAP-4's verbatim rule: record what the schema declares, do not model it. If M3 exceeds three days, the referee's condition vocabulary (BTB-REF-3) drops to proximity-only and the rest moves to MVP+1 |
+| **R3 — The entity-picture work overruns its 2–3 day budget** — **CLOSED at M3 on the outcome, not on a measured burn-down.** No elapsed-effort record was kept, so "inside budget" is not a claim this project can make. What is established is what the risk was actually about: the containment was never invoked, BTB-REF-3 keeps its full three-kind vocabulary, and nothing moved to MVP+1 | Medium — pushes past the 1–2 week target | Medium — it is unbudgeted in [S1] and therefore unvalidated as an estimate | Containment is BTB-CAP-4's verbatim rule: record what the schema declares, do not model it. If M3 exceeds three days, the referee's condition vocabulary (BTB-REF-3) drops to proximity-only and the rest moves to MVP+1 |
 | **R4 — A determinism leak in our own emission path** | High — silently invalidates EXT-17's foundational self-test | Medium-high — three known sources exist (unordered map, float formatting, container iteration) and all three are easy to reintroduce | BTB-CAP-3 names all three; the M7 harness is the standing check, run on every change, not once |
 | **R5 — Format churn after EXT-17 starts consuming it** | Medium — breaks a downstream repo | Medium | Freeze at end of M7; version-bump discipline in §"Migration plan"; the reader's version check makes a mismatch loud |
 | **R6 — The reference scenario turns out to be unrepresentative** (too few entities, too short, no removals) — **CLOSED at M1.** `Atacama Air Defense`: 42 entities at load, two distinct removal reasons (`destroyed`, `expended`), a natural quiescent end at t ≈ 180 s. `Outback Kamikaze Swarm` (126 entities) is retained as the M6 overload case | Medium — acceptance demos prove less than they appear to | ~~Medium — no scenario has been chosen yet~~ | Choose it in M1 against explicit criteria: multiple entities, at least one removal, a natural end, and a duration that makes the rate measurable |
@@ -990,39 +998,41 @@ Any rollback that touches the format after the M7 freeze is communicated to the 
 
 Milestone order follows [S1]'s prescribed step order deliberately: observe, then minimal client, then subscribe, then output, then lifecycle, then backpressure, then shutdown. Effort target 1–2 weeks total [S1].
 
-### M1 — Watch the traffic (0.5 day) — **delivered**
+> **The day figures below are the estimates made when this plan was written. They are not a record of elapsed effort — none was kept, and no burn-down was measured.** They are retained because they document what the work was expected to cost, which is what R3 and H3 were reasoning about. Do not read "delivered" beside an estimate as "delivered in that many days", and do not calibrate a future estimate against them.
+
+### M1 — Watch the traffic (est. 0.5 day) — **delivered**
 Run the simulator; observe what the bus actually carries. Identify the reference scenario against R6's criteria. Record the entity-state topic, its schema fields, the update rate, and the entity count.
 **Validation:** OQ-3 answered from observation, not memory. Throughput baselines for §"Performance requirements" exist as numbers. Reference scenario chosen and justified. First entries written into the notes deliverable.
 
-### M2 — Smallest possible client (0.5 day) — **delivered**
+### M2 — Smallest possible client (est. 0.5 day) — **delivered**
 `create()`, start the pump, print engine state once a second. Nothing else. [S1] is explicit that most of the difficulty is configuration, not logic — this milestone exists to hit that wall alone.
 **Validation:** BTB-CX-1. Engine state, frame number, simulation time, and scenario name print correctly from the local getters, with no bus round trip.
 
-### M3 — The entity picture (2–3 days) — *the item [S1] assumed was free* — **delivered, inside budget**
+### M3 — The entity picture (est. 2–3 days) — *the item [S1] assumed was free* — **delivered, containment not invoked**
 Register schemas; subscribe decoded; build the roster from `sim/entity/event`; build the latest-sample map with ordered containers.
 **Validation:** BTB-EP-1 through BTB-EP-4. Roster fills and empties correctly across a full scenario. Registry size and resolved topic logged. **Gate: if this exceeds three days, invoke R3's containment before proceeding.**
 **Result:** met. Both topics resolved from the registry with no topic literal in the codebase; all three BTB-EP-1 failure modes exercised on distinct exit codes. Reference run: 42 entities at load, 90 distinct names, 132 occupancies, removals `destroyed:23 expended:48 scenario_unload:19`, 132 188 samples, **0 drops, 0 orphans**. Two findings changed this document — the twelfth schema field (§"Prior art"), and BTB-EP-3's unsatisfiable criterion (ADR-6). R3 closed; the gate was not reached.
 
-### M4 — Capture format and the spec (1 day) — **delivered**
+### M4 — Capture format and the spec (est. 1 day) — **delivered**
 Design and document `n8ro-capture/1`; write the header with its embedded schema envelope; emit `sample` records; write `docs/capture-format-v1.md` alongside the code, not after it.
 **Validation:** BTB-CAP-1, BTB-CAP-4, BTB-CAP-5. A capture from a real run parses. The spec is complete enough to hand to someone who has not seen the code.
 **Result:** met. `docs/capture-format-v1.md` specifies all eight record types normatively; `tests/capture-reader/` is a conformance reader written from that document alone, linking neither the bridge nor the SDK, and it is the standing check that the document stays sufficient. Float formatting landed here rather than at M5 (OQ-5, rev 4). Two scope notes: M4 emits the state model's **attach-mid-run** segment branch only — one segment, opened on the first sample — so that no `sample` sits outside an open segment and the reference capture is conformant rather than a known-bad file; and it records by filling a bounded buffer on the pump thread and writing the whole file from our own thread afterwards, because the writer thread and the handler-to-writer queue are M5's (BTB-BP-1/BP-2) and building them early would have pre-empted that milestone's backpressure accounting. §"Producer conformance" in the format spec states both gaps to a reader.
 
-### M5 — Output path and lifecycle (1.5 days)
+### M5 — Output path and lifecycle (est. 1.5 days)
 The writer thread; the handler-to-writer handoff; segment boundaries on scenario load and reload; entity-removal records; host-loss handling. *(Float formatting was resolved at M4, not here — see OQ-5.)*
 **Validation:** BTB-CX-3, BTB-CX-4, BTB-BP-1, BTB-BP-2, BTB-CAP-2, BTB-CAP-3. A reload produces two segments. Killing the simulator produces a `host_lost` trailer. No wall-clock value appears anywhere in the capture path. **Carried in from M4:** a capture containing a real *second occupancy* — a name removed and re-created, bracketed by its own `entity_add` / `entity_remove` records. M4's captures stop at the record budget before the teardown burst, and could not have shown it anyway without those records: a sample under an occupancy no record opened is a file the format spec calls malformed. ADR-6 is proven in memory (M3) and against a synthetic capture (`mutate.py`); this is where it gets proven end-to-end in a real file.
 
-### M6 — Referee and backpressure (2 days)
+### M6 — Referee and backpressure (est. 2 days)
 Condition file parsing; the three condition kinds; live verdicts; replay mode; both backpressure boundaries set explicitly; the overload demonstration.
 **Validation:** BTB-REF-1 through BTB-REF-4, BTB-BP-3, BTB-BP-4, BTB-OBS-1. Replay verdicts equal live verdicts. Overload produces accurate per-topic drop counts. OQ-4 resolved under real load. **Carried in from M4 (R7):** re-run the publisher-versus-capture comparison under the 126-entity overload scenario.
 **Result:** met. Live and replay verdicts over the same run are **byte-identical** (same SHA-256), which holds by construction rather than by testing — one evaluation engine, two field sources. Replay of a 64 MB capture takes 1.02 s against a 60 s target. All three condition kinds and both never-met kinds exercised on the reference scenario; `tests/referee/` adds 93 checks needing no simulator. OQ-4 and OQ-6 resolved. **R7 re-measured and reframed** — the rate hypothesis was falsified and the reference instrument was found to be lossy in the same whole-frame shape; see the risk register and `docs/capture-format-v1.md` §14. Two scope notes: BTB-CAP-6's byte limit remains unbuilt (P2), and the overload scenario turned out not to overload this design — the only way to make the internal queue drop anything was `--queue-size 4`.
 
-### M7 — Shutdown, determinism, evidence (1.5 days)
+### M7 — Shutdown, determinism, evidence (est. 1.5 days)
 Signal handling and drain; the determinism harness; the twenty-cycle shutdown loop; the R1 teardown spike; README, sample capture, reader, recording, notes.
 **Validation:** BTB-SD-1, BTB-DOC-1, BTB-DOC-2, and every success metric. **Format freeze at the end of this milestone** (§"Migration plan" step 2). R1 spike result documented and taken to the mentor whichever way it goes.
 **Result:** met, with one requirement left unbuilt and one deliverable that needs a person. BTB-SD-1 verified over twenty scripted interrupt-and-verify cycles — real console Ctrl-C, exit 0 and a well-formed `shutdown` trailer every time, with the trailer's own sample count checked against the records in the file. R1 did not reproduce in 20 of 20 plugin-free cycles. R8 resolved, and it corrected a claim in the format spec on the way (see rev 8 above). The determinism harness is two harnesses: ten replays of one stored capture hash identically, and a unit harness that tests each of R4's three named hazards directly — including a comma-decimal locale, which this machine actually has. `docs/capture-format-v1.md` is **frozen**. **Not delivered:** BTB-CAP-6's byte-limited capture (P2), and the 5-minute demo recording, which needs a person and a screen recorder — everything it should show is scripted and the README names the command for each beat. `docs/decisions-m5-m7.md` D-37 is the complete list.
 
-**Total: 9–10 working days**, inside [S1]'s 1–2 week target. The entity picture (M3) is the largest single item and the one most likely to breach it — flagged per R3, with containment defined rather than hoped for.
+**Estimated total: 9–10 working days**, against [S1]'s 1–2 week target. **This is the plan's estimate, not a measurement** — elapsed effort was never recorded, so this document cannot say what the work actually cost. The entity picture (M3) was the largest single item and the one most likely to breach the target — flagged per R3, with containment defined rather than hoped for, and never invoked.
 
 ## Review checklist
 
@@ -1048,7 +1058,7 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 | BTB-CX-1 | [S1] step 2, deliverables | G1 |
 | BTB-CX-2 | [S1] acceptance criterion 1 | G1 |
 | BTB-CX-3 | [S1] acceptance criterion 6; [S2] host-crash survival | G1 |
-| BTB-CX-4 | [S1] acceptance criterion 4; [S2] constraint 3 | G1, G4 |
+| BTB-CX-4 | [S1] acceptance criteria 2 and 4; [S2] constraint 3 | G1, G4 |
 | BTB-EP-1 | [S1] packed-schema rule; [S3] entity-picture correction | G1, G5 |
 | BTB-EP-2 | [S3]; [S4] `MessageBusPacked.h` | G1 |
 | BTB-EP-3 | [S1] acceptance criterion 5; [S2] constraint 4; [S4] `IEntityManager.h` | G1 |
@@ -1061,8 +1071,8 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 | BTB-CAP-6 | Operational (disk exhaustion) | G1 |
 | BTB-BP-1 | [S1] rule 1 | G1 |
 | BTB-BP-2 | [S1] rule 2 | G1, G4 |
-| BTB-BP-3 | [S1] rule 6; [S4] `IMessageBus.h` defaults | G1 |
-| BTB-BP-4 | [S1] rule 6, acceptance criterion 7 | G1 |
+| BTB-BP-3 | [S1] step 6 ("Handle backpressure"); [S4] `IMessageBus.h` defaults | G1 |
+| BTB-BP-4 | [S1] step 6 ("Handle backpressure"), acceptance criterion 7 | G1 |
 | BTB-REF-1 | [S1] Referee shape; [S2] assertion separation | G3 |
 | BTB-REF-2 | [S2] "names what was checked and on what data" | G3 |
 | BTB-REF-3 | [S1] Referee examples | G3 |
@@ -1072,6 +1082,20 @@ Signal handling and drain; the determinism harness; the twenty-cycle shutdown lo
 | BTB-SD-1 | [S1] acceptance criterion 8 | G1 |
 | BTB-DOC-1 | [S1] deliverables | G2, G5 |
 | BTB-DOC-2 | [S1] deliverables | G5 |
+
+**[S1]'s eight acceptance criteria, and where each is discharged.** Every one traces to at least one FR;
+criterion 2 is the only one no single FR owns, so it is spelled out here rather than left implicit.
+
+| # | [S1] acceptance criterion | Discharged by |
+|---|---------------------------|---------------|
+| 1 | Starts before the simulator, waits, connects — no required start order | BTB-CX-2 |
+| 2 | **Follows a scenario from load to end and produces its output correctly** | **No single FR. Composed of BTB-CX-4 (segment opened on load, closed on end), BTB-EP-3 (roster follows the run), BTB-CAP-4 (every declared field, verbatim) and BTB-CAP-1 (the file is interpretable without this code).** Demonstrated end to end by the sample capture in `docs/sample-capture/`, which the conformance reader reports as CONFORMS |
+| 3 | Records carry the published simulation time; you can say how you know they are not predictions | BTB-CAP-2 |
+| 4 | A scenario reload is handled — the output does not silently mix two runs | BTB-CX-4 |
+| 5 | Entity removal is reflected: nothing lingers after a body is gone | BTB-EP-3 |
+| 6 | The simulator exiting does not crash or hang the program | BTB-CX-3 |
+| 7 | Backpressure behaviour is chosen, documented and demonstrated | BTB-BP-3, BTB-BP-4 |
+| 8 | Clean shutdown on Ctrl-C: flushed output, no lost tail | BTB-SD-1 |
 
 ## Appendix B: User acceptance criteria
 
@@ -1325,5 +1349,5 @@ Re-read of all P1 requirement statements found no vague adjectives, superlatives
 
 **Backward traceability**
 
-Source items checked: 41 (from [S1]'s rules, acceptance criteria, steps, and deliverables; [S2]'s four binding constraints; [S3]'s corrections and scope decision).
+Source items checked: 41 (from [S1]'s five rules, eight acceptance criteria, seven steps, five deliverables and its choose-an-output instruction; [S2]'s four binding constraints; [S3]'s corrections).
 Fully covered: 37. Intentionally excluded: 4 — the three unselected output shapes and the predicted-sample handling, each with a dated §"Out of scope" entry. Dropped: 0.
