@@ -707,6 +707,29 @@ and is not a ground truth. The tool reports both directions by frame for exactly
 Risk R7 and §14 of the format spec carry the full picture; the M6 section of
 [`notes.md`](notes.md) has the numbers and what changed because of them.
 
+### The host driver
+
+`tests/host-driver/` drives an already-running `n8ro-sim-app.exe` over the bus — it loads a
+scenario, starts the engine, waits a **frame** budget and stops it. It is the only tool here
+that **publishes**, which is why it lives in `tests/` and not in the bridge: ADR-4 and §14 of
+the format spec both promise a consumer that the recorder cannot perturb the run.
+
+Unlike the four suites above it links the SDK, so it needs the install and the same four
+import libraries the bridge does:
+
+```cmd
+cl /std:c++17 /EHsc /W4 /O2 ^
+   /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
+   /Fe:build\tests\host_driver.exe /Fo:build\tests\ ^
+   tests\host-driver\host_driver.cpp ^
+   /link /LIBPATH:%N8RO_RELEASE%\lib n8ro-core.lib n8ro-sim.lib n8ro-schema.lib n8ro-data.lib
+build\tests\host_driver.exe --help
+```
+
+`--help` exits 2 and prints the usage, which is the cheapest check that the link resolved.
+It is used by [The R8 spike](#the-r8-spike-is-the-headless-host-repeatable), and it is what
+closed OQ-2 — the headless invocation is demonstrated rather than asserted.
+
 ## Determinism probe
 
 `tests/float-format/float_format_probe.cpp` settles which double-to-text format is
@@ -816,6 +839,9 @@ as exit code `-1073741819`. Result: **host 0 ×20, bridge 0 ×20 — it did not 
 
 This is the one that changes what EXT-17 should build. It needs the headless host, driven over
 the bus — the invocation OQ-2 asked about:
+
+Build `host_driver` first if you have not — see [The host driver](#the-host-driver); it is
+not built by the solution and terminal 3 below needs it.
 
 ```cmd
 :: EVERY terminal below: call C:\N8RO\setup.cmd first. It exports N8RO_RELEASE and puts
@@ -944,6 +970,7 @@ tests/publisher-compare/                 capture vs the host's own record — ho
 tests/shutdown/                          the twenty-cycle Ctrl-C loop
 tests/teardown-spike/                    the R1 spike
 tests/host-driver/                       drives the headless host — a TEST TOOL, not the bridge
+                                         (links the SDK; built by hand, not by the solution)
 tests/evidence/                          the capture trimmer
 tests/float-format/                      the OQ-5 determinism probe
 n8ro-bridge.sln / .vcxproj               Release|x64, v145, stdcpp17
