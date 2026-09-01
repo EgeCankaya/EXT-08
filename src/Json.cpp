@@ -75,7 +75,7 @@ void appendDouble(std::string& out, double value) {
     if (result.ec != std::errc{}) {
         // Unreachable for a finite double in 32 bytes. Handled rather than asserted,
         // because the platform contract is return values plus logging, never a throw and
-        // never an abort in a writer (CLAUDE.md hard rule 1).
+        // never an abort in a writer (never throw; PRD C3).
         out += "\"unrepresentable\"";
         return;
     }

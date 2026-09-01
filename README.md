@@ -4,7 +4,7 @@ A standalone C++17 console program that attaches to a running N8RO simulation ov
 message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
 [`notes.md`](notes.md).
 
-**Status: M1 through M7 — complete. Every requirement in the PRD is implemented, and the demo recording is [published as four takes](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** covering all seven BTB-DOC-2 beats, shot following [`docs/demo-recording-script.md`](docs/demo-recording-script.md). The bridge registers the packed schemas, resolves **four** topics
+**Status: M1 through M7 — complete. Every requirement in the PRD is implemented, and the demo recording is [published as four takes](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** covering all seven BTB-DOC-2 beats. The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
 subscribes decoded to all of them, maintains a roster and a latest-sample map of its own, and
 streams a self-describing `n8ro-capture/1` capture through a writer thread behind a bounded
@@ -39,8 +39,6 @@ an edit.
   the requirement's acceptance criterion is met; what does not exist is a single five-minute
   file with titles between the beats.
 
-`docs/decisions-m5-m7.md` records every judgment call made across M5–M7, with what it turned on
-and what would reverse it.
 
 ### Three things to know before you compare or trust a capture
 
@@ -139,7 +137,7 @@ n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db
 [INFO] (n8ro-bridge) message pump and writer thread started. Waiting for the simulation host; no start order is required (BTB-CX-2). Host loss is declared after 3.000000 s without an engine-state message (BTB-CX-3)
 [INFO] (n8ro-bridge) waiting for a simulation host on sim/engine/state; the bridge is subscribed and will begin capturing the moment one publishes
 [INFO] (n8ro-bridge) attached: the simulation host is publishing engine state
-[INFO] (n8ro-bridge) capture opened: captures\capture-atacama-air-defense-000.n8rocap.jsonl format n8ro-capture/1 producer 0.5.0 attached_mid_run=false
+[INFO] (n8ro-bridge) capture opened: captures\capture-atacama-air-defense-000.n8rocap.jsonl format n8ro-capture/1 producer 0.9.0 attached_mid_run=false
 engine=running    frame=249    simTime=  12.450 scenario=Atacama Air Defense live=42  names=45  samples=10098 orphaned=0
     capture=10145 records (seg=1 samples=10098 add=45 rm=2) queue=0/9216 drops=0/0
     busLoss=0(bp=0 qo=0 rl=0) decode=0(hash=0 fail=0 noschema=0)
@@ -549,13 +547,25 @@ database** — they drive the picture by handing it `StreamValueMap`s, which is 
 the bus's `DecodedHandler` does, so they exercise the real entry points. They also link no
 N8RO import library; headers alone are enough.
 
+Every suite below builds into `build\tests\`, which is where
+[The four unit suites](#the-four-unit-suites--no-simulator-needed) and the rest of this README
+expect to find them. `build\` is git-ignored, so a fresh clone has to create it once:
+
 ```cmd
 call C:\N8RO\setup.cmd
+call C:\N8RO\dev\setup-dev.cmd
+if not exist build\tests mkdir build\tests
+```
+
+`setup.cmd` alone is not enough here: it exports `N8RO_RELEASE` and the runtime `PATH`, but it
+is `setup-dev.cmd` that puts the compiler on `PATH`. Without it, `cl` is not recognised.
+
+```cmd
 cl /std:c++17 /EHsc /W4 /O2 ^
    /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
-   /Fe:entity_picture_test.exe ^
+   /Fe:build\tests\entity_picture_test.exe /Fo:build\tests\ ^
    tests\entity-picture\entity_picture_test.cpp src\EntityPicture.cpp
-entity_picture_test.exe
+build\tests\entity_picture_test.exe
 ```
 
 Exit code 0 if every check passes, 1 otherwise with each failure named. 81 checks covering
@@ -579,10 +589,10 @@ use, so it exercises the real entry points. **No simulator, no bus, no model dat
 ```cmd
 cl /std:c++17 /EHsc /W4 /O2 ^
    /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
-   /Fe:referee_test.exe ^
+   /Fe:build\tests\referee_test.exe /Fo:build\tests\ ^
    tests\referee\referee_test.cpp src\Referee.cpp src\Conditions.cpp ^
    src\Geodesy.cpp src\JsonParse.cpp src\Json.cpp
-referee_test.exe
+build\tests\referee_test.exe
 ```
 
 93 checks, exit 0 if all pass.
@@ -611,11 +621,11 @@ than being skipped.
 ```cmd
 cl /std:c++17 /EHsc /W4 /O2 ^
    /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
-   /Fe:determinism_test.exe ^
+   /Fe:build\tests\determinism_test.exe /Fo:build\tests\ ^
    tests\determinism\determinism_test.cpp src\CaptureFormat.cpp src\Json.cpp ^
    src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp ^
    src\RecordQueue.cpp
-determinism_test.exe
+build\tests\determinism_test.exe
 ```
 
 39 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
@@ -631,11 +641,17 @@ BTB-CAP-5's "the spec is complete enough to write a reader from" a test rather t
 Every rule it enforces cites the spec section it came from.
 
 ```cmd
-cl /std:c++17 /EHsc /W4 /O2 /Fe:capture_reader.exe tests\capture-reader\capture_reader.cpp
+cl /std:c++17 /EHsc /W4 /O2 /Fe:build\tests\capture_reader.exe /Fo:build\tests\ ^
+   tests\capture-reader\capture_reader.cpp
 
-capture_reader.exe captures\capture-atacama-air-defense-000.n8rocap.jsonl ^
+build\tests\capture_reader.exe ^
+    docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
     --spec docs\capture-format-v1.md
 ```
+
+That runs against the trimmed sample, which is the one capture a fresh clone has. Point it at a
+full reference run instead — 200 s of the reference scenario, made by
+[Recording a capture](#recording-a-capture) — and the summary looks like this:
 
 ```
   format n8ro-capture/1
@@ -661,7 +677,8 @@ mutation-checked the same way the entity picture's suite is:
 
 ```cmd
 python tests\capture-reader\mutate.py ^
-    captures\capture-atacama-000.n8rocap.jsonl build\tests\capture_reader.exe docs\capture-format-v1.md
+    docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+    build\tests\capture_reader.exe docs\capture-format-v1.md
 ```
 
 Sixteen deliberate defects — wrong field order, an undeclared field, a sample outside a
@@ -696,8 +713,9 @@ Risk R7 and §14 of the format spec carry the full picture; the M6 section of
 round-trip exact **and** locale independent on this toolchain. It is standalone:
 
 ```cmd
-cl /std:c++17 /O2 /EHsc tests\float-format\float_format_probe.cpp
-float_format_probe.exe
+cl /std:c++17 /O2 /EHsc /Fe:build\tests\float_format_probe.exe /Fo:build\tests\ ^
+   tests\float-format\float_format_probe.cpp
+build\tests\float_format_probe.exe
 ```
 
 Exit code 0 if at least one candidate passes both axes. The result and what it means for
@@ -706,18 +724,16 @@ the capture format are in [`notes.md`](notes.md).
 ## Reproducing the evidence
 
 Everything the project claims is re-runnable with one command. The scripts are in the
-repository so a result is checkable rather than asserted, and so the 5-minute demo recording
-had a script to follow: [`docs/demo-recording-script.md`](docs/demo-recording-script.md) is
-that script — four takes, the command behind each of BTB-DOC-2's seven beats, and what to say
-over them.
+repository so a result is checkable rather than asserted. The demo recording was shot to a
+script covering four takes, the command behind each of BTB-DOC-2's seven beats, and what to
+say over them.
 
 Each of these assumes a shell that has run `C:\N8RO\setup.cmd`.
 
 ### The demo recording
 
-**[Four takes, on Google Drive.](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** Shot 2026-08-31 following
-[`docs/demo-recording-script.md`](docs/demo-recording-script.md), which is both the shooting
-script and the record of what each take produced. Every beat BTB-DOC-2 names is on camera:
+**[Four takes, on Google Drive.](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** Shot 2026-08-31 to a prepared shooting
+script. Every beat BTB-DOC-2 names is on camera:
 
 | Beat | Take | What proves it on screen |
 |---|---|---|
@@ -742,8 +758,12 @@ Two things to know before watching, both of which look like faults and are not:
   `docs/capture-format-v1.md` §14 was taken in this configuration, and provisioning terrain
   would make the recording show a different system than the evidence describes.
 
-The captures the shoot produced are committed in `captures/` under the `demo`, `overload` and
-`ctrlc` labels, so every number visible on screen can be re-checked against a file here.
+The shoot wrote its captures into `captures/` under the `demo`, `overload` and `ctrlc` labels.
+**Those files are not in the repository** — `captures/` is git-ignored, because a single
+reference run is about 64 MB and the three together are roughly 79 MB. What ships instead is
+[`docs/sample-capture/`](docs/sample-capture/), a trimmed capture from a real run that is
+un-ignored deliberately. To re-check a number visible on screen against a file, re-run that
+beat's command from [Reproducing the evidence](#reproducing-the-evidence) below.
 
 ### The four unit suites — no simulator needed
 
@@ -864,13 +884,14 @@ one side only.
 python tests\evidence\trim_capture.py <big-capture> docs\sample-capture\<name>.n8rocap.jsonl
 ```
 
-Keeps every non-sample record and the samples of two entities, and rewrites one number in the
-trailer. The result still reports CONFORMS, which is the check that it stayed valid.
+Keeps every non-sample record and the samples of three entities — `RedUAV_N_01`,
+`BlueBase_Airfield` and `BlueSAM_ShortRange` — and rewrites one number in the trailer. The
+result still reports CONFORMS, which is the check that it stayed valid.
 
 ## The sample capture
 
 [`docs/sample-capture/`](docs/sample-capture/) holds a real capture from a real run, trimmed to
-3.2 MB. It carries the whole story in one file:
+5.1 MB. It carries the whole story in one file:
 
 - **both segments** — the run, and the teardown reload the engine's stop path produces
 - **`RedUAV_N_01` at two occupancies** — created, `destroyed` at `t = 149.45`, re-created at
@@ -878,17 +899,23 @@ trailer. The result still reports CONFORMS, which is the check that it stayed va
 - **all 132 `entity_add` and 90 `entity_remove` records**, with reasons verbatim
 - **all seven verdicts**, including the two never-met ones
 
-Its header says `producer 0.5.0` because that is the build that recorded it. That is accurate
-rather than tidy: the file is a real artifact of a real run, not a regenerated one, and §16 of
-the format spec carries the producer version history.
+Its header says **`producer 0.9.0`**, which is the build this repository produces, so the file
+demonstrates the current producer rather than an older one — including
+`sample_form: "published"` (§6.3a) and `header.limits` (§6.6), the two keys that let a reader
+answer "are these predictions?" and "was this file cut short?" from the file itself. §16 of the
+format spec carries the producer version history.
+
+Regenerating it is one run and one trim — see
+[Making a committable sample capture](#making-a-committable-sample-capture). The counts above
+are properties of the structure and survive a regeneration; per-entity **sample** counts do not,
+because the publication schedule differs by about 1% between runs (§14).
 
 ## Layout
 
 ```
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
 docs/capture-format-v1.md                the cross-repo contract EXT-17 is handed
-docs/decisions-m5-m7.md                  every judgment call made in M5–M7, and why
-docs/escalations.md                      the two findings this project cannot close itself
+docs/escalations.md                      the five findings this project cannot close itself
 notes.md                                 what the bus actually carries (graded deliverable)
 src/main.cpp                             CLI, wiring, the lifecycle loop, the run summary
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and all four topics from the registry
@@ -937,9 +964,11 @@ n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db
 ```
 
 The bridge records until the simulation host stops publishing, then closes the capture with
-`end_reason: host_lost` and exits 0. There is no signal handling until M7, so **let the host
-end the run** rather than interrupting the bridge; `--capture-max-samples` gives you a record
-budget if you want a bounded file instead, and closes it with `end_reason: size_limit`.
+`end_reason: host_lost` and exits 0. **Ctrl-C ends it cleanly at any point** — the queue is
+drained, the trailer is written with `end_reason: shutdown`, and the exit code is 0 (BTB-SD-1;
+see [Clean Ctrl-C, twenty times](#clean-ctrl-c-twenty-times-btb-sd-1)). `--capture-max-samples`
+gives you a record budget if you want a bounded file instead, and closes it with
+`end_reason: size_limit`.
 
 A 200-second run of the reference scenario produces about **132 000 sample records and 64 MB**
 of JSON Lines, at roughly 484 bytes per sample record.
@@ -960,9 +989,10 @@ reload, holding the re-created entities at **occupancy 2** and a short tail of s
 this repository.
 
 That second segment is also where a capture finally demonstrates ADR-6 end to end. In the
-reference capture `RedUAV_N_01` is created at occupancy 1, publishes 2 956 samples, is
+committed sample capture `RedUAV_N_01` is created at occupancy 1, publishes 2 954 samples, is
 `destroyed` at `t = 149.45`, and returns at occupancy 2 with 9 more — each tenure bracketed by
-its own `entity_add` / `entity_remove`.
+its own `entity_add` / `entity_remove`. The destruction time is a property of the scenario and
+repeats; the 2 954 is a sample count and will differ by about 1% in another run.
 
 ### Checking a capture
 

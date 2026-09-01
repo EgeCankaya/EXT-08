@@ -16,11 +16,9 @@
 // verdicts from the file alone, the file demonstrably contains enough.
 //
 // Scope: BTB-SD-1 on top of M2-M6. The normative description of what it writes is
-// docs/capture-format-v1.md; every decision taken while building it is in
-// docs/decisions-m5-m7.md.
+// docs/capture-format-v1.md.
 //
-// A live run ends on host loss, on Ctrl-C, or on the record budget. The one requirement left
-// unbuilt is BTB-CAP-6's byte-limited capture, which is P2 - see docs/decisions-m5-m7.md.
+// A live run ends on host loss, on Ctrl-C, or on a size or record bound.
 //
 // The four topics, and why each is here:
 //
@@ -31,7 +29,7 @@
 //
 // Not one of those strings is written anywhere in this program. Each is read off a schema
 // the registry resolved from a message-instance name or an EventNames.h constant
-// (CLAUDE.md hard rule 3, BTB-EP-1).
+// (derive from the schema; PRD tie-breaker 4, BTB-EP-1).
 
 #include "CaptureFormat.h"
 #include "CaptureRecord.h"
@@ -99,8 +97,7 @@ constexpr const char* kDefaultEngineStateMessage = "simEngineState";
 constexpr std::size_t kBusQueueSize = 1024;
 constexpr n8ro::core::BackpressurePolicy kBusPolicy = n8ro::core::BackpressurePolicy::FIFO_DROP;
 
-// INTERNAL SIDE. See RecordQueue.h for the shape and docs/decisions-m5-m7.md D-6 to D-9 for
-// the reasoning. 8192 records is ~16 MB at M4's measured ~2 KB per held StreamValueMap -
+// INTERNAL SIDE. See RecordQueue.h for the shape and the reasoning. 8192 records is ~16 MB at M4's measured ~2 KB per held StreamValueMap -
 // 10.0 s of headroom at 818/s against a p95 enqueue-to-durable target of 250 ms.
 constexpr std::size_t kDefaultQueueSize = 8192;
 constexpr std::size_t kStructuralReserve = 1024;
@@ -117,7 +114,7 @@ constexpr std::size_t kStructuralReserve = 1024;
 // 3.0 s is 5.5x that largest observed gap and ~59 heartbeat periods. Deliberately far below
 // SubscriptionOptions::activityThresholdS, whose 30 s default is the bus's own "this
 // subscription looks idle" semantics and is two orders of magnitude too slow to be a
-// host-loss signal for a campaign runner. docs/decisions-m5-m7.md, D-3.
+// host-loss signal for a campaign runner.
 constexpr double kHostLossWindowS = 3.0;
 
 // How often the main loop wakes. The status line is printed once a second; the loop runs
@@ -253,7 +250,7 @@ struct TopicActivity {
 };
 
 // Called from inside every handler, first thing. Three relaxed atomics and no allocation -
-// the handler stays a courier (CLAUDE.md hard rule 2, BTB-BP-1).
+// the handler stays a courier (the courier rule; PRD tie-breaker 5, BTB-BP-1).
 void noteDecoded(TopicActivity& activity, const n8ro::core::Message& message) {
     activity.decoded.fetch_add(1, std::memory_order_relaxed);
 
@@ -332,8 +329,8 @@ struct Options {
 }
 
 // Returns false and names the offending argument. Never throws: argv parsing is the first
-// place an exception would escape main, and the platform contract forbids that (CLAUDE.md,
-// hard rule 1).
+// place an exception would escape main, and the platform contract forbids that (PRD C3 -
+// never throw).
 bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -530,7 +527,7 @@ void reportCreateFailure(const Options& options) {
 
 // The roster transitions our thread drained since the last report. This is where "destroyed
 // at t=412.5" becomes visible - the handler could not log it, because a handler is a
-// courier (CLAUDE.md hard rule 2).
+// courier (the courier rule; PRD tie-breaker 5).
 void logRosterEvents(const std::vector<RosterEvent>& events) {
     for (const RosterEvent& event : events) {
         std::string line = event.eventName + " " + event.scenarioEntityName + " gen=" +
@@ -1049,7 +1046,7 @@ int run(const Options& options) {
 
     // BTB-EP-2: decoded subscriptions. Every handler below is a courier - it copies what it
     // needs, hands it to the queue, and returns. No IO, no formatting, no float conversion,
-    // no file. All of that is the writer thread's (CLAUDE.md hard rule 2, BTB-BP-1).
+    // no file. All of that is the writer thread's (the courier rule; PRD tie-breaker 5, BTB-BP-1).
     const std::uint64_t stateSubscription = packed.subscribeByTopic(
         resolution.entityState.topic,
         [&picture, &queue, &stateTiming, &topics, &foreignSchemaOnStateTopic,
@@ -1573,7 +1570,7 @@ int run(const Options& options) {
 
 int main(int argc, char** argv) {
     // Console-only logger. The rotating-file initializer writes under <N8RO_RELEASE>\logs,
-    // and C:\N8RO is read-only for this project (CLAUDE.md, Guardrail).
+    // and C:\N8RO is read-only for this project (PRD C5 - the install tree is not ours).
     n8ro::core::GlobalLogger::setLogger(
         n8ro::core::LogReportingFactory::createLogger<n8ro::core::ConsoleLoggerConfig>());
 

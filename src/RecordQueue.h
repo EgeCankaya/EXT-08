@@ -16,7 +16,7 @@
 // One queue, all topics. Per-topic queues would give per-topic FIFO trivially and lose the
 // interleaving between topics, and the interleaving is what guarantees an entity_add is
 // written before the samples it opens. A single FIFO preserves global arrival order, and
-// BTB-BP-2's per-topic order follows from it for free (docs/decisions-m5-m7.md, D-7).
+// BTB-BP-2's per-topic order follows from it for free.
 //
 // Two capacities, not one. A sample burst that filled the queue could evict an
 // entity_created, and a lost entity_created orphans every subsequent sample for that name -

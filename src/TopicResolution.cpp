@@ -372,7 +372,7 @@ Resolution resolveTopics(
     // The heartbeat. Its silence is what host loss looks like; entity-state silence is not,
     // because entity state stops legitimately at every unload. Measured across two full
     // cycles: engine state publishes at ~19.5/s through idle frames, largest observed gap
-    // 548 ms at scenario load (docs/decisions-m5-m7.md, D-3).
+    // 548 ms at scenario load.
     const n8ro::sim::MessageSchema* engineSchema = registry.getByName(engineStateMessageName);
     if (engineSchema == nullptr || engineSchema->topic.empty()) {
         N8RO_LOG_ERROR(std::string("no packed schema registered under message name ") +

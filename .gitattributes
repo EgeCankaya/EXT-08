@@ -1,0 +1,24 @@
+# Capture files are a byte-exact contract, not text.
+#
+# `docs/capture-format-v1.md` §2 states the container rule without an exception:
+#
+#     Line terminator | LF (0x0A). Never CRLF, on any platform
+#
+# The producer honours that — it writes LF on Windows like everywhere else. But Git for
+# Windows defaults to `core.autocrlf=true`, which rewrites LF to CRLF on **checkout** for any
+# file it decides is text, and a `.jsonl` file has no NUL bytes so the heuristic decides it is.
+# The blob in the object store stays LF; the file on a reviewer's disk does not.
+#
+# The effect was that a fresh clone on Windows failed this project's own conformance check —
+# the first command the README asks a reader to run:
+#
+#     FAIL  line 0  [spec 2]  7180 line(s) end in CRLF; the format is LF-terminated
+#
+# `-text` disables both directions of that conversion, so a capture arrives byte-for-byte as
+# the producer wrote it. This matters beyond tidiness: EXT-17 consumes these files against the
+# frozen spec, and §14's determinism guarantees are stated in bytes.
+*.n8rocap.jsonl -text
+
+# The verdict sidecars the referee writes are compared byte-for-byte between a live run and a
+# replay (BTB-REF-4), so they are covered by the same reasoning.
+verdicts-*.jsonl -text

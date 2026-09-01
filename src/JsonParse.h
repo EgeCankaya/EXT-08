@@ -16,7 +16,7 @@
 // project writes and rejects the rest with a position and a reason - which is the whole
 // requirement, because both inputs are files this project or its own specification defines.
 //
-// Never throws (CLAUDE.md hard rule 1). Every failure is `false` plus a named error.
+// Never throws (never throw; PRD C3). Every failure is `false` plus a named error.
 
 #pragma once
 

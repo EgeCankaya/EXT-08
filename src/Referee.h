@@ -17,7 +17,7 @@
 // decoded `StreamValueMap` off the bus, and a parsed `sample.fields` object out of a file.
 //
 // Threading: the referee runs on the writer thread in live mode and on the main thread in
-// replay. Never in a handler (CLAUDE.md hard rule 2).
+// replay. Never in a handler (the courier rule; PRD tie-breaker 5).
 //
 // ---------------------------------------------------------------------------------------
 // Verdict semantics, because "when is a condition met" needs saying once, precisely

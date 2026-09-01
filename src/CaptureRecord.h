@@ -5,11 +5,10 @@
 // observation of the platform is the reason: the `entity_created` burst that materialises a
 // scenario arrives *before* the `scenario_loaded` that announces it, at bring-up and at
 // every reload, so a design that routed roster events and samples through separate paths
-// could not know which segment a creation burst belonged to. See docs/decisions-m5-m7.md,
-// D-1 and D-7.
+// could not know which segment a creation burst belonged to. Both were measured at M5.
 //
 // A record is copied whole on the pump thread and never touched again until the writer
-// serialises it. That is the courier rule (CLAUDE.md hard rule 2): copy, hand off, return.
+// serialises it. That is the courier rule (the courier rule; PRD tie-breaker 5): copy, hand off, return.
 
 #pragma once
 
