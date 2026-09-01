@@ -704,7 +704,12 @@ passed before fails after. They are recorded here because two of them touch a **
 one changes what the boundary artifact *is*, and both of those are choices rather than typo
 fixes.
 
-### D-49 — E-3 and E-4 are clarifications, admissible under the freeze, and the freeze is why they are worded narrowly
+**The numbering jumps to D-70 on purpose.** The 2026-09-01 defect sweep was still in flight
+when these were written and is still numbering its own decisions upward from D-43; the gap is
+reserved for it. These three were first written as D-49-D-51 and collided with it, which is
+recorded rather than quietly fixed - the commit that introduced them names the old numbers.
+
+### D-70 — E-3 and E-4 are clarifications, admissible under the freeze, and the freeze is why they are worded narrowly
 
 `docs/capture-format-v1.md` is frozen: a change to what it specifies is `n8ro-capture/2`. Neither
 of these changes what it specifies.
@@ -738,7 +743,7 @@ downstream project holding a pinned copy can see what moved without diffing the 
 readable and correctly readable throughout. What was at risk was two projects computing different
 numbers from one frozen document, which is the thing a frozen document exists to stop.
 
-### D-50 — the condition schema becomes a file, rather than staying a set of README sections
+### D-71 — the condition schema becomes a file, rather than staying a set of README sections
 
 **E-5 (#3) is not a wording defect; it is a defect in the shape of the artifact.** The condition
 schema had no file. It lived as four consecutive sections of `README.md`, and a downstream
@@ -772,7 +777,7 @@ is for the capture format.
 **What would reverse it:** the duplication is real, and a test is a weaker guarantee than a single
 copy. If these sections grow, option 2 becomes the right one and the README keeps a summary.
 
-### D-51 — E-6 is fixed where the omission was, not where it was reported
+### D-72 — E-6 is fixed where the omission was, not where it was reported
 
 **E-6 (#4)** was filed against `PROVENANCE.md` finding 6 — which is EXT-17's own manifest and not
 an EXT-08 file at all. EXT-17 caught that itself and corrected the citation by a comment rather
