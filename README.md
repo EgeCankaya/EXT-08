@@ -22,6 +22,20 @@ conformance reader in `tests/capture-reader/` was written from it alone — it l
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
+**The consumer on the other side of that contract is
+[EXT-17, the headless campaign runner](https://github.com/EgeCankaya/EXT-17)**, and this line
+names it because until 2026-09-01 nothing here did. This README mentions EXT-17 eight times —
+what it is handed, what it measured downstream, which escalations it raised — and gave no way to
+find it. **EXT-17 had the exact mirror of the same defect**: it requires this repository's
+`n8ro-bridge.exe` as its `--recorder`, devotes a whole section to saying so, and named no
+repository either. Both were found by cloning the two cold and following both READMEs literally,
+**in both orders** — see [`docs/clean-room.md`](docs/clean-room.md).
+
+**The two repositories share no source, by design** — not a header, not a snippet, not a class
+name relied upon. What crosses is a documented file format and a process. You need this
+repository only to build the recorder; everything EXT-17 does with a capture afterwards, it does
+from the specification alone.
+
 A live run ends on host loss, on Ctrl-C with a clean drain, or on a size or record bound if you
 set one — see [Bounding a capture](#bounding-a-capture), which is also where the stop-or-rotate
 choice lives. Both backpressure boundaries are set explicitly (BTB-BP-3, BTB-BP-4) — see
@@ -681,10 +695,19 @@ python tests\capture-reader\mutate.py ^
     build\tests\capture_reader.exe docs\capture-format-v1.md
 ```
 
-Sixteen deliberate defects — wrong field order, an undeclared field, a sample outside a
-segment, a miscounted trailer, a truncated file, a record after the trailer, an injected
-timestamp, CRLF endings, an unknown `format_version`, a sample after its own occupancy's
-removal — **16 caught, 0 survivors.**
+**Twenty-three deliberate defects** — wrong field order, an undeclared field, a sample outside a
+segment, a verdict outside one, a miscounted trailer, a truncated file, a record after the
+trailer, an injected timestamp, CRLF endings, an unknown `format_version`, an occupancy below 1,
+a sample after its own occupancy's removal, and six on the 0.9.0 bound-and-rotate keys — **23
+caught, 0 survivors.**
+
+This sentence read *"Sixteen deliberate defects … 16 caught"* until 2026-09-01. The harness had
+grown by seven — the `limits` and `continues_from` / `continued_in` cases that came with producer
+0.9.0 — and the prose did not. **The number was wrong in the safe direction, which is why nothing
+caught it**: it understated a result nobody would dispute, and it is only visible by running the
+thing and reading the last line. Re-run it when the reader changes and correct this sentence in
+the same commit. The CI job below runs it on every push, so the *result* cannot rot silently even
+though the *prose* did.
 
 ### Comparing a capture against the publisher
 
@@ -942,6 +965,8 @@ because the publication schedule differs by about 1% between runs (§14).
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
 docs/capture-format-v1.md                the cross-repo contract EXT-17 is handed
 docs/escalations.md                      five findings raised outward - three resolved, two open
+docs/condition-file-schema.md            the referee's declaration shape, vendored by EXT-17
+docs/clean-room.md                       what a COLD CLONE of this repo does, failures included
 notes.md                                 what the bus actually carries (graded deliverable)
 src/main.cpp                             CLI, wiring, the lifecycle loop, the run summary
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and all four topics from the registry

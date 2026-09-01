@@ -1,0 +1,152 @@
+# EXT-08 - the zero-install tier, built and run on a machine nobody here owns.
+#
+# WHAT THIS IS FOR. BTB-CAP-5's claim is that `docs/capture-format-v1.md` is complete enough to
+# write a reader from. The proof is `tests/capture-reader/`, written from the specification and
+# not from this program's source, linking neither the bridge nor the N8RO SDK. Until now that was
+# checked only on the machine that has C:\N8RO installed - which can show a reader compiles
+# without SDK include paths, and cannot show the install is unnecessary, because the install was
+# always there.
+#
+# A stock `windows-latest` runner has never had C:\N8RO on it. If the reader builds, conforms and
+# catches every mutation there, the claim is evidence rather than an argument. **It is the only
+# result in this repository that is not self-certified**, which is the whole reason for the file.
+#
+# WHAT IT DELIBERATELY DOES NOT COVER, stated rather than left to be discovered. The measurement
+# is in docs/clean-room.md section 4:
+#
+#   builds and passes here   capture_reader (the conformance reader), its mutation harness,
+#                            and check_schema_digest.py
+#   cannot build here        n8ro-bridge itself, and entity_picture_test / referee_test /
+#                            determinism_test - 213 of 236 checks. They need SDK HEADERS ONLY,
+#                            no import library and no running install, pulled in through six
+#                            files. That distinction is worth keeping precise: if a header-only
+#                            subset of the SDK were ever distributable, those 213 checks would
+#                            become clean-room-able for free. N8RO's owner's call, not ours.
+#
+# So this job runs the half that can run rather than weakening the half that cannot, and the
+# README's Tests section carries the same split in prose.
+#
+# THE TOOLCHAIN IS NOT TESTED HERE AND THAT IS THE KNOWN HOLE. n8ro-bridge.vcxproj pins
+# <PlatformToolset>v145</PlatformToolset>, which only Visual Studio 18.x provides; a stock VS 2022
+# runner stops at MSB8020. That is correct - it must match the toolset C:\N8RO 2.1.328 was built
+# with - but it means an evaluator on VS 2022 cannot build the recorder, and therefore that the
+# EXT-08 + EXT-17 pair needs 18.x as a whole. Measured in docs/clean-room.md section 4. Nothing
+# below exercises it, because everything below deliberately links nothing.
+
+name: zero-install tier
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  clean-room:
+    name: the format contract, with no N8RO install
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: This runner really is a clean room
+        shell: cmd
+        run: |
+          if exist "C:\N8RO" (
+            echo FAIL: C:\N8RO exists on this runner, so nothing below is evidence of anything.
+            exit /b 1
+          )
+          if not "%N8RO_RELEASE%"=="" (
+            echo FAIL: N8RO_RELEASE is set to "%N8RO_RELEASE%".
+            exit /b 1
+          )
+          echo No C:\N8RO. No N8RO_RELEASE. No SDK include path anywhere below.
+
+      # The regression guard for .gitattributes. Before that file existed, a clone on Windows
+      # rewrote the sample capture to CRLF - and the first command this README asks a reader to
+      # run then FAILED the project's own conformance check, on section 2's "LF. Never CRLF, on
+      # any platform". It was invisible from a working directory, because the producer always
+      # wrote LF and the file was never checked out again. Only a clone reads what ships.
+      - name: The sample capture survived checkout as LF
+        shell: pwsh
+        run: |
+          # iso-8859-1 keeps every byte a char, so a CR is countable rather than normalised away.
+          $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1')
+          $bad = 0
+          foreach ($f in Get-ChildItem -Recurse -Include *.n8rocap.jsonl, verdicts-*.jsonl) {
+            $cr = ([System.IO.File]::ReadAllText($f.FullName, $enc) -split "`r").Count - 1
+            "{0,-8} CR bytes  {1}" -f $cr, $f.FullName.Substring($PWD.Path.Length + 1)
+            if ($cr -ne 0) { $bad++ }
+          }
+          if ($bad -ne 0) {
+            Write-Host "FAIL: a capture checked out with CR bytes; format spec section 2 is 'LF, never CRLF, on any platform'."
+            exit 1
+          }
+          Write-Host "Every capture checked out byte-for-byte as the producer wrote it."
+
+      # THE TOOLCHAIN IS DISCOVERED INLINE, AND NOT THROUGH A THIRD-PARTY ACTION. Two reasons.
+      # The obvious one is that a job whose point is "this needs nothing" should not open by
+      # installing something from outside the repository. The other is that the ONE script that
+      # would do this for us - C:\N8RO\dev\setup-dev.cmd - requires the install by construction,
+      # so it is unavailable here exactly because the claim is true.
+      #
+      # `free` in EXT-17's sense: this target links nothing and needs only a C++17 compiler, so
+      # any 17.x or 18.x with the x64 tools will do. That is NOT true of n8ro-bridge itself,
+      # which pins toolset v145 - see the header comment.
+      #
+      # vcvars64 sets environment, and each `run:` step is its own shell, so the call has to live
+      # in the step that compiles rather than in a step of its own.
+      #
+      # Standard library only below. No /I, no /LIBPATH, no .lib - which is the entire claim, and
+      # a compile line anyone can read in five seconds is a better proof of it than an argument
+      # about translation units.
+      - name: Build the conformance reader - no SDK include path, no import library
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" (
+            echo FAIL: vswhere.exe not found. Every Visual Studio installer since 2017 ships it.
+            exit /b 1
+          )
+          set "VSDIR="
+          for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -prerelease -products * -version [17.0^,18.99] -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%I"
+          if "%VSDIR%"=="" (
+            echo FAIL: no Visual Studio with the C++ x64 toolset was found on this runner.
+            exit /b 1
+          )
+          echo Toolchain: %VSDIR%
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
+          if errorlevel 1 exit /b 1
+          cl 2>&1 | findstr /C:"Version"
+
+          if not exist build\tests mkdir build\tests
+          cl /nologo /std:c++17 /EHsc /W4 /O2 ^
+             /Fe:build\tests\capture_reader.exe /Fo:build\tests\ /Fd:build\tests\ ^
+             tests\capture-reader\capture_reader.cpp
+          if errorlevel 1 exit /b 1
+
+      - name: The shipped sample conforms to n8ro-capture/1
+        shell: cmd
+        run: |
+          build\tests\capture_reader.exe ^
+              docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+              --spec docs\capture-format-v1.md
+          if errorlevel 1 exit /b 1
+
+      # A reader that has never rejected anything has not been shown to work. Twenty-three
+      # deliberate defects, each of which the reader must catch; a survivor fails the job.
+      - name: Mutation harness - every deliberate defect is caught
+        shell: cmd
+        run: |
+          python tests\capture-reader\mutate.py ^
+              docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+              build\tests\capture_reader.exe docs\capture-format-v1.md
+          if errorlevel 1 exit /b 1
+
+      # docs/condition-file-schema.md is vendored BY IDENTITY into EXT-17's contract/ directory
+      # (its E-5). This is the check that stops it drifting from the README section it was cut
+      # from - upstream of a downstream pin, which is why it belongs in CI rather than in a habit.
+      - name: The vendorable condition digest still matches the README
+        shell: cmd
+        run: |
+          python tests\referee\check_schema_digest.py
+          if errorlevel 1 exit /b 1
