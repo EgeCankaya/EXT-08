@@ -1,8 +1,150 @@
 # EXT-08 — Bus Telemetry Bridge
 
-A standalone C++17 console program that attaches to a running N8RO simulation over the
-message bus. The contract is [`docs/prd.md`](docs/prd.md); observations from the bus are in
-[`notes.md`](notes.md).
+A standalone C++17 console program that attaches to a running N8RO simulation over the message
+bus and turns what the engine publishes into a durable, versioned, self-describing capture file —
+plus a pass/fail verdict, live or re-judged offline long after the run has ended.
+
+**M1 through M7 — complete.** Every requirement in the PRD is implemented. The binding contract is
+[`docs/prd.md`](docs/prd.md); the capture format is
+[`docs/capture-format-v1.md`](docs/capture-format-v1.md) and it is **frozen**, because a second
+repository consumes it — see [Status, in full](#status-in-full) for what that costs and what is
+deliberately not here.
+
+---
+
+## Quickstart
+
+**Three commands.** Needs Visual Studio 18.x (the project pins toolset `v145`, to match the
+toolset `C:\N8RO` 2.1.328 was built with) and the N8RO SDK at `C:\N8RO`.
+
+```cmd
+call C:\N8RO\setup.cmd && call C:\N8RO\dev\setup-dev.cmd
+msbuild n8ro-bridge.sln /p:Configuration=Release /p:Platform=x64
+
+build\x64\Release\n8ro-bridge.exe --config SimEngineClient_SharedMemory ^
+    --model-path C:\N8RO\data\db --schema-file N8roSimSchema --out-dir captures
+```
+
+The bridge is a **passive client**: something else has to be hosting an engine. Start the bridge
+first — it waits, and the `entity_created` burst that fills the roster is published once, at
+scenario load — then in a second prompt that has also run `setup.cmd`, and **from a scratch
+directory**, run `n8ro-sim-local.exe --scenario "Atacama Air Defense" --model-path C:\N8RO\data\db
+--run-ms 200000`. No start order is actually required; starting the bridge first is only how you
+avoid missing the roster burst. When the simulator exits, the bridge notices within 3 s, closes
+the capture with `end_reason: host_lost`, prints a summary and exits 0.
+
+**Or with no N8RO install at all.** The conformance reader links neither this program nor the SDK,
+so a reviewer with an empty machine can still check a real capture against the specification:
+
+```cmd
+cl /std:c++17 /EHsc /W4 /O2 /Fe:capture_reader.exe tests\capture-reader\capture_reader.cpp
+capture_reader.exe docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
+    --spec docs\capture-format-v1.md
+```
+
+## Running Tests
+
+```cmd
+tests\build.cmd
+```
+
+**213 checks across three suites, plus a 23-mutation harness and the schema digest** — the roster
+and its identity rule, the referee's three condition kinds and the loader's rejections, and the
+three determinism hazards. Exit `0` if every check passes, `1` otherwise with each failure named.
+
+The script runs in **two tiers, and says which one it skipped.** The three suites link no import
+library and start no simulator, but they do include SDK headers, so they need `C:\N8RO` present;
+the conformance reader and its mutation harness need nothing at all. Without an install the first
+tier is skipped by name and the second still runs — which is exactly the split
+[CI](.github/workflows/zero-install-tier.yml) exploits: it runs the zero-install tier on a stock
+`windows-latest` runner and **fails the job if `C:\N8RO` exists**, because none of the rest means
+anything on a machine that has the install. That is the only result in this repository that is
+not self-certified.
+
+Beyond the unit tiers, [Tests](#tests) covers the harnesses that need a simulator: twenty clean
+Ctrl-C cycles, the replay-hash determinism harness, the publisher comparison, and the host driver.
+
+## Architecture at a Glance
+
+**EXT-08 records; [EXT-17](https://github.com/EgeCankaya/EXT-17) runs the campaign.** This is the
+upstream half of a two-project pair. The bridge registers the packed schemas, resolves **four**
+topics *from the registry* — entity state, entity events, scenario events and engine state —
+subscribes decoded to all of them, and maintains a roster and a latest-sample map of its own. The
+bus handler never blocks on I/O: samples go through a bounded queue to a writer thread, which
+streams them into an `n8ro-capture/1` file, splitting a scenario reload into separate segments and
+writing the roster's transitions out as `entity_add` / `entity_remove` records.
+
+**That capture file is the entire interface to the downstream project, and it is the only one.**
+EXT-17 starts `n8ro-bridge.exe` as a child process, then does everything else — determinism
+comparison, parameter sweeps, assertions — from the stored bytes and from
+`docs/capture-format-v1.md` alone. **The two repositories share no source**: not a header, not a
+snippet, not a class name relied upon. That is why the format is frozen, and why the conformance
+reader in `tests/capture-reader/` was written from the specification rather than from this
+program's source — so *"complete enough to write a reader from"* is a test rather than a claim.
+
+## Key Decisions & Trade-offs
+
+- **An entity's identity is `(name, occupancy)`, never name.** The engine re-creates entities under
+  the same name, mid-run and at teardown, so a roster keyed on name silently lets a stale sample
+  survive a re-creation and corrupts every statistic downstream. This is the single most
+  consequential decision here, it is enforced through the whole picture, and **it was the
+  mutation harness that found the gap** — every ordinary test had been passing over it.
+- **The capture format is a frozen, versioned, cross-repo contract, and completeness is proven by
+  construction.** After the freeze, a change to what it specifies is a version bump and a
+  downstream change, not an edit. **Trade-off:** that is genuinely expensive — four imprecisions
+  raised by the downstream project had to be fixed as *corrections to the text* rather than as
+  quiet edits, and each cost an issue, a diff and a downstream re-pin. The alternative was
+  discovering the drift in somebody else's analysis.
+- **A reader that has never rejected anything has not been shown to work.** 23 deliberate defects
+  are injected into a real capture — a swapped field order, a sample outside any open segment, a
+  wall-clock timestamp in the header, CRLF line endings, a continuation part with no back-link —
+  and **0 survivors** are permitted.
+- **Backpressure is bounded and *counted*, never absorbed silently.** The handler-to-writer queue
+  has an explicit bound and an explicit overflow policy, and what it dropped is written into the
+  capture's own trailer. A `sample` is never permitted to evict a roster or segment record, so a
+  capture under load loses resolution and never loses the lifecycle it is read for.
+- **A scenario reload is separate segments, not one timeline.** A single ordinary run contains
+  two, because the engine's stop path unloads and reloads — so any statistic computed over a whole
+  capture without segmenting it is wrong, and the format makes that structural rather than
+  advisory.
+- **Determinism is a property of the emission path, tested by running it.** No unordered container
+  is ever iterated for output, and floats are written in shortest round-trip form with a decimal
+  point whatever the ambient locale — checked by serialising under a comma-decimal locale and
+  requiring byte-identical output, which is the failure `%.17g` would otherwise produce silently.
+- **Live and replay verdicts over the same run are byte-identical**, because the referee reaches
+  its data through one seam and a stored capture and a live bus go through the same evaluator.
+  That is what makes an offline re-judgement worth anything.
+- **Ending a run is a signal, not a command**, and the shutdown drains rather than truncates:
+  twenty consecutive Ctrl-C cycles, each checked for exit 0, a well-formed trailer, and a trailer
+  count that matches the records actually in the file. **20 of 20 clean.**
+- **A capture can be bounded, and `rotate` works — but `stop` is what the downstream chose.**
+  Rotation is complete and not lossy; a four-part capture stitches back to the same roster
+  lifecycle as an unrotated one. It still turns one run's two segments into five `(part, segment)`
+  keys, four of them fragments that nothing in any file identifies as such, which is why the
+  consumer takes the simpler bound.
+
+## Documentation
+
+**[`docs/prd.md`](docs/prd.md) is the deep dive and the binding contract** — the full requirements
+document, revised fifteen times as measurement contradicted it, with requirement-by-requirement
+traceability, the user acceptance criteria, the architecture decision records, and the risks and
+open decisions.
+
+Four documents sit beside it:
+
+| | |
+|---|---|
+| [`docs/capture-format-v1.md`](docs/capture-format-v1.md) | **The frozen cross-repo contract.** The whole of what EXT-17 is given. A reader was written from this file alone, and it works |
+| [`docs/condition-file-schema.md`](docs/condition-file-schema.md) | The referee's condition shape, the distance arithmetic and the boundary rules — vendored downstream by identity, with a CI check that stops it drifting from the README it was cut from |
+| [`docs/clean-room.md`](docs/clean-room.md) | Both repositories cloned cold and both READMEs walked literally, in both orders. **A pass that reads one repository cannot see the seam between two** |
+| [`docs/escalations.md`](docs/escalations.md) | Every question raised in either direction, and what came back |
+
+The rest of this README is the reference manual: everything below is detail behind one of the
+five sections above.
+
+---
+
+## Status, in full
 
 **Status: M1 through M7 — complete. Every requirement in the PRD is implemented, and the demo recording is [published as four takes](https://drive.google.com/drive/folders/1L0lPs0wkDA_qGYx8Z0Q8-SMzNrOvLoXN?usp=sharing)** covering all seven BTB-DOC-2 beats. The bridge registers the packed schemas, resolves **four** topics
 *from the registry* — entity state, entity events, scenario events and engine state —
@@ -554,6 +696,12 @@ this machine, they are ellipsoidal rather than orthometric. That is the datum EC
 the absence helps here.
 
 ## Tests
+
+**All of it runs from one command — `testsuild.cmd`** — which discovers the toolchain,
+builds every suite from the build lines their own header comments carry, runs them, sums the
+checks they printed, and skips the tier that needs SDK headers by name if there is no install.
+The compile lines below are what it executes; they are kept here because a reader debugging one
+suite wants the single line, not the script.
 
 The entity picture (`src/EntityPicture.*`) is a component we own permanently rather than a
 shim awaiting an SDK type, so it has tests. They need **no simulator, no bus and no model
