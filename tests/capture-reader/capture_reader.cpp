@@ -920,6 +920,16 @@ int validate(const std::string& capturePath, const std::string& specPath) {
 
         if (type == "verdict") {
             ++totals.verdict;
+            // Spec section 7: "`entity_add`, `entity_remove` and `verdict` records also carry
+            // `segment` and also fall inside an open segment." The rule was enforced here for
+            // `sample` and for the two roster types but not for `verdict`, which is how a
+            // producer defect the spec forbids - end-of-run verdicts written after the last
+            // segment closed - passed this reader.
+            if (openSegments.find(segment) == openSegments.end()) {
+                report.fail(lineNumber, "spec 7",
+                            "verdict in segment " + std::to_string(segment) +
+                                ", which is not open");
+            }
             for (const char* required : {"condition_id", "met", "entities", "values"}) {
                 if (record.member(required) == nullptr) {
                     report.fail(lineNumber, "spec 10",

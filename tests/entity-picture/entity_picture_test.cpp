@@ -27,6 +27,7 @@
 namespace {
 
 using n8ro::bridge::EntityPicture;
+using n8ro::bridge::EventOutcome;
 using n8ro::bridge::LatestSample;
 using n8ro::bridge::PictureSnapshot;
 using n8ro::bridge::RosterEvent;
@@ -254,6 +255,44 @@ void testRemovalReasonVerbatim() {
     checkEq(reasonOf(snap.roster, "c"), std::string("acme_radar_jammer_consumed"),
             "the roster entry carries it too");
     checkEq(reasonOf(snap.roster, "a"), std::string("destroyed"), "and each carries its own");
+}
+
+void testRepeatedDeleteDoesNotDoubleClose() {
+    // A second entity_deleted for a name with no entity_created between the two. Not observed
+    // on runtime 2.1.328 - which is exactly why it is worth a test: the handler is driven by
+    // a vocabulary the engine owns, and a repeated delete would otherwise return a second
+    // Kind::Removed, which the writer turns into a second `entity_remove` record for one
+    // occupancy. Format spec section 8.1 has a reader bracket an occupancy by "an entity_add
+    // and the matching entity_remove", singular, so two closes for one open is a capture no
+    // reader can key on.
+    beginCase("a repeated entity_deleted does not close one occupancy twice");
+    EntityPicture picture;
+    picture.onEntityEvent(createEvent("RedUAV_N_01", 0.0));
+    const EventOutcome first = picture.onEntityEvent(deleteEvent("RedUAV_N_01", 149.45,
+                                                                 "destroyed"));
+    const EventOutcome second = picture.onEntityEvent(deleteEvent("RedUAV_N_01", 150.0,
+                                                                  "scenario_unload"));
+
+    check(first.kind == EventOutcome::Kind::Removed, "the first delete closes the occupancy");
+    check(second.kind == EventOutcome::Kind::Ignored,
+          "the second produces no second entity_remove record");
+
+    const PictureSnapshot snap = picture.snapshot();
+    checkEq(snap.counters.entityDeleted, 1u, "one removal, not two");
+    checkEq(snap.counters.deleteOfClosedOccupancy, 1u, "and the redundant one is counted");
+    checkEq(snap.removalsByReason.size(), std::size_t{1},
+            "the removal-reason tally is not double-counted");
+    checkEq(reasonOf(snap.roster, "RedUAV_N_01"), std::string("destroyed"),
+            "the reason recorded stays the one that actually closed the occupancy");
+    check(!snap.isLive("RedUAV_N_01"), "the occupancy is still closed");
+
+    // And the guard must not block a legitimate next tenure (ADR-6).
+    picture.onEntityEvent(createEvent("RedUAV_N_01", 0.0));
+    const EventOutcome third = picture.onEntityEvent(deleteEvent("RedUAV_N_01", 5.0,
+                                                                 "scenario_unload"));
+    check(third.kind == EventOutcome::Kind::Removed,
+          "a delete after a re-creation still closes the new occupancy");
+    checkEq(third.generation, 2u, "and it names occupancy 2");
 }
 
 void testRecreatedNameOpensNextOccupancy() {
@@ -503,6 +542,7 @@ int main() {
     testOrphansBeforeFirstAcceptedIsFrozen();
     testNoSampleAfterRemovalWithinOccupancy();
     testRemovalReasonVerbatim();
+    testRepeatedDeleteDoesNotDoubleClose();
     testRecreatedNameOpensNextOccupancy();
     testRecreateDoesNotInheritPreviousSample();
     testScenarioUnloadTeardownProducesNoOrphans();

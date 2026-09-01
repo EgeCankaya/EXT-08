@@ -83,32 +83,43 @@ std::string CaptureWriter::nextRunLabel(const std::string& outDir, const std::st
     std::error_code ec;
     std::uint64_t highest = 0;
     bool any = false;
-    std::filesystem::directory_iterator it(outDir, ec);
-    if (!ec) {
-        for (const std::filesystem::directory_entry& entry : it) {
-            const std::string name = entry.path().filename().string();
-            if (name.size() <= prefix.size() + suffix.size()) {
-                continue;
-            }
-            if (name.compare(0, prefix.size(), prefix) != 0) {
-                continue;
-            }
-            if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
-                continue;
-            }
-            const std::string middle =
-                name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
-            if (middle.empty() ||
-                !std::all_of(middle.begin(), middle.end(),
-                             [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; })) {
-                continue;
-            }
-            const std::uint64_t ordinal = std::strtoull(middle.c_str(), nullptr, 10);
-            if (!any || ordinal > highest) {
-                highest = ordinal;
-                any = true;
-            }
+    // Constructed AND advanced through the error_code overloads. A range-for over a
+    // directory_iterator calls the throwing operator++(), which has no error_code form, so a
+    // share that goes away mid-walk would send a filesystem_error out of the writer thread -
+    // where there is no catch and hard rule 1 says there should be nothing to catch. The
+    // explicit loop is the only way to iterate a directory without throwing.
+    const std::filesystem::directory_iterator end;
+    for (std::filesystem::directory_iterator it(outDir, ec); !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size()) {
+            continue;
         }
+        if (name.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string middle =
+            name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        if (middle.empty() ||
+            !std::all_of(middle.begin(), middle.end(),
+                         [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; })) {
+            continue;
+        }
+        const std::uint64_t ordinal = std::strtoull(middle.c_str(), nullptr, 10);
+        if (!any || ordinal > highest) {
+            highest = ordinal;
+            any = true;
+        }
+    }
+    if (ec) {
+        // A partial walk. Whatever was seen still bounds the ordinal from below, so the label
+        // is at worst a reused one rather than a wrong one, and the operator is told which.
+        N8RO_LOG_WARNING(std::string("could not finish reading ") + outDir + " while choosing a "
+                             "run label (" + ec.message() +
+                             "); the label is derived from what was readable",
+                         kCategory);
     }
 
     const std::uint64_t next = any ? highest + 1 : 0;
@@ -429,6 +440,26 @@ void CaptureWriter::closeSegment(double simTimeS, const char* reason) {
     segmentOpen_ = false;
 }
 
+void CaptureWriter::abandonStaging() {
+    // The bound stopped the run part-way through a creation burst. The record that did not
+    // fit is already counted by noteStoppedAtBound(); everything still queued behind it will
+    // never be written either, and leaving it in the deque unwritten and uncounted is the one
+    // thing tenet 3 forbids outright - a loss nobody can see. Counted under the same staging
+    // counter the summary and trailer.drops.events_not_recorded already report.
+    if (staging_.empty()) {
+        return;
+    }
+    const std::uint64_t abandoned = static_cast<std::uint64_t>(staging_.size());
+    counts_.stagedDropped += abandoned;
+    runCounts_.stagedDropped += abandoned;
+    staging_.clear();
+    N8RO_LOG_WARNING(std::string("the capture bound was reached inside a roster burst; ") +
+                         std::to_string(abandoned) +
+                         " staged roster records were not written and are counted into "
+                         "trailer.drops.events_not_recorded",
+                     kCategory);
+}
+
 void CaptureWriter::flushStaging() {
     // In arrival order, into the segment that just opened. These are the roster records that
     // preceded their own scenario_loaded - see the header comment and D-1.
@@ -440,6 +471,7 @@ void CaptureWriter::flushStaging() {
                     return capture::writeEntityAdd(record.simTimeS, segmentOrdinal_,
                                                    record.subject, record.occupancy);
                 }, record.simTimeS)) {
+                abandonStaging();
                 return;
             }
             ++counts_.entitiesAdded;
@@ -454,6 +486,7 @@ void CaptureWriter::flushStaging() {
                                                       record.subject, record.occupancy,
                                                       record.reason);
                 }, record.simTimeS)) {
+                abandonStaging();
                 return;
             }
             ++counts_.entitiesRemoved;
@@ -478,6 +511,7 @@ void CaptureWriter::apply(const CaptureRecord& record) {
                 // during initialisation, when nothing has ever been loaded; treating it as a
                 // boundary would emit an unnamed segment (notes.md, M1).
                 ++counts_.unloadNoiseIgnored;
+                ++runCounts_.unloadNoiseIgnored;
                 return;
             }
             lastScenarioSeen_ = record.subject;
@@ -510,6 +544,7 @@ void CaptureWriter::apply(const CaptureRecord& record) {
                 // is materialising, or for a sample to force the issue (D-1, D-2).
                 if (staging_.size() >= kStagingCapacity) {
                     ++counts_.stagedDropped;
+                    ++runCounts_.stagedDropped;
                     return;
                 }
                 staging_.push_back(record);
@@ -578,8 +613,15 @@ void CaptureWriter::apply(const CaptureRecord& record) {
             // if it actually reached a file. A rotation happens inside here, which is why the
             // span bookkeeping that follows reads segmentSpans_.back() rather than a span
             // captured before the call - after a rotation the back() is the new part's.
+            // The schema the bus delivered WITH this message, not the one resolved at
+            // startup (BTB-EP-2 AC2). They are the same object on every arrival this program
+            // has ever observed; the requirement is written the way it is because nothing in
+            // the code guarantees that, and a record must be a verbatim rendering of its own
+            // message's declaration or BTB-CAP-4's rule means nothing.
+            const n8ro::sim::MessageSchema& schema =
+                record.schema != nullptr ? *record.schema : stateSchema_;
             if (!admitData([&] { return capture::writeSample(record, segmentOrdinal_,
-                                                             stateSchema_); },
+                                                             schema); },
                            record.simTimeS)) {
                 return;
             }
@@ -633,6 +675,18 @@ void CaptureWriter::run(RecordQueue& queue) {
             // the compromise the PRD's optimisation notes ask for - bounded interval, not
             // bounded by record count.
             file_.flush();
+            if (!file_) {
+                // A buffered stream surfaces a full disk HERE, not at the insert that filled
+                // the buffer. emit() checks the stream after every record, but the bytes it
+                // checked were still in the buffer; without this the failure is first seen at
+                // the next emit(), by which time a short line can already be on disk.
+                // BTB-CX-3 AC3: no partially-written final line.
+                N8RO_LOG_ERROR(std::string("flush failed on capture file ") + path_ +
+                                   "; the device is full or the file is gone. No further "
+                                   "records will be written",
+                               kCategory);
+                failed_ = true;
+            }
         }
         if (closedAndDrained) {
             return;
@@ -668,6 +722,27 @@ bool CaptureWriter::finish(EndReason reason, const capture::TrailerDrops& drops,
     // observations, and dropping them silently is what tenet 3 forbids.
     if (!staging_.empty() && !segmentOpen_) {
         openSegment(lastScenarioSeen_, staging_.front().simTimeS);
+    }
+
+    if (referee_ && referee_->conditionCount() > 0 && !segmentOpen_) {
+        // There has to BE a segment for the verdicts below to sit inside. Three ways to reach
+        // here with none open: a run that declared conditions and never saw a scenario load at
+        // all; an interrupt landing in the window between a `scenario_unloaded` and the
+        // reload's creation burst; and a rotation that could not open a usable part. In each,
+        // the verdicts would otherwise be written outside any segment, which
+        // docs/capture-format-v1.md section 7 - "`entity_add`, `entity_remove` and `verdict`
+        // records also carry `segment` and also fall inside an open segment" - calls
+        // malformed. Opening one emits what section 7 already specifies; it adds nothing to
+        // the format.
+        //
+        // The verdicts keep the stamp finalVerdicts() is given, which is the last DATA
+        // record's segment and time. Section 10 states that exactly - "on a not-met verdict it
+        // is the time of the last data record in the run, and `segment` the segment that
+        // record was in" - and it is also the only anchor a replay of this same file can
+        // reach, which is what makes live and replay verdicts byte-identical (BTB-REF-4). A
+        // segment opened here carries no data record, so a replay's anchor does not move by
+        // its presence (D-44).
+        openSegment(lastScenarioSeen_, lastDataSimTimeS_);
     }
 
     if (referee_) {

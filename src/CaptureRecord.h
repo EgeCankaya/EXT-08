@@ -16,6 +16,7 @@
 // StreamValueMap is an alias declared in MessageBusPacked.h, not in StreamValue.h - the
 // value type and the map over it live in different headers.
 #include <messaging/packed/MessageBusPacked.h>
+#include <messaging/packed/MessageSchema.h>
 #include <messaging/packed/StreamValue.h>
 
 #include <cstdint>
@@ -58,6 +59,24 @@ struct CaptureRecord {
 
     // Sample only.
     n8ro::sim::StreamValueMap values;
+
+    // Sample only: the MessageSchema the bus DELIVERED with this message, which is what
+    // BTB-EP-2 AC2 requires be used for field order rather than discarded. The writer formats
+    // `fields` by walking it, so a message is always written against its own declaration and
+    // never against a snapshot that merely happens to match.
+    //
+    // A pointer, not a copy. Copying a MessageSchema per sample is a vector of strings per
+    // message on the bus thread, which is precisely the work hard rule 2 keeps out of a
+    // handler; a pointer costs nothing. Its lifetime is the registry's: the schemas live in a
+    // `shared_ptr<const RegistrySnapshot>` inside MessageBusPackedSchemaRegistry, this program
+    // builds one registry and never calls `reloadAllSchemas` or `processSchemaChanges` on it,
+    // and the registry outlives both the subscriptions and the writer thread. Introducing a
+    // runtime schema reload is what would invalidate this, and it is the thing to check first
+    // if one is ever added (D-45).
+    //
+    // Null on a record built by anything but a live subscription; the writer falls back to the
+    // schema resolved at startup, which is what every such record was written against before.
+    const n8ro::sim::MessageSchema* schema = nullptr;
 };
 
 // True for the kinds the queue protects with reserved headroom (D-8). These are the single,

@@ -93,6 +93,21 @@ def m_sample_outside_segment(lines):
     return [lines[0]] + lines[2:]          # drop segment_open
 
 
+def m_verdict_outside_segment(lines):
+    """Spec section 7: a `verdict` also falls inside an open segment.
+
+    This is the exact producer defect the reader used to accept - end-of-run not-met
+    verdicts emitted after the last segment_close, or with no segment ever opened.
+    """
+    verdict = dumps({"type": "verdict", "sim_time_s": json.loads(lines[-1])["sim_time_s"],
+                     "segment": 0, "condition_id": "never-met", "met": False,
+                     "entities": ["BlueBase_Airfield"], "values": {"kind": "terminal_state"}})
+    counts = json.loads(lines[-1])
+    counts["counts"]["verdicts"] = 1
+    # After the segment_close, before the trailer.
+    return lines[:-2] + [lines[-2], verdict, dumps(counts)]
+
+
 def m_wrong_counts(lines):
     record = json.loads(lines[-1])
     record["counts"]["samples"] += 1
@@ -210,6 +225,7 @@ MUTATIONS = [
     ("two sample fields swapped out of schema order", m_field_order_swapped),
     ("a field the schema does not declare", m_undeclared_field),
     ("a sample outside any open segment", m_sample_outside_segment),
+    ("a verdict outside any open segment", m_verdict_outside_segment),
     ("trailer.counts disagrees with the records present", m_wrong_counts),
     ("no trailer - a truncated capture", m_no_trailer),
     ("a record after the trailer", m_record_after_trailer),

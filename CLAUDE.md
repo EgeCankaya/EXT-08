@@ -82,7 +82,10 @@ the bus. Never write into it — no files, no plugins, no schema edits. All work
 M1 observe the bus · M2 smallest client · M3 entity picture · M4 capture format + spec
 · M5 output path + lifecycle · M6 referee + backpressure · M7 shutdown, determinism, evidence
 
-**M1 through M7 are delivered, and every requirement in the PRD is implemented.** BTB-CAP-6
+**M1 through M7 are delivered, and every requirement in the PRD is implemented.** (BTB-OBS-2's
+detection half was the one exception, found by the 2026-09-01 defect review and implemented at
+PRD rev 14 with `--topic-silence-s`; the FR read as delivered because its *other* half, the
+one-screen exit summary, always was.) BTB-CAP-6
 (the byte-limited capture) was built after M7 closed — `--capture-max-bytes` plus
 `--on-size-limit stop|rotate`, both stated in `header.limits`; see PRD rev 11 and D-38 to D-41.
 **Every deliverable is also met** (PRD rev 12): the demo recording is published as its four
@@ -91,7 +94,11 @@ half is carried as EXT-17's OQ-3. The only things still outstanding are the two 
 `docs/escalations.md`, both sent to the brief's author on 2026-08-31 and awaiting a reply;
 neither is EXT-08's to close, and E-1's substance is already adopted downstream in EXT-17's PRD.
 `docs/decisions-m5-m7.md` D-37 is the list as it stood at M7's close, with the discharged items
-struck through.
+struck through. **A bug-hunting review of `src/` on 2026-09-01 (`docs/code-review-2026-09-01.md`)
+found fourteen defects; ten are fixed, one was re-derived and rejected, and three became
+escalations E-7 to E-9** — read D-43 to D-49 before revisiting any of them, and PRD rev 14 for
+the four FR clauses that were added where the code had picked a behaviour the requirement did
+not state.
 
 **`docs/capture-format-v1.md` is FROZEN.** After the M7 freeze, a change to what it specifies is
 a version bump and a downstream change for EXT-17 — not an edit. Adding a key to an existing
@@ -128,7 +135,11 @@ Things established by measurement, which it would be expensive to re-derive:
 - **Host loss is `sim/engine/state` silence for 3.0 s**, derived from a measured 548 ms worst
   observed gap. Entity-state silence is *not* a host-loss signal — it happens at every unload.
 - **Both backpressure boundaries are already explicit**: `FIFO_DROP` / 1024 at the bus,
-  `drop_newest` / 8192 + 1024 reserved internally. `BLOCK` is rejected at both, and
+  `drop_newest` / 8192 + 1024 reserved internally. The internal reserve is **two** mechanisms:
+  the threshold, and `drop_oldest`'s rule that it evicts the oldest *sample* rather than the
+  oldest record. Only the first existed until D-43 — the second was the fix for the review's
+  H1, and it is what makes §16's "overload costs data and never structure" true under both
+  policies rather than only the default. `BLOCK` is rejected at both, and
   `docs/capture-format-v1.md` §14 promises consumers in writing that this producer never
   blocks the bus. OQ-4 is still open — M6's overload run is what resolves it.
 - **Handler cost is measured**: p50 ≤ 1 µs, p95 ≤ 5 µs, p99 ≤ 10 µs over 132 150 invocations,

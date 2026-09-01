@@ -1720,7 +1720,10 @@ Plus a set of **golden lines** — the exact bytes of an `entity_remove`, a `seg
 the header's opening keys. After the format freeze those are the friction that makes changing
 the spelling a deliberate act rather than an accident.
 
-29 checks, and the locale one is the one that earns its keep.
+39 checks, and the locale one is the one that earns its keep. Nine of them are not about
+determinism at all: the handler-to-writer queue's structural reserve landed here after the
+2026-09-01 sweep because `RecordQueue` links no import library and had nowhere else
+simulator-free to live.
 
 ### The evidence pack, and the one deliverable that is not here
 
@@ -1812,3 +1815,67 @@ the last record that did not fit would have been — which is the reserve doing 
 is for. The stop path closes at 293 285 bytes of a 300 000 bound with seven verdicts and a
 well-formed trailer, and live-versus-replay verdicts over that size-limited capture are still
 byte-identical.
+
+---
+
+## What a defect review found that the stream had not (2026-09-01)
+
+A bug-hunting review of `src/` (`docs/code-review-2026-09-01.md`) landed after M7 closed. Most
+of what it found is not about the stream at all — it is about paths the reference run never
+takes — and that is the entry worth writing down. **Three of the four highest-severity findings
+are unreachable on the default configuration**, which is precisely why 132 188 samples of live
+traffic had not surfaced them.
+
+- **`--overflow-policy drop_oldest` had never been run.** D-8's overload experiment
+  (`--queue-size 4`, 2 520 samples dropped, **0** events) was run under the default
+  `drop_newest`, and the two-threshold reserve was only ever implemented for that branch. Under
+  the other policy an arriving sample popped the front of the queue — which during a scenario
+  load is the `entity_created` burst. The measurement that proved the reserve worked was taken
+  on the one path where the reserve was complete. *A default-path measurement is evidence about
+  the default path.*
+- **The capture's own `verdict` records had a placement rule nobody was enforcing.** Spec §7
+  requires a `verdict` to fall inside an open segment. The producer emitted the end-of-run
+  not-met verdicts without checking one was open, and the conformance reader — which enforces
+  that rule for `sample`, `entity_add` and `entity_remove` — did not check it for `verdict`. So
+  a producer defect and the instrument that would have caught it had the same blind spot, and
+  every capture in this repository passes because every one of them happens to have a segment
+  open at that moment.
+- **`Message::sequenceNumber` had never been read.** Not by us, and not by anything in the
+  release's headers — the field is declared in `Message.h` and appears nowhere else under
+  `include\`. BTB-BP-2's second acceptance criterion asks for gap detection against it, and
+  §14 documents a whole-frame loss that every platform counter reads zero through. The one
+  instrument that could have counted that loss was being discarded on every arrival.
+
+  It is now read, per topic, and reported in the run summary — **as observed, not as a loss
+  count.** How this platform allocates the sequence is not documented anywhere and no
+  measurement here has established it. If it numbers per topic, a gap is upstream loss; if it
+  numbers per bus, every per-topic delta is greater than one and the number means nothing. So
+  the summary prints `contiguous`, `gaps`, `reordered` and `unnumbered` side by side and says
+  which of them is safe to read. `reordered` is the one that means the same thing under any
+  scheme. **What the next live run should do is look at that block** — the shape of the numbers
+  answers the question no header does.
+
+### The one thing that changes what the notes assert about the stream
+
+`entity_deleted` was assumed to arrive at most once per occupancy. Nothing in the release
+guarantees that — the event vocabulary is the engine's, and a `reason` outside its own set is
+already something this project records verbatim rather than coerces. A second delete with no
+`entity_created` between the two used to produce a second `entity_remove` record for one
+occupancy, which is a capture §8.1's bracketing forbids.
+
+It is now counted under `deleteOfClosedOccupancy` and ignored. **The counter has been zero on
+every run recorded so far, and it is worth watching**: if it ever moves, the stream did
+something this roster model did not anticipate, and that belongs here rather than in a
+changelog.
+
+Two smaller ones, for completeness, both about our own behaviour rather than the bus:
+
+- The bridge's `--out-dir` walk used `std::filesystem`'s **throwing** `operator++`. Reading a
+  directory is not obviously an operation that throws, which is how it survived a project whose
+  first hard rule is "never throw"; the non-throwing form needs an explicit `it.increment(ec)`
+  loop, because a range-for cannot express it.
+- A `MessageSchema` arrives with every decoded message and was being dropped on the floor. It
+  is the same object as the one resolved at startup on every arrival observed — but "is the
+  same object today" and "is guaranteed to be" are different claims, and BTB-EP-2 AC2 was
+  written about the second. A message on the entity-state topic carrying a *different* schema
+  is now excluded and counted rather than written under the wrong `message` name.

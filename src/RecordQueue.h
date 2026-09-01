@@ -26,6 +26,12 @@
 // catastrophic loss is unreachable at any rate this platform produces: the reference run's
 // entire event traffic is 134 messages against 132 188 samples (D-8).
 //
+// The threshold is only half of that reserve. `drop_oldest` also has to be told what it may
+// evict, or an arriving sample simply pops whatever is at the front - which during a scenario
+// load is the creation burst. It evicts the oldest *sample* instead, and refuses the arrival
+// when the queue holds no sample to give up. The reserve therefore holds under BOTH policies,
+// which is what docs/capture-format-v1.md section 16 promises a reader in writing (D-43).
+//
 // BLOCK is not offered. The format specification already promises EXT-17 in writing that
 // this producer never blocks the bus (docs/capture-format-v1.md section 14), and blocking
 // here blocks the handler, which stalls the bus delivery thread - the same perturbation by a
@@ -47,7 +53,7 @@ namespace n8ro::bridge {
 
 enum class OverflowPolicy {
     DropNewest,   // refuse the arriving record. The default - see below
-    DropOldest,   // evict the front of the queue to make room
+    DropOldest,   // evict the oldest SAMPLE to make room; never a structural record
 };
 
 // Parses `--overflow-policy`. Returns false for anything unrecognised, and for `block`
