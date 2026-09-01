@@ -161,10 +161,11 @@ with `end_reason: host_lost`, prints a run summary and exits 0.
 | `--entity-state-message` | message instance name the entity-state topic is resolved *from*. Default `simEntityStateUpdate`. Optional |
 | `--engine-state-message` | message instance name the host-loss heartbeat is resolved *from*. Default `simEngineState`. Optional |
 | `--queue-size` | handler-to-writer queue bound, in sample records. Default `8192`. Optional |
-| `--overflow-policy` | `drop_newest` (default) or `drop_oldest`. Optional |
+| `--overflow-policy` | `drop_newest` (default) or `drop_oldest`. Either way a `sample` is never permitted to evict a roster or segment record — `drop_oldest` evicts the oldest *sample*. Optional |
 | `--capture-max-bytes` | maximum size of **one capture file**, in bytes (BTB-CAP-6). Default `0`, meaning no bound. Minimum 16384 when set. The limit and the action below are written into the capture's own `header`. Optional |
 | `--on-size-limit` | what happens on reaching `--capture-max-bytes`: `stop` (default) or `rotate`. See [Bounding a capture](#bounding-a-capture). Optional |
 | `--capture-max-samples` | stop after this many `sample` records **across the whole run** and close with `end_reason: size_limit`. Default `0`, meaning no bound — a live run ends on host loss. A record-count safety bound; it always stops, never rotates. Optional |
+| `--topic-silence-s` | warn when a subscribed topic has decoded nothing for this many seconds **while the engine reports itself running** — the schema-mismatch fault, which is otherwise silent (BTB-OBS-2). Default `10.0`; `0` disables the check. Diagnostic only: no capture byte and no exit code depends on it. Optional |
 | `--conditions` | JSON file of declared conditions. Without it the bridge records but judges nothing. Optional |
 | `--replay` | offline mode: re-judge a stored capture with no simulator, no bus and no client. Requires `--conditions`, and is mutually exclusive with `--config` |
 
@@ -250,6 +251,17 @@ an inherited default. Neither uses `BLOCK`.
 |---|---|---|
 | bus → handler | `FIFO_DROP`, queue **1024** | The `SubscriptionOptions` default is `KEEP_LATEST` with queue 100. For a recorder that is precisely wrong: it discards the *older* of two messages, which is the one already part of the run's history. 1024 is ~1.25 s of headroom at the reference scenario's 818 packets/s, against ~120 ms for the default. Provisional — M6 confirms it under overload (OQ-4) |
 | handler → writer | `drop_newest`, **8192** sample records **+ 1024 reserved** | Drop-oldest is `KEEP_LATEST`'s mistake one thread later. 8192 records is ~16 MB and 10 s of headroom at the reference rate. The reserve is only usable by roster and segment records, so overload costs data and never structure — measured: at `--queue-size 4` a reference run dropped 2 520 samples and **zero** events, and the capture still contained two correct segments |
+
+The reserve is two mechanisms, not one, and it holds under **both** policies. The threshold — a
+sample is refused above `--queue-size`, a structural record only above `--queue-size + 1024` —
+is what stops a sample burst from *filling* the roster records' headroom. Under `drop_oldest`
+that is not enough on its own, because an arriving sample does not merely fail to fit: it
+chooses a victim, and the front of the queue during a scenario load is the `entity_created`
+burst. So `drop_oldest` evicts the oldest **sample**, skipping past any roster or segment
+record ahead of it, and refuses the arrival outright when the queue holds no sample to give up.
+Either way the loss is counted, and `trailer.drops.events_not_recorded` cannot be non-zero from
+overload alone — which is what §16 of the format spec tells a reader it may lean on. Regression
+-tested for both policies in `tests/determinism/`; see D-43.
 
 **`block` is not offered at either boundary.** Blocking the bus stalls the publisher and changes
 the run being recorded; blocking the internal queue blocks the handler, which stalls the bus
@@ -422,6 +434,12 @@ own verdicts from the file alone, the file demonstrably contains enough for a th
 Replay of a 64 MB, 132 454-line capture takes **1.02 s**, against a target of under 60 s for a
 ten-minute capture.
 
+> **Vendoring this?** Take [`docs/condition-file-schema.md`](docs/condition-file-schema.md), not
+> an excerpt of the four sections below. It carries all four — the declaration shape *and* the
+> arithmetic and boundary rules every number in a verdict depends on — in one file, so a re-pin
+> is a byte comparison. Excerpting these by hand is how a downstream consumer ended up with the
+> shape and none of the arithmetic (EXT-17's E-5).
+
 ### Declaring conditions
 
 The vocabulary is **closed at three kinds**. A fourth is a named parse error and a non-zero
@@ -540,10 +558,10 @@ cl /std:c++17 /EHsc /W4 /O2 ^
 entity_picture_test.exe
 ```
 
-Exit code 0 if every check passes, 1 otherwise with each failure named. 72 checks covering
+Exit code 0 if every check passes, 1 otherwise with each failure named. 81 checks covering
 occupancy lifecycle (ADR-6), orphan counting, verbatim reasons and payloads, absent-field
-accounting, deterministic ordering, the bounded event log, and concurrent handler/snapshot
-traffic.
+accounting, deterministic ordering, the bounded event log, concurrent handler/snapshot
+traffic, and the guard that stops a repeated `entity_deleted` closing one occupancy twice.
 
 The suite's own adequacy is checked by mutation: deliberate defects introduced into
 `EntityPicture.cpp` must make it fail. That is worth re-running when the picture changes —
@@ -579,6 +597,13 @@ containers. It also carries **golden lines** — the exact bytes of an `entity_r
 carries (spec §6.6, §6.7), and a trailer with and without `continued_in` — so that after the
 format freeze, changing a record's spelling means editing a test that says "these bytes". It also carries **BTB-CAP-4's schema-growth check**: a field inserted into the middle of a schema must appear in the `sample` record in the position the schema declares, with no code change — which is the half of UAC-BTB-CAP-4 that needs no simulator.
 
+It also carries the one **writer-side** invariant that is checkable with no file and no
+simulator: the handler-to-writer queue's structural reserve (BTB-BP-4, D-8, format spec §16) —
+that an overload costs samples and never roster or segment records, under **both** overflow
+policies. That is not a determinism property; it lives here because `RecordQueue` links no
+import library and has no other simulator-free home, and a separate harness for three checks
+would be a fourth build line for the same three checks.
+
 The locale check is the one that earns its keep. `%.17g` is round-trip exact and *silently*
 locale-dependent, and this machine's locale is comma-decimal, so the test runs for real rather
 than being skipped.
@@ -588,11 +613,12 @@ cl /std:c++17 /EHsc /W4 /O2 ^
    /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
    /Fe:determinism_test.exe ^
    tests\determinism\determinism_test.cpp src\CaptureFormat.cpp src\Json.cpp ^
-   src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp
+   src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp ^
+   src\RecordQueue.cpp
 determinism_test.exe
 ```
 
-29 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
+39 checks, exit 0 if all pass. The end-to-end half — ten replays of one stored capture, hashed
 — is `tests\determinism\replay_hashes.ps1`; see [Reproducing the
 evidence](#reproducing-the-evidence).
 
@@ -722,13 +748,15 @@ The captures the shoot produced are committed in `captures/` under the `demo`, `
 ### The four unit suites — no simulator needed
 
 ```cmd
-build\tests\entity_picture_test.exe     :: 72 checks - the roster and ADR-6
+build\tests\entity_picture_test.exe     :: 81 checks - the roster and ADR-6
 build\tests\referee_test.exe            :: 93 checks - the three condition kinds
-build\tests\determinism_test.exe        :: 29 checks - R4's hazards, the locale, golden bytes, CAP-4
+build\tests\determinism_test.exe        :: 39 checks - R4's hazards, the locale, golden bytes,
+                                       ::             CAP-4, and BP-4's structural reserve
 build\tests\capture_reader.exe docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
     --spec docs\capture-format-v1.md     :: the format spec, checked against a real file
 python tests\capture-reader\mutate.py docs\sample-capture\capture-atacama-air-defense-sample.n8rocap.jsonl ^
-    build\tests\capture_reader.exe docs\capture-format-v1.md   :: 22 mutations, 0 survivors
+    build\tests\capture_reader.exe docs\capture-format-v1.md   :: 23 mutations, 0 survivors
+python tests\referee\check_schema_digest.py  :: the vendorable condition digest still matches this file
 ```
 
 The build lines for each are in the file's own header comment, and in [Tests](#tests) above.
@@ -770,6 +798,9 @@ This is the one that changes what EXT-17 should build. It needs the headless hos
 the bus — the invocation OQ-2 asked about:
 
 ```cmd
+:: EVERY terminal below: call C:\N8RO\setup.cmd first. It exports N8RO_RELEASE and puts
+:: C:\N8RO\bin on PATH, and BOTH are required here - see the two paragraphs under this block.
+
 :: terminal 1 - the bridge, started first
 build\x64\Release\n8ro-bridge.exe --config SimEngineClient_SharedMemory ^
     --model-path C:\N8RO\data\db --schema-file N8roSimSchema --out-dir captures --run-label r8a
@@ -781,6 +812,23 @@ n8ro-sim-app.exe --sim-config SimEngineHost_SharedMemory ^
 :: terminal 3 - load, start, run to a FRAME budget, stop
 build\tests\host_driver.exe --scenario "Atacama Air Defense" --frames 1200
 ```
+
+**`N8RO_RELEASE` must be set for the headless host too, and its failure mode is the dangerous
+one.** This block was first written as though the variable mattered only to the build and to
+`n8ro-sim-local` ("Start order", above). It does not. With `N8RO_RELEASE` unset,
+`n8ro-sim-app.exe` resolves its plugin directory from the **current working directory**, skips
+the plugin scan, never registers `componentPhysics` from the stock
+`bin\plugins\sim\n8ro-physics.dll`, and then **refuses every scenario load whose entities need
+it** — all 42 of `Atacama Air Defense`. It does not exit and it does not report a failure: it
+sits idle, so terminal 3 waits on a load that will never complete and an unattended run **hangs
+rather than fails**. Measured downstream by EXT-17 (its E-6 / F-17), and confirmed by the
+platform mentor on 2026-09-01 as the expected production provisioning rather than a workaround.
+
+**`C:\N8RO\bin` on `PATH` is a second, separate precondition, and setting one does not cover
+the other.** It is where `n8ro-sim.dll` and `n8ro-core.dll` resolve from, and there is nowhere
+else. An SDK-linked binary — the bridge, `host_driver`, or anything EXT-17 builds — launched
+from a directory without it exits **53** having produced no output at all, which reads like a
+crash and is a missing DLL.
 
 Repeat for `r8b`, then compare:
 

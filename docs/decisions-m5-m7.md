@@ -693,3 +693,268 @@ neither of which is a shipped interface — which is the measure of how little w
 The general point, because it recurred: **an open question kept open because its answer lives in
 another organisation is not diligence, it is a document that never closes.** The test is whether
 anything this project ships would change with the answer. Here, nothing does.
+
+---
+
+## Post-M7 — the 2026-09-01 defect sweep
+
+Six judgement calls taken while working the findings in `docs/code-review-2026-09-01.md`.
+Plain corrections — a `runCounts_` read where a `counts_` read was written, a flush whose
+result was dropped — are not recorded here; these are the ones where the fix was a choice
+between two defensible behaviours, or where the honest answer was to make no change.
+
+### D-43 — under `drop_oldest`, a sample is refused before a roster record is evicted
+
+`RecordQueue` implemented the structural reserve as a **threshold** — a sample is refused above
+`capacity`, a structural record only above `capacity + reserve` (D-8). A threshold is enough
+for `drop_newest`, where an overrunning record simply fails to fit. It is not enough for
+`drop_oldest`, where the arriving record does not fail to fit: it *chooses a victim*, and the
+front of the queue during a scenario load is the `entity_created` burst. So `drop_oldest`
+inverted the exact trade D-8 was written to prevent — 2 520 samples dropped and 0 events under
+the default policy, and under the other policy the burst.
+
+Two candidate fixes. **Refuse the arriving sample when the queue is full of structural records**
+(the simple one) loses the property that `drop_oldest` keeps the *newest* data, which is the
+only reason anyone would select it. **Evict the oldest sample rather than the oldest record**
+keeps that property and keeps the reserve. Taken: the second, with the first as its fallback
+for the corner where there is no sample to give up.
+
+The scan is `find_if` from the front for the first non-structural record. That is O(n) in the
+worst case where it was O(1), and the worst case needs a queue holding nothing but roster
+records — 134 event messages against 132 188 samples on the reference run, so in practice the
+first candidate *is* the front and the scan is one comparison.
+
+The counters do not change meaning: the loss is counted under the kind of the record that
+leaves, which under `drop_oldest` is now always a sample. That is what keeps
+`trailer.drops.events_not_recorded` the number `docs/capture-format-v1.md` §16 promises.
+
+**What would reverse it:** a reader that wants `drop_oldest` to mean "the last N records,
+whatever they are". Nobody has asked for that, and §16 tells every reader the opposite.
+
+BTB-BP-4 gains the criterion in the same change (PRD rev 14), because the FR named three
+policies without saying which invariant wins when one of them collides with the reserve.
+Regression-tested for **both** policies in `tests/determinism/`, and mutation-verified: putting
+the old `pop_front()` back fails four checks.
+
+### D-44 — end-of-run verdicts get a segment opened for them, and keep their own stamp
+
+`finish()` emitted the not-met verdicts before closing the segment — correct — but never
+checked that a segment was open. Three reachable paths put them outside one: conditions
+declared and no scenario ever loaded; an interrupt between a `scenario_unloaded` and the
+reload's creation burst; and a rotation that could not open a usable part. Format spec §7 says
+`verdict` records "also fall inside an open segment", so all three produce a malformed file.
+
+The fix is one `openSegment` when none is open and the referee has conditions. The judgement is
+in what the fix deliberately does **not** do: it does not restamp the verdicts.
+
+Restamping is what `drainVerdicts` does for mid-run verdicts, and for a good reason (spec §5.2 —
+a record names the segment in the file that contains it). Doing the same here would break
+BTB-REF-4. Live and replay agree because both anchor an end-of-run verdict on the **last data
+record**, which is the only anchor a replay reading the finished file can reach; a segment
+opened solely to host verdicts contains no data record, so replay's anchor does not move when
+it reads one. Restamping to the new ordinal would make the live file say one thing and its own
+replay say another, and BTB-REF-4 AC1 is byte-identity.
+
+Spec §10 settles the value independently and in the same direction: "on a not-met verdict it is
+the time of the last data record in the run, and `segment` the segment that record was in".
+
+**The residual, stated rather than hidden:** on the rotate-abort path the last data record is in
+the *previous part*, whose ordinals the new part does not have — so a verdict there names a
+segment its own file lacks. §10 and §5.2 point opposite ways in that one corner. It is
+`docs/escalations.md` E-5, because choosing between them is a spec decision and EXT-17 reads
+both sections. It is reachable only after an error the producer already logs and stops on.
+
+**What would reverse it:** EXT-17 saying it keys verdicts on the enclosing `segment_open`
+rather than on §10's rule. Then §10 changes, and this restamps.
+
+### D-45 — the delivered `MessageSchema` is carried as a pointer, and a foreign message is excluded
+
+BTB-EP-2 AC2 requires the `MessageSchema` delivered with each message to be "used for field
+order, not discarded". It was discarded: the handler took it as an unnamed parameter and the
+writer formatted against a copy taken from the registry at startup. Identical today; not
+guaranteed by anything in the code, which is why the criterion is worded the way it is.
+
+Three ways to satisfy it. **Copy the schema per record** is a vector of strings per message on
+the bus thread — precisely the work hard rule 2 keeps out of a handler, at 818/s. **Compare and
+carry nothing** verifies the identity without ever using the delivered schema, which is not
+what the criterion says. Taken: **carry a `const MessageSchema*`**, which costs a pointer copy.
+
+Its lifetime is the registry's, and that is a condition rather than a guarantee. The schemas
+live in a `shared_ptr<const RegistrySnapshot>` that `reloadAllSchemas` / `processSchemaChanges`
+would swap; this program builds one registry, calls neither, and destroys the registry after
+both the subscriptions and the writer thread. Written down in `CaptureRecord.h` because
+"nobody calls reload" is exactly the kind of fact that stops being true silently.
+
+**And a second change the finding implies but did not name.** Using the delivered schema alone
+would swap one malformation for another: a foreign message on the entity-state topic would be
+written verbatim under its own name, into a file whose `header.schemas` declares only one
+message — a `sample` record no reader could join. So the handler also checks the delivered
+`messageId` / `schemaHash` against the resolved entity-state message and **excludes and counts**
+a mismatch. Two relaxed atomics; excluded rather than recorded because a header is written once,
+at open, and cannot gain a schema later.
+
+**What would reverse it:** a model database that deliberately multiplexes message types onto one
+topic. Then `header.schemas` has to carry every message the topic can bear, which is a format
+question (§6.5) and a version bump, not a producer change.
+
+### D-46 — a repeated `entity_deleted` is counted, not acted on
+
+`onEntityEvent` closed an occupancy without checking it was open. A second `entity_deleted` for
+a name with no `entity_created` between the two returned a second `Kind::Removed`, which the
+writer turns into a second `entity_remove` record — two closes for one open, against §8.1's
+"opened by an `entity_add` and closed by **the matching** `entity_remove`". It also
+double-counted `removalsByReason_`, so the summary's removal tally would exceed the roster.
+
+Never observed on runtime 2.1.328. Fixed anyway, because the cost is one comparison and the
+alternative is a capture EXT-17 cannot key on, produced by a vocabulary we do not own.
+
+Counted under `deleteOfClosedOccupancy` rather than warned: a warning implies the operator can
+act, and they cannot — it would be the engine's behaviour, not theirs. If the counter ever
+moves, that is a `notes.md` entry about what the stream contained that we did not expect.
+
+**What would reverse it:** the platform giving a repeated delete a meaning — a *second* removal
+of a re-created body whose `entity_created` we missed. Then the missing create is the defect and
+this guard hides it, and the fix moves to the create side.
+
+### D-47 — the writer thread is guarded, and the run summary is not the only place it shows
+
+`main()`'s `try`/`catch` covers the main thread. An exception leaving the writer-thread lambda
+is `std::terminate`: no trailer, no flush, no diagnostic, and an exit code outside
+`ExitCodes.h`. There was one concrete throwing call behind it — `nextRunLabel` constructed its
+`directory_iterator` with an `error_code` and then advanced it with the throwing `operator++`,
+which has no `error_code` form — and every `std::string` built in `CaptureFormat` is a
+`bad_alloc` site besides.
+
+Both fixed, and the second is the one that matters: the guard makes hard rule 1 structural
+rather than a property of the code as currently written.
+
+The judgement is what the guard does after catching. **Swallow and continue** is not available —
+the writer's state is unknown. **`std::exit` from the thread** skips the trailer, which is the
+one thing a consumer needs. Taken: set an atomic the main loop already polls beside
+`writer.failed()`, break, and run the **ordinary** teardown — so the queue closes, the thread
+joins, and `finish()` writes a trailer if the file is still usable. The process then returns
+`kExitUnexpected` rather than `kExitOk`, because a campaign runner reading a truncated capture
+as a complete one is the failure this is protecting against.
+
+**What would reverse it:** nothing likely. This is the shape `main()` already uses one thread
+over.
+
+### D-48 — the host-loss teardown keeps no timeout of its own (no change made)
+
+Finding L5 observes that `startDrainWatchdog` fires only on a *second interrupt*, so on an
+unattended host-loss teardown the four `unsubscribe` calls and `stopMessagePump()` run against a
+dead bus with nothing behind them. BTB-CX-3 AC2 says the bridge "never blocks indefinitely on a
+dead bus".
+
+**No change.** An unconditional teardown timeout would force-exit a drain that is merely slow —
+a large queue flushing to a slow disk is exactly that — and BTB-SD-1 requires "every record
+enqueued before the signal present in the capture". Trading a *measured* guarantee for an
+*unmeasured* one is the wrong direction, and the finding is explicitly PLAUSIBLE: whether these
+SDK calls can block on a dead bus at all could not be established statically, and establishing
+it needs a host that is killed mid-run, which this sweep did not run.
+
+What would settle it: kill `n8ro-sim-app.exe` under `tests/host-driver/` with the bridge
+attached and time the teardown. If it blocks, the fix is a timeout scoped to the SDK calls
+**before** `queue.close()`, never around the drain — the drain is ours and is bounded by the
+queue's own size.
+
+**What would reverse this non-decision:** one observation of a teardown that did not return.
+
+---
+
+## Post-M7 — the four corrections EXT-17 raised
+
+EXT-17 filed four defects against what EXT-08 hands it, as GitHub issues #1–#4. All four are
+**documentation**: nothing about a capture, a verdict or the producer changes, and no test that
+passed before fails after. They are recorded here because two of them touch a **frozen** file and
+one changes what the boundary artifact *is*, and both of those are choices rather than typo
+fixes.
+
+### D-49 — E-3 and E-4 are clarifications, admissible under the freeze, and the freeze is why they are worded narrowly
+
+`docs/capture-format-v1.md` is frozen: a change to what it specifies is `n8ro-capture/2`. Neither
+of these changes what it specifies.
+
+- **E-3 (#1), §6.7 stitching rule 2.** The rule said a run's totals are the sum of its parts'
+  `counts`. For four of the five counters that is true; for `segments` it contradicts rule 1
+  three paragraphs above it, which already says a cut segment is *one* segment appearing in two
+  files. EXT-17 measured it: four parts reading 1, 1, 1, 2 for a run with 2 segments. **The fix
+  narrows the sentence and states the correction** — subtract one per cut, a cut being a part
+  carrying both `size_limit` and a `continued_in`. §11 restates the same rule and was corrected
+  with it.
+- **E-4 (#2), §5.1's frozen-clock test.** The *test* was never wrong and is unchanged. What was
+  too narrow is the **reading** attached to it: "the clock was reset" is one cause of a positive
+  result and EXT-17 measured two more — a burst published twice with identical values inside a
+  segment whose clock ran normally (1 of 27 ordinary runs), and a pre-`start` update landing in
+  that burst with values that differ (4 of 35 such runs). The fix states what a positive result
+  actually establishes — *the segment cannot be aligned on `sim_time_s`* — lists the three
+  shapes, and says they are distinguishable and why that is worth doing. §14's self-test guidance
+  gained the consequence EXT-17 pays for: excluding these segments can leave a self-test with
+  **nothing** to compare, which is a refusal and not a pass, and retrying until a pair comes out
+  comparable would turn a real refusal into a silent one.
+
+**Why this is admissible.** A capture written before these edits is byte-identical to one written
+after; no key gains, loses or changes a meaning; no reader that conformed before fails after. §13
+already permitted clarifications and the frozen banner says so. **What would have made them a
+version bump** is changing the test in §5.1 or the meaning of `counts.segments` in a file —
+neither was touched. Both are listed in §13 under "Clarifications made after the freeze" so a
+downstream project holding a pinned copy can see what moved without diffing the whole file.
+
+**What this does not do:** it does not correct any capture already written, and every capture was
+readable and correctly readable throughout. What was at risk was two projects computing different
+numbers from one frozen document, which is the thing a frozen document exists to stop.
+
+### D-50 — the condition schema becomes a file, rather than staying a set of README sections
+
+**E-5 (#3) is not a wording defect; it is a defect in the shape of the artifact.** The condition
+schema had no file. It lived as four consecutive sections of `README.md`, and a downstream
+project vendoring it excerpted the two that declare the file shape and stopped one heading before
+the two that say what the numbers mean — "How distance is computed" and "Boundary semantics".
+
+The excerpt was faithful, verbatim and not stale. It was still enough to produce **silent
+divergence**: from the shape alone a consumer could reasonably compute a great-circle or
+horizontal distance and then emit verdicts disagreeing with this referee's, on the same capture,
+in the same vocabulary, against the same condition ids, with nothing anywhere to surface it.
+
+**Three options were considered.**
+
+1. *Reply "yes, take those two sections as well".* Rejected. It fixes one consumer and leaves the
+   next one to make the same excerpt, because the thing that invited the excerpt — that there is
+   no file to take — is untouched.
+2. *Move the sections out of `README.md` into the new file and link them.* Rejected. The referee
+   section of a README that a reader lands on should say how a distance is computed; sending them
+   to another file to find out is worse for the larger audience.
+3. **Adopted: `docs/condition-file-schema.md` carries all four sections verbatim, `README.md`
+   keeps them, and a test fails if the two ever drift.** `tests/referee/check_schema_digest.py`
+   compares the spans line by line and prints the first difference; it needs no simulator and no
+   build. Verified to reject: changing one `<=` to `<` in the digest fails it, naming the line.
+
+`README.md` now points at the file immediately above the sections, so "vendor this, do not
+excerpt these" is answered where the excerpt would otherwise be made. This also closes EXT-17's
+**F-19** as a side effect: its vendored digest could not be verified by identity because no file
+of that name existed upstream, and now one does — so a re-pin is a byte comparison, exactly as it
+is for the capture format.
+
+**What would reverse it:** the duplication is real, and a test is a weaker guarantee than a single
+copy. If these sections grow, option 2 becomes the right one and the README keeps a summary.
+
+### D-51 — E-6 is fixed where the omission was, not where it was reported
+
+**E-6 (#4)** was filed against `PROVENANCE.md` finding 6 — which is EXT-17's own manifest and not
+an EXT-08 file at all. EXT-17 caught that itself and corrected the citation by a comment rather
+than a silent edit (its F-37). The substance was unaffected and it is EXT-08's: the **R8 spike
+block in `README.md`** gives the headless invocation with no mention of `N8RO_RELEASE`, and
+following it exactly produces a host that refuses every 42-entity scenario load **while sitting
+idle rather than failing** — the shape that hangs an unattended campaign instead of breaking it.
+
+The block now says to run `setup.cmd` in every terminal, and states both preconditions under it
+with their failure modes: `N8RO_RELEASE` unset gives the silent-idle refusal, and `C:\N8RO\bin`
+missing from `PATH` gives exit **53** with no output, which reads like a crash and is a missing
+DLL. They are two separate preconditions and setting one does not cover the other.
+
+**Why it was worth an edit rather than "it works on a machine that has run `setup.cmd`".** The
+README says elsewhere that `setup.cmd` does both, which is true and was not enough — the R8 block
+is a self-contained recipe that a reader runs as written, and it was written as though the
+variable mattered only to the build and to `n8ro-sim-local`. The platform mentor confirmed on
+2026-09-01 that `N8RO_RELEASE` **is** expected to be set in production, which is what moved this
+from "our machine is provisioned oddly" to a defect in the instructions.

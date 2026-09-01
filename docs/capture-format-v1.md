@@ -173,6 +173,37 @@ observed platform behaviour rather than format choices:
   the maximum number of samples any one `(entity, occupancy)` carries at a single `sim_time_s`
   is 1; in a frozen one it is not. §14 says the same thing from the determinism side, and
   `tests/determinism/compare_captures.py` in the producer's repository implements it.
+
+  **The test is exact; its reading is narrower than the test.** What a positive result
+  establishes is that **the segment cannot be aligned on `sim_time_s`** — which is the whole of
+  what a consumer needs, and is why the instruction to exclude the segment does not depend on
+  the cause. A reset clock is **one** cause of that and not the only one. Three are measured:
+
+  1. **The clock was reset** — the engine's stop path, described above. The segment carries one
+     `sim_time_s` value across dozens of samples per key.
+  2. **Part of a publication burst was published twice, with byte-identical values**, inside a
+     segment whose clock did **not** reset. Measured downstream on an ordinary 1200-frame
+     `Atacama Air Defense` run with no manipulation of any kind: segment 0 had 1 200 distinct
+     `sim_time_s` values spanning `0` to `59.999999999998728`, and **13** instants published
+     twice for one `(entity, occupancy)` — the first thirteen entities of the start-up roster
+     burst, at `sim_time_s 0`, all at `phase: "uninitialized"`, **13 of 13 carrying identical
+     values**. Frequency over 42 real captures: 2 have a frozen segment 0, and 1 of 27 ordinary
+     unmanipulated runs (~3.7%).
+  3. **A publication landed inside that same burst carrying values that differ** — the shape a
+     consumer causes for itself by updating entity state after scenario load and before
+     `start`. Measured downstream at 4 of 35 such runs (11.4%), against 1 of 27 ordinary ones.
+
+  **Shapes 2 and 3 are distinguishable from each other, and both from shape 1**, by whether the
+  repeated records' values agree and by whether the segment spans more than one `sim_time_s`.
+  Distinguishing them is worth the trouble because they have different causes upstream: shape 1
+  is the engine's lifecycle, shape 2 sits upstream of the producer (the duplicate records are
+  byte-identical and both are in the file, so the producer recorded faithfully what it was
+  handed), and shape 3 is the consumer's own doing. **The instruction is the same for all
+  three — exclude the segment** — but a consumer that reports "the clock was reset" for shape 2
+  or 3 is reporting something that did not happen, and one that cannot tell them apart cannot
+  tell a platform finding from a defect in its own harness.
+
+  Reported by EXT-17 (its E-4), which measured shapes 2 and 3 and implements this reading.
 - **It carries accumulated floating-point error, and the capture preserves it exactly.**
   Values such as `35.20000000000014` and `65.74999999999841` are real and correct — a 0.05 s
   frame increment summed a few hundred times. They are not rounded, because rounding them
@@ -365,9 +396,20 @@ skipping each part's `header` and `trailer` after the first. Two rules matter:
    `reason: "size_limit"` at the end of one part and a `segment_open` at the start of the
    next — one segment split across two files, not two segments. Any statistic computed per
    segment across a set must key on `(part, segment)`, never on `segment` alone.
-2. **`counts` in each `trailer` is that file's own.** The run's totals are the sum across
+2. **`counts` in each `trailer` is that file's own, and only four of the five sum.** The run's
+   totals for `samples`, `entities_added`, `entities_removed` and `verdicts` are the sum across
    parts. Nothing in any part states the set's total, because no part knows it — part 0's
    trailer is written long before the run ends.
+
+   **`segments` is not summable**, and rule 1 above is why: a segment cut by a rotation is
+   closed in one part and opened in the next, so it is counted in **both** parts' `segments`.
+   The sum therefore over-counts a run's segments by one per cut. **Subtract one per cut** — a
+   cut is a part whose `trailer` carries both `end_reason: "size_limit"` and a `continued_in`.
+
+   Measured on a rotated four-part recording of a 1200-frame `Atacama Air Defense` run: the
+   parts' `segments` read 1, 1, 1, 2 and sum to **5**; the run has **2**, exactly as an
+   unrotated recording of the same configuration produces (§16). The other four counters summed
+   correctly and matched the unrotated run exactly. Reported by EXT-17 (its E-3).
 
 ### 6.5 `schemas`
 
@@ -698,7 +740,10 @@ A reader should count the records itself and compare. A disagreement means the f
 truncated, or the producer is defective; either way it is worth reporting.
 
 **In a rotated set these are per part**, not per run (§6.7). Summing them across the set gives
-the run's totals; no single file states them.
+the run's totals for `samples`, `entities_added`, `entities_removed` and `verdicts`; no single
+file states them. **`segments` does not sum** — a segment cut by a rotation is counted in both
+the part that closes it and the part that reopens it, so subtract one per cut. §6.7's stitching
+rule 2 has the correction and the measurement.
 
 **One caveat on an intermediate part's `drops` and `bus_metrics`.** The trailer of a part that
 was closed by a rotation is written mid-run, by the producer's writer thread, at a moment when
@@ -855,6 +900,19 @@ partial parse (§3, step 2).
 **Old captures are never rewritten.** If `n8ro-capture/2` ships, files written under version 1
 remain valid under version 1, and this document remains their specification.
 
+### Clarifications made after the freeze
+
+Listed so a consumer holding a pinned copy can see what moved without diffing the whole file.
+**Neither entry changes what a conformant file contains, what any key means, or what any reader
+must accept or reject** — a capture written before them is byte-identical to one written after,
+and a reader conformant before them is conformant after. That is what makes them admissible
+under the freeze; anything else would be `n8ro-capture/2`.
+
+| Date | Section | What was clarified | Reported by |
+|---|---|---|---|
+| 2026-09-01 | §6.7 rule 2, and §11's restatement of it | `counts.segments` is **not** summable across the parts of a rotated set; the other four counters are. A cut segment is counted in both parts, so subtract one per cut | EXT-17, E-3 |
+| 2026-09-01 | §5.1's third bullet, and §14's self-test guidance | §5.1's frozen test is exact, but its **reading** is narrower than "the clock was reset": three phenomena satisfy it, they are distinguishable, and excluding them can leave a self-test with nothing to compare — which is a refusal, not a pass | EXT-17, E-4 |
+
 ---
 
 ## 14. Determinism guarantees
@@ -993,6 +1051,13 @@ The distinction above is the whole of the practical advice, so it is worth stati
    samples per entity at one value (§5.1). And **exclude frozen-clock segments entirely**;
    they cannot be aligned across runs, and a comparison that tries reports differences that
    are artifacts of the alignment rather than of the data.
+
+   **Excluding them will sometimes leave you with nothing to compare, and that is not a pass.**
+   §5.1 records three phenomena that satisfy the frozen test, and two of them can land on
+   segment 0 of an otherwise ordinary run — measured downstream at about 1 run in 27, so about
+   1 pair in 14. A self-test with no comparable segment left has established nothing and should
+   say so, in its own state rather than as a pass. Retrying until a pair happens to come out
+   comparable would convert a real refusal into a silent one.
 4. **When two captures do differ, find the first differing record rather than reporting only
    that they differ.** The header, the record counts and a long identical prefix are all
    diagnostic: identical headers with divergence deep in the sample stream points at the
