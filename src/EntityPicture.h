@@ -7,9 +7,9 @@
 // Threading: every public method takes the same mutex. The bus calls onSample() and
 // onEntityEvent() from the pump thread; our own thread calls snapshot() and
 // drainEvents(). Nothing here does IO, parsing or formatting - a handler is a courier
-// (CLAUDE.md hard rule 2), so it copies, hands off, and returns.
+// (the courier rule; PRD tie-breaker 5), so it copies, hands off, and returns.
 //
-// Ordering: every container iterated here is ordered (CLAUDE.md hard rule 4, BTB-EP-4).
+// Ordering: every container iterated here is ordered (BTB-EP-4 — order is meaning).
 // StreamValueMap is an std::unordered_map and is stored verbatim, but it is only ever
 // *looked up* by name, never iterated - field order comes from MessageSchema::fields.
 

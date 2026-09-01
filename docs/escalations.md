@@ -5,7 +5,7 @@ All are recorded here in full so they can be forwarded as they stand, and so tha
 finds them re-derived somewhere else can see they were raised.
 
 None blocks EXT-08. The first blocks **EXT-17** outright. E-7 to E-9 were raised by the
-2026-09-01 defect sweep (`docs/code-review-2026-09-01.md`, PRD rev 14) and are all addressed to
+2026-09-01 defect sweep (PRD rev 14) and are all addressed to
 **EXT-17's author**, because each is a change to a frozen cross-repo contract that only its
 consumer can agree to.
 
@@ -17,8 +17,8 @@ consumer can agree to.
 
 > **Numbering note.** This file's E-numbers run E-1, E-2, then E-7 onward. **E-3 to E-6 are
 > EXT-17's findings against *us*, not ours against anyone** — they arrived on 2026-09-01, carry
-> EXT-17's own numbering, and are answered in `docs/decisions-m5-m7.md` D-70 to D-72 and in
-> `docs/capture-format-v1.md` §13's post-freeze clarification table. They are not repeated here
+> EXT-17's own numbering, and are answered in `docs/capture-format-v1.md` §13's post-freeze
+> clarification table. They are not repeated here
 > because this file is the outbound list. The gap in the sequence is what keeps one label from
 > meaning two things.
 >
@@ -230,7 +230,7 @@ bytes, and reads neither key.
 **To:** EXT-17's author, as the reader of `trailer.drops`
 **Status:** raised 2026-09-01 by the defect sweep. Long-standing — the substitution was made at
 M5 and recorded, but the FR was never amended to match, so the two documents disagree
-**Evidence:** PRD BTB-BP-4 AC3; `docs/decisions-m5-m7.md` D-7; `docs/capture-format-v1.md` §11
+**Evidence:** PRD BTB-BP-4 AC3; `docs/capture-format-v1.md` §11
 and §16
 
 ### The disagreement
@@ -271,7 +271,7 @@ EXT-08 will implement (2) if asked; it is a small change to `RecordQueue`'s coun
 **To:** EXT-17's author, as the consumer of `verdict` records
 **Status:** raised 2026-09-01 by the defect sweep. Reachable only on an error path the producer
 already logs and stops on, so it is a correctness question rather than an operational one
-**Evidence:** `docs/capture-format-v1.md` §5.2, §7, §10; `docs/decisions-m5-m7.md` D-44
+**Evidence:** `docs/capture-format-v1.md` §5.2, §7, §10
 
 ### The two rules
 
@@ -313,7 +313,7 @@ One of:
    keeps BTB-REF-4 exact.
 2. **§5.2 wins**, the producer restamps end-of-run verdicts to the enclosing segment, and
    BTB-REF-4's byte-identity is re-derived by teaching the replay path the same rule — which
-   means the deciding rule exists in two places, which is the thing ADR-5 and CLAUDE.md both say
+   means the deciding rule exists in two places, which is the thing ADR-5 says
    not to do.
 
 Until it is decided the producer follows §10, which is the more specific rule and the one
@@ -327,8 +327,8 @@ For completeness, since a reader may expect them here:
 
 - **The 5-minute demo recording** is shot and **published as its four takes**, linked from the
   README with a beat-by-take map. All seven beats were captured on 2026-08-31 following
-  `docs/demo-recording-script.md`. Never a decision, and not one now either.
-- **BTB-CAP-6** (byte-limited capture, P2) **is now implemented** — see `docs/decisions-m5-m7.md`
+  the shooting script. Never a decision, and not one now either.
+- **BTB-CAP-6** (byte-limited capture, P2) **is now implemented** — see PRD rev 11
   D-38 to D-41 and PRD rev 11. It was a known, recorded gap inside EXT-08's own scope, never a
   decision for anyone else, and it is closed. Worth one line here for EXT-17's author, since it
   touches the shared contract: the capture format **stays frozen at `n8ro-capture/1`**. Four

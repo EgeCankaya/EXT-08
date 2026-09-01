@@ -1727,10 +1727,10 @@ simulator-free to live.
 
 ### The evidence pack, and the one deliverable that is not here
 
-`docs/sample-capture/` holds a real capture, trimmed to 3.2 MB by
+`docs/sample-capture/` holds a real capture, trimmed to 5.1 MB by
 `tests/evidence/trim_capture.py`: every non-sample record is kept — the header, both segment
 pairs, all 132 `entity_add` records, all 90 `entity_remove` records, all 7 verdicts — and only
-the samples of two entities survive. The trimmer rewrites exactly one number, `counts.samples`,
+the samples of three entities survive. The trimmer rewrites exactly one number, `counts.samples`,
 by editing that number in the trailer line rather than re-encoding the record, so every other
 byte is preserved. The result still reports CONFORMS, which is the check that the trimming did
 not quietly invalidate anything, and the mutation suite now runs against it too.
@@ -1820,7 +1820,7 @@ byte-identical.
 
 ## What a defect review found that the stream had not (2026-09-01)
 
-A bug-hunting review of `src/` (`docs/code-review-2026-09-01.md`) landed after M7 closed. Most
+A bug-hunting review of `src/` landed after M7 closed. Most
 of what it found is not about the stream at all — it is about paths the reference run never
 takes — and that is the entry worth writing down. **Three of the four highest-severity findings
 are unreachable on the default configuration**, which is precisely why 132 188 samples of live

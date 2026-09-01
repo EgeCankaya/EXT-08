@@ -1,7 +1,7 @@
 // EXT-08 Bus Telemetry Bridge - M3: schema registration and topic resolution (BTB-EP-1).
 //
 // Every topic string this program subscribes to is read out of the model database at
-// runtime. None is hand-written (CLAUDE.md hard rule 3): a literal is how a working
+// runtime. None is hand-written (derive from the schema; PRD tie-breaker 4): a literal is how a working
 // program becomes a silently-empty one after an upgrade, and a schema mismatch drops
 // messages with a warning rather than an error, so the failure looks exactly like success.
 //

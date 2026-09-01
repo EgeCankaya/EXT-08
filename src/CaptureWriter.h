@@ -2,7 +2,7 @@
 // machine (BTB-CX-4, BTB-EP-3, BTB-BP-1, BTB-CAP-2).
 //
 // Everything expensive happens here and only here: float conversion, JSON encoding, and all
-// file IO. The bus handlers copy into a RecordQueue and return (CLAUDE.md hard rule 2).
+// file IO. The bus handlers copy into a RecordQueue and return (the courier rule; PRD tie-breaker 5).
 //
 // This replaces M4's buffer-then-dump entirely. What survives unchanged is CaptureFormat's
 // serialiser, which is pure functions over their arguments and never knew where its records
@@ -16,7 +16,7 @@
 //     waiting -> attached -> segment_open <=> segment_closed -> closing -> closed
 //
 // and M5 implements all of it. The one thing the model did not anticipate is what M5
-// measured on the live bus (docs/decisions-m5-m7.md, D-1): **the entity_created burst that
+// measured on the live bus: **the entity_created burst that
 // materialises a scenario arrives before the scenario_loaded that announces it**, at
 // bring-up and at every reload.
 //
