@@ -143,6 +143,16 @@ EventOutcome EntityPicture::onEntityEvent(const n8ro::sim::StreamValueMap& value
             ++counters_.deleteOfUnknownEntity;
             return EventOutcome{};
         }
+        if (!entry->second.open) {
+            // The occupancy this delete names is already closed, and no entity_created has
+            // opened another. Closing it again would return a second Kind::Removed for one
+            // occupancy, and the writer turns every one of those into an `entity_remove`
+            // record - so the capture would carry two closes for one open, which the format
+            // spec's section 8.1 bracketing forbids and which no reader could repair. It
+            // would also double-count the removal reason. Counted and ignored (D-46).
+            ++counters_.deleteOfClosedOccupancy;
+            return EventOutcome{};
+        }
         entry->second.open = false;
         // Verbatim, including a supplier-specific value outside the engine's own set. The
         // roster never coerces a reason it does not recognise, and never drops one.

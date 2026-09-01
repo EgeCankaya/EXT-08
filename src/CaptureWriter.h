@@ -242,6 +242,9 @@ private:
     void openSegment(const std::string& scenario, double simTimeS);
     void closeSegment(double simTimeS, const char* reason);
     void flushStaging();
+    // Counts and clears whatever flushStaging() could not write because the byte bound
+    // stopped the run mid-burst. See the definition for why leaving them is not an option.
+    void abandonStaging();
     void emit(const std::string& line);
     void drainVerdicts();
 

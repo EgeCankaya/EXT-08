@@ -1,5 +1,6 @@
 #include "RecordQueue.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace n8ro::bridge {
@@ -74,16 +75,35 @@ void RecordQueue::offer(CaptureRecord record) {
                 }
                 return;
             }
-            // DropOldest. Evict from the front, and count the evicted record under its own
-            // kind rather than under the arriving one - the loss is the record that leaves.
-            if (!records_.empty()) {
-                if (isStructuralRecord(records_.front().kind)) {
+            // DropOldest. Evict the OLDEST SAMPLE, never a structural record.
+            //
+            // The two thresholds above are only half of the reserve; this is the other half.
+            // Popping records_.front() unconditionally would let an arriving sample - whose
+            // threshold is sampleCapacity_ - evict an entity_add sitting at the front of a
+            // creation burst, which is exactly the trade D-8 was written to forbid and which
+            // docs/capture-format-v1.md section 16 tells a reader it can lean on: "overload
+            // costs data and never structure". So the scan skips structural records and takes
+            // the first sample behind them. In practice that is the front, because samples
+            // outnumber events by three orders of magnitude on this platform.
+            //
+            // If the queue holds nothing but structural records there is no sample to give
+            // up, and the arriving record is refused instead - counted under its own kind, so
+            // the loss is still exactly one record and still exactly one count.
+            const auto oldestSample =
+                std::find_if(records_.begin(), records_.end(), [](const CaptureRecord& queued) {
+                    return !isStructuralRecord(queued.kind);
+                });
+            if (oldestSample == records_.end()) {
+                if (structural) {
                     ++counters_.structuralDropped;
                 } else {
                     ++counters_.samplesDropped;
                 }
-                records_.pop_front();
+                return;
             }
+            // Counted under the kind of the record that LEAVES, which is always a sample here.
+            ++counters_.samplesDropped;
+            records_.erase(oldestSample);
         }
 
         records_.push_back(std::move(record));

@@ -129,6 +129,14 @@ struct PictureCounters {
     std::uint64_t entityCreated = 0;
     std::uint64_t entityDeleted = 0;
     std::uint64_t deleteOfUnknownEntity = 0; // entity_deleted for a name never created
+    // entity_deleted for a name whose occupancy is ALREADY closed - a repeated delete with no
+    // entity_created between the two. Counted and ignored rather than acted on: acting would
+    // emit a second `entity_remove` for one occupancy, and docs/capture-format-v1.md section
+    // 8.1 has a reader bracket an occupancy by "an `entity_add` and the matching
+    // `entity_remove`", singular. Never observed on runtime 2.1.328, which is why it is a
+    // counter and not a warning - if it ever moves, the stream did something the roster model
+    // did not anticipate and notes.md should say so.
+    std::uint64_t deleteOfClosedOccupancy = 0;
     std::uint64_t eventsUnnamed = 0;         // no eventName field in the payload
     std::uint64_t eventsWithoutEntity = 0;   // eventName present, scenarioEntityName absent
     std::uint64_t eventQueueDropped = 0;     // roster-event log overflowed (bounded, counted)

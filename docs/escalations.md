@@ -1,15 +1,26 @@
 # Escalations — findings EXT-08 cannot close itself
 
-Two findings from EXT-08 need a decision or a correction from someone outside this project.
-Both are recorded here in full so they can be forwarded as they stand, and so that a reader who
+Five findings from EXT-08 need a decision or a correction from someone outside this project.
+All are recorded here in full so they can be forwarded as they stand, and so that a reader who
 finds them re-derived somewhere else can see they were raised.
 
-Neither blocks EXT-08. The first blocks **EXT-17** outright.
+None blocks EXT-08. The first blocks **EXT-17** outright. E-7 to E-9 were raised by the
+2026-09-01 defect sweep (`docs/code-review-2026-09-01.md`, PRD rev 14) and are all addressed to
+**EXT-17's author**, because each is a change to a frozen cross-repo contract that only its
+consumer can agree to.
 
-> **Both were sent to the brief's author on 2026-08-31** by this project's DRI, and both remain
-> open pending a reply. Nothing below has changed as a result; the status lines say "raised"
-> rather than "open" so a later reader can tell "nobody has been told" from "told, awaiting an
-> answer".
+> **E-1 and E-2 were sent to the brief's author on 2026-08-31** by this project's DRI, and both
+> remain open pending a reply. Nothing below has changed as a result; the status lines say
+> "raised" rather than "open" so a later reader can tell "nobody has been told" from "told,
+> awaiting an answer". **E-7 to E-9 have not been sent yet** — they were written on 2026-09-01
+> and are addressed to EXT-17's author rather than to the brief's.
+
+> **Numbering note.** This file's E-numbers run E-1, E-2, then E-7 onward. **E-3 to E-6 are
+> EXT-17's findings against *us*, not ours against anyone** — they arrived on 2026-09-01, carry
+> EXT-17's own numbering, and are answered in `docs/decisions-m5-m7.md` D-70 to D-72 and in
+> `docs/capture-format-v1.md` §13's post-freeze clarification table. They are not repeated here
+> because this file is the outbound list. The gap in the sequence is what keeps one label from
+> meaning two things.
 >
 > **E-1's substance has separately been resolved downstream, and that is the outcome it was
 > written to produce.** EXT-17's PRD keys its determinism gate on content rather than bytes
@@ -148,6 +159,168 @@ the implementer without an answer.
 
 ---
 
+
+---
+
+## E-7 — the format spec's determinism guarantee predates rotation and is now incomplete
+
+**To:** EXT-17's author, as the consumer of `n8ro-capture/1`
+**Status:** raised 2026-09-01 by the defect sweep. Not urgent — no capture in this repository
+is affected — but it must be settled before EXT-17 writes a comparison from §14 alone
+**Evidence:** `docs/capture-format-v1.md` §14 and its "What a size bound does to a byte
+comparison" subsection; PRD BTB-CAP-3 (amended at rev 14); `tests/determinism/compare_captures.py`
+
+### What §14 says
+
+> **The one host-dependent field** is `platform.model_path` … compare with that field excluded.
+
+### What is also host-dependent
+
+`header.continues_from` and `trailer.continued_in` embed `<run-label>`, and `<run-label>`
+defaults to *the next unused ordinal in `--out-dir`*. Two otherwise byte-identical rotated runs
+recorded into the same directory therefore get labels `000` and `001` and differ in those two
+keys. The keys were added by BTB-CAP-6 at rev 11 (§6.7); §14's sentence was written before they
+existed and was not revisited.
+
+The effect is narrow and worth stating precisely, so nobody reads this as bigger than it is:
+
+- It cannot occur in an **unrotated** capture, which omits both keys. Every capture in this
+  repository is unrotated.
+- It disappears entirely when `--run-label` is supplied explicitly, which a campaign runner
+  addressing runs by path would do anyway.
+- It is not variation introduced by the recorder. It is a function of the directory the
+  recorder was pointed at — the same class of thing as `platform.model_path`, which is why it
+  belongs in the same sentence.
+
+### Why this is not simply edited
+
+`docs/capture-format-v1.md` was frozen at M7. A determinism guarantee is something the document
+*specifies*, so restating it is a change to the contract rather than a correction to prose, and
+EXT-17 is the party that binds to it. **EXT-08 has therefore stated the exclusion in its own
+PRD (BTB-CAP-3, rev 14) and left §14 alone.**
+
+**There is now a mechanism for exactly this, which is why this should be cheap to settle.**
+Later on 2026-09-01 — after this finding was written — §13 gained a *"Clarifications made after
+the freeze"* table, and two of EXT-17's own findings were admitted through it on the test that a
+capture written before is byte-identical to one written after, no key gains or changes a
+meaning, and a reader conformant before is conformant after (D-49). **This finding passes that
+test on all three counts.** What it lacks is not admissibility but the consumer's agreement,
+which is the column that table records. So the ask is narrow: agree it, and it becomes a third
+row rather than a debate about a version bump.
+
+### The decision needed
+
+Either:
+
+1. **Amend §14** to list `header.continues_from` and `trailer.continued_in` alongside
+   `platform.model_path` as environment-dependent and excluded from a byte comparison. **This is
+   what EXT-08 recommends** — it is a one-sentence correction that makes the section true, and
+   §13 does not make it a version bump because no key is added, renamed, retyped or
+   revocabularised. Or:
+2. **Rule that a rotated set is out of scope for a byte comparison altogether**, and say so in
+   §14 instead. Defensible, and simpler, if EXT-17 never compares rotated runs.
+
+Either way `tests/determinism/compare_captures.py` is unaffected: it compares content, not
+bytes, and reads neither key.
+
+---
+
+## E-8 — BTB-BP-4 AC3 says per-topic drop counts; the producer counts per kind
+
+**To:** EXT-17's author, as the reader of `trailer.drops`
+**Status:** raised 2026-09-01 by the defect sweep. Long-standing — the substitution was made at
+M5 and recorded, but the FR was never amended to match, so the two documents disagree
+**Evidence:** PRD BTB-BP-4 AC3; `docs/decisions-m5-m7.md` D-7; `docs/capture-format-v1.md` §11
+and §16
+
+### The disagreement
+
+BTB-BP-4's third acceptance criterion:
+
+> Drop counts are **per-topic**, so a loss can be attributed.
+
+The trailer carries two: `drops.samples_not_recorded` and `drops.events_not_recorded`. Those are
+per **kind** — sample versus structural — and "structural" merges the entity-event topic and the
+scenario-event topic under one number. D-7 states the substitution as the design and gives the
+reason (one queue, so that arrival order across topics is preserved; the drop counters follow
+the queue's own partition, which is the reserve's partition). The FR was not amended.
+
+In practice this has cost nothing: `events_not_recorded` is 0 on every run recorded so far, and
+after the `drop_oldest` fix in PRD rev 14 it cannot be non-zero from overload alone. The
+attribution the criterion asks for is only interesting when the number is not zero.
+
+### The decision needed
+
+One of:
+
+1. **Amend BTB-BP-4 AC3 to per-kind**, and say in §16 that the two event topics are merged.
+   Costs nothing, changes no byte, and makes the two documents agree. **EXT-08's
+   recommendation**, unless EXT-17 has a use for the split.
+2. **Add per-topic keys under `trailer.drops`.** §13 makes added keys non-breaking, so this does
+   not move the format version — but it *is* a contract change to a record EXT-17 parses, and
+   adding keys nobody reads is how a format accumulates. Only worth doing if EXT-17 will
+   attribute a loss to one of the two event topics specifically.
+
+EXT-08 will implement (2) if asked; it is a small change to `RecordQueue`'s counters and to
+`CaptureFormat::writeTrailer`.
+
+---
+
+## E-9 — §10 and §5.2 disagree about a not-met verdict's `segment` across a rotation
+
+**To:** EXT-17's author, as the consumer of `verdict` records
+**Status:** raised 2026-09-01 by the defect sweep. Reachable only on an error path the producer
+already logs and stops on, so it is a correctness question rather than an operational one
+**Evidence:** `docs/capture-format-v1.md` §5.2, §7, §10; `docs/decisions-m5-m7.md` D-44
+
+### The two rules
+
+§10, on a not-met verdict:
+
+> On a not-met verdict it is the time of the last data record in the run, and `segment` **the
+> segment that record was in** — there is no deciding moment to point at, and the producer does
+> not invent one.
+
+§5.2 and §7, on every record:
+
+> A reader should treat file order as authoritative … `entity_add`, `entity_remove` and
+> `verdict` records also carry `segment` and also fall inside an open segment.
+
+and §7 again, on rotation: ordinals "restart at 0 in every part, so a statistic computed per
+segment across a set must key on `(part, segment)`".
+
+### Where they collide
+
+Almost nowhere — the two rules name the same ordinal in every ordinary run, which is why the
+conflict was not visible until the sweep traced it. They part company in exactly one place: a
+run that rotates and whose **last data record is in the previous part**. §10 says the verdict
+carries that part's ordinal; §5.2/§7 say it must name a segment its own file has. The new part's
+ordinals restart at 0, so the two answers differ.
+
+`drainVerdicts` already restamps *mid-run* verdicts at render time for the §5.2 reason. The
+end-of-run verdicts deliberately do not, because they are the ones BTB-REF-4 compares against a
+replay, and a replay reading the finished file can only reach §10's anchor. Restamping them
+would make a live run and a replay of its own capture disagree, which is the one invariant
+ADR-5 exists to protect.
+
+### The decision needed
+
+One of:
+
+1. **§10 wins, and §7 gains a sentence** saying a not-met verdict's `segment` may name a segment
+   in an earlier part of a rotated set, and that a reader keying per segment should treat it as
+   `(part, segment)` from the trailer chain. **EXT-08's recommendation** — it costs no code and
+   keeps BTB-REF-4 exact.
+2. **§5.2 wins**, the producer restamps end-of-run verdicts to the enclosing segment, and
+   BTB-REF-4's byte-identity is re-derived by teaching the replay path the same rule — which
+   means the deciding rule exists in two places, which is the thing ADR-5 and CLAUDE.md both say
+   not to do.
+
+Until it is decided the producer follows §10, which is the more specific rule and the one
+written about this exact record.
+
+---
+
 ## Not escalated
 
 For completeness, since a reader may expect them here:
@@ -162,6 +335,15 @@ For completeness, since a reader may expect them here:
   keys were added to two existing record types, which §13 makes non-breaking, and every capture
   written before it remains valid and unchanged. A reader that ignores `header.limits`,
   `header.part`, `header.continues_from` and `trailer.continued_in` is still a correct reader.
+- **The conformance reader's missing §7 rule for `verdict` records.** The review that opened
+  E-7 to E-9 also found that `tests/capture-reader/` — BTB-CAP-5's evidence that the spec is
+  complete enough to build a reader from — enforced §7's "falls inside an open segment" rule for
+  `sample` and for `entity_add` / `entity_remove` but **not** for `verdict`, which is why it
+  accepted a producer defect the spec forbids. **Closed in EXT-08 on 2026-09-01**, not
+  escalated: the rule is one comparison, the producer defect it was hiding is fixed in the same
+  change (D-44), and the mutation harness gains a case for it — 23 mutations, 0 survivors. Worth
+  one line here because EXT-17 builds a reader against the same section, and this is the rule
+  that was easiest to miss.
 - **OQ-2's mentor confirmation.** **Closed in EXT-08 at PRD rev 12** (D-42). The headless
   invocation is demonstrated to work (`tests/host-driver/`), which was the half that was ever
   this project's; whether it is the intended production shape is a question about the

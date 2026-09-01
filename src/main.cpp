@@ -57,6 +57,7 @@
 #include <messaging/packed/MessageBusPackedSchemaRegistry.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -126,13 +127,30 @@ constexpr auto kPollInterval = std::chrono::milliseconds(250);
 constexpr int kPollsPerStatusLine = 4;
 constexpr auto kWaitingLogInterval = std::chrono::seconds(5);
 
+// --- Silent-topic detection (BTB-OBS-2) -------------------------------------------------
+//
+// The entity-state topic decoding nothing while the engine reports itself running is the
+// schema-mismatch fault [S1] warns about, seen from the only side we can see it from: the
+// registry is non-empty and the subscription succeeded, so BTB-EP-1 passed, and a hash
+// mismatch confined to one message type then produces an empty capture with no error
+// anywhere. This is the interval after which we say so.
+//
+// 10 s rather than the 3.0 s of host loss, and for a different reason. Host loss is
+// engine-state silence, which is regular at ~19.5/s through idle frames; entity-state
+// silence is NOT irregular - it happens at every unload and at every pause - so the interval
+// has to be long enough that an ordinary quiet stretch does not produce a warning. Ten
+// seconds is ~13x the 767 ms longest entity-state gap seen inside a running scenario and
+// still short enough to catch the fault in the first minute of a run.
+constexpr double kDefaultTopicSilenceS = 10.0;
+
 constexpr const char* kUsage =
     "usage: n8ro-bridge --config <SimEngineClient_*> --model-path <dir> --schema-file <name>\n"
     "                   --out-dir <dir> [--run-label <label>]\n"
     "                   [--entity-state-message <name>] [--engine-state-message <name>]\n"
     "                   [--queue-size <n>] [--overflow-policy <drop_newest|drop_oldest>]\n"
     "                   [--capture-max-bytes <n>] [--on-size-limit <stop|rotate>]\n"
-    "                   [--capture-max-samples <n>] [--conditions <file>]\n"
+    "                   [--capture-max-samples <n>] [--topic-silence-s <s>]\n"
+    "                   [--conditions <file>]\n"
     "       n8ro-bridge --replay <capture> --conditions <file> [--out-dir <dir>]\n"
     "\n"
     "  --config                 client-side sim engine config entry, e.g.\n"
@@ -169,12 +187,101 @@ constexpr const char* kUsage =
     "                           with end_reason=size_limit. Default 0, meaning no bound -\n"
     "                           a live run ends on host loss. A record-count safety bound,\n"
     "                           counted across the whole run; it always stops, never rotates.\n"
+    "  --topic-silence-s        warn when the entity-state topic has decoded nothing for\n"
+    "                           this many seconds WHILE the engine reports itself running -\n"
+    "                           the schema-mismatch fault, which is otherwise silent.\n"
+    "                           Default 10.0; 0 disables the check. No warning fires while\n"
+    "                           the simulation is paused or stopped, and none is raised for\n"
+    "                           the event topics, which are legitimately quiet.\n"
     "  --conditions             JSON file of declared conditions. Verdicts are written into\n"
     "                           the capture and into verdicts-<scenario>-<run-label>.jsonl\n"
     "                           beside it. Without it the bridge records but judges nothing.\n"
     "  --replay                 offline mode: re-judge a stored capture with no simulator,\n"
     "                           no bus and no client. Requires --conditions. Mutually\n"
     "                           exclusive with --config.\n";
+
+// What each subscription records about its own topic, for the two diagnostics that need a
+// per-topic view: BTB-OBS-2's silent topic, and BTB-BP-2's second acceptance criterion.
+//
+// Every field is written from the bus pump thread inside a handler and read from the main
+// loop, so every field is atomic and every write is relaxed - these are counters for a
+// diagnostic, and a lost increment costs a digit rather than correctness (the same reasoning
+// HandlerTiming states). `label` and `topic` are set once, before the subscription exists.
+struct TopicActivity {
+    std::string label;
+    std::string topic;
+
+    // BTB-OBS-2: the number the main loop watches for movement.
+    std::atomic<std::uint64_t> decoded{0};
+
+    // Whether this topic's silence is EVIDENCE. Only true where the traffic is continuous:
+    //
+    //   entity-state    ~818/s through a running scenario. Silence here while the engine
+    //                   reports running is the schema-mismatch fault and nothing else. TRUE.
+    //   engine-state    ~19.5/s, including through idle frames - but its silence is already
+    //                   host loss, detected at 3.0 s, which is a stronger signal arriving
+    //                   sooner and ending the run. A second detector on the same evidence
+    //                   would only ever fire after the first had broken the loop. FALSE.
+    //   entity-event    event-driven: a creation burst at load, then a removal whenever one
+    //                   happens. The reference run carries 134 messages across 200 s.
+    //   scenario-event  two messages per scenario, at its boundaries.
+    //
+    // The last two are silent for most of every healthy run, so a literal reading of
+    // BTB-OBS-2 - "a subscribed topic has produced no decoded messages" - would warn about
+    // them every interval, on every run, forever. That is not the FR being satisfied; it is
+    // the FR's own pain restated, because a warning that fires when nothing is wrong is
+    // exactly what makes the one that matters invisible. See D-49.
+    bool silenceIsEvidence = false;
+
+    // BTB-BP-2 AC2: "a sequence gap or out-of-order arrival is counted and reported, not
+    // silently accepted". `Message::sequenceNumber` is the only instrument that could ever
+    // see loss UPSTREAM of us - the queue's own FIFO is established by construction (D-7) and
+    // every counter this platform exposes reads zero through the frame-shaped loss section 14
+    // documents.
+    //
+    // What the numbers mean depends on how the platform allocates the sequence, which is not
+    // stated in any header and which no measurement in this project has established - so they
+    // are reported as what they literally are, per topic, and the summary says so rather than
+    // asserting they are a loss count. `reorders` is the one that means the same thing under
+    // every allocation scheme: a number that did not advance did not advance.
+    std::atomic<std::uint32_t> lastSequence{0};
+    std::atomic<std::uint64_t> sequenceContiguous{0};   // advanced by exactly one
+    std::atomic<std::uint64_t> sequenceGaps{0};         // advanced by more than one
+    std::atomic<std::uint64_t> sequenceMissing{0};      // how many numbers those gaps skipped
+    std::atomic<std::uint64_t> sequenceReorders{0};     // repeated, or went backwards
+    std::atomic<std::uint64_t> sequenceUnnumbered{0};   // arrived with sequenceNumber == 0
+};
+
+// Called from inside every handler, first thing. Three relaxed atomics and no allocation -
+// the handler stays a courier (CLAUDE.md hard rule 2, BTB-BP-1).
+void noteDecoded(TopicActivity& activity, const n8ro::core::Message& message) {
+    activity.decoded.fetch_add(1, std::memory_order_relaxed);
+
+    const std::uint32_t sequence = message.sequenceNumber;
+    if (sequence == 0) {
+        // Either the platform does not populate it on this path, or the counter has wrapped
+        // exactly onto zero. Counted rather than treated as a gap, so a platform that never
+        // numbers its messages reports "unnumbered", not "every message was lost".
+        activity.sequenceUnnumbered.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const std::uint32_t previous =
+        activity.lastSequence.exchange(sequence, std::memory_order_relaxed);
+    if (previous == 0) {
+        return;   // the first numbered arrival on this topic has nothing to compare against
+    }
+    // Unsigned subtraction, so a counter wrapping past 2^32 reads as the small forward step
+    // it is rather than as an enormous gap.
+    const std::uint32_t delta = sequence - previous;
+    if (delta == 1) {
+        activity.sequenceContiguous.fetch_add(1, std::memory_order_relaxed);
+    } else if (delta == 0 || delta > 0x80000000u) {
+        activity.sequenceReorders.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        activity.sequenceGaps.fetch_add(1, std::memory_order_relaxed);
+        activity.sequenceMissing.fetch_add(delta - 1, std::memory_order_relaxed);
+    }
+}
 
 struct Options {
     std::string config;
@@ -189,6 +296,7 @@ struct Options {
     std::size_t captureMaxSamples = 0;   // 0 = unbounded
     std::uint64_t captureMaxBytes = 0;   // 0 = unbounded (BTB-CAP-6)
     SizeLimitAction onSizeLimit = SizeLimitAction::Stop;
+    double topicSilenceS = kDefaultTopicSilenceS;   // 0 = the check is off (BTB-OBS-2)
     std::string conditionsPath;
     std::string replayPath;
 
@@ -205,6 +313,21 @@ struct Options {
         return false;
     }
     out = static_cast<std::size_t>(parsed);
+    return true;
+}
+
+// Seconds, as a non-negative decimal. Zero means "off" for every caller of this, so unlike
+// parseCount it is always permitted.
+[[nodiscard]] bool parseSeconds(const std::string& flag, const std::string& value, double& out,
+                                std::string& error) {
+    char* end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    if (end == value.c_str() || *end != '\0' || !(parsed >= 0.0) || parsed > 86400.0) {
+        error = flag + " needs a non-negative number of seconds no greater than 86400, got " +
+                value;
+        return false;
+    }
+    out = parsed;
     return true;
 }
 
@@ -262,6 +385,10 @@ bool parseOptions(int argc, char** argv, Options& out, std::string& error) {
             out.captureMaxBytes = static_cast<std::uint64_t>(bytes);
         } else if (arg == "--on-size-limit") {
             if (!parseSizeLimitAction(value, out.onSizeLimit, error)) {
+                return false;
+            }
+        } else if (arg == "--topic-silence-s") {
+            if (!parseSeconds(arg, value, out.topicSilenceS, error)) {
                 return false;
             }
         } else if (arg == "--conditions") {
@@ -446,7 +573,9 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                      const QueueCounters& queue, const RecordQueue& queueShape,
                      const HandlerTiming& stateTiming, const HandlerTiming& eventTiming,
                      const n8ro::sim::MessageBusPackedMetricsSnapshot& metrics,
-                     const n8ro::core::IMessageBus::Statistics& busStats, EndReason endReason) {
+                     const n8ro::core::IMessageBus::Statistics& busStats, EndReason endReason,
+                     const TopicActivity* topics, std::size_t topicCount,
+                     std::uint64_t foreignSchemaOnStateTopic) {
     std::printf("\n=== run summary =========================================================\n");
     const std::vector<std::string>& parts = writer.parts();
     if (parts.size() <= 1) {
@@ -549,7 +678,7 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
     std::printf("removals    %s\n", formatCountsByName(snap.removalsByReason).c_str());
     if (!writer.verdictPath().empty()) {
         std::printf("verdicts    %llu written -> %s\n",
-                    static_cast<unsigned long long>(writer.counts().verdicts),
+                    static_cast<unsigned long long>(writer.runCounts().verdicts),
                     writer.verdictPath().c_str());
     }
 
@@ -566,11 +695,23 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                 static_cast<unsigned long long>(metrics.decodeFailures),
                 static_cast<unsigned long long>(metrics.missingSchemaPassthrough),
                 static_cast<unsigned long long>(metrics.legacyPayloadPassthrough));
-    std::printf("picture      orphaned=%llu unnamed=%llu untimed=%llu deleteOfUnknown=%llu\n",
+    std::printf("picture      orphaned=%llu unnamed=%llu untimed=%llu deleteOfUnknown=%llu "
+                "deleteOfClosed=%llu\n",
                 static_cast<unsigned long long>(snap.counters.samplesOrphaned),
                 static_cast<unsigned long long>(snap.counters.samplesUnnamed),
                 static_cast<unsigned long long>(snap.counters.samplesUntimed),
-                static_cast<unsigned long long>(snap.counters.deleteOfUnknownEntity));
+                static_cast<unsigned long long>(snap.counters.deleteOfUnknownEntity),
+                static_cast<unsigned long long>(snap.counters.deleteOfClosedOccupancy));
+    if (foreignSchemaOnStateTopic > 0) {
+        // BTB-EP-2 AC2. A message on the entity-state topic that is not the entity-state
+        // message was excluded rather than written under the wrong `message` name with the
+        // wrong field set. Only printed when it happened, because on every run observed so
+        // far it has not.
+        std::printf("schema       %llu message(s) on the entity-state topic carried a schema "
+                    "other than\n             the one header.schemas declares; excluded, not "
+                    "recorded\n",
+                    static_cast<unsigned long long>(foreignSchemaOnStateTopic));
+    }
     std::printf("writer queue samplesDropped=%llu eventsDropped=%llu  (capacity %zu+%zu, "
                 "policy %s, highWater=%zu)\n",
                 static_cast<unsigned long long>(queue.samplesDropped),
@@ -579,8 +720,45 @@ void printRunSummary(const CaptureWriter& writer, const PictureSnapshot& snap,
                 queueShape.hardCapacity() - queueShape.sampleCapacity(),
                 overflowPolicyName(queueShape.policy()), queue.highWater);
     std::printf("staging      dropped=%llu   unload noise ignored=%llu\n",
-                static_cast<unsigned long long>(writer.counts().stagedDropped),
-                static_cast<unsigned long long>(writer.counts().unloadNoiseIgnored));
+                static_cast<unsigned long long>(writer.runCounts().stagedDropped),
+                static_cast<unsigned long long>(writer.runCounts().unloadNoiseIgnored));
+
+    std::printf("\n-- per-topic sequence (BTB-BP-2 AC2: a gap is counted, not accepted) ------\n");
+    {
+        bool anyNumbered = false;
+        for (std::size_t i = 0; i < topicCount; ++i) {
+            const TopicActivity& topic = topics[i];
+            const std::uint64_t contiguous =
+                topic.sequenceContiguous.load(std::memory_order_relaxed);
+            const std::uint64_t gaps = topic.sequenceGaps.load(std::memory_order_relaxed);
+            const std::uint64_t missing = topic.sequenceMissing.load(std::memory_order_relaxed);
+            const std::uint64_t reorders =
+                topic.sequenceReorders.load(std::memory_order_relaxed);
+            const std::uint64_t unnumbered =
+                topic.sequenceUnnumbered.load(std::memory_order_relaxed);
+            anyNumbered = anyNumbered || contiguous > 0 || gaps > 0 || reorders > 0;
+            std::printf("%-13s decoded=%-8llu contiguous=%-8llu gaps=%llu(missing=%llu) "
+                        "reordered=%llu unnumbered=%llu\n",
+                        topic.label.c_str(),
+                        static_cast<unsigned long long>(
+                            topic.decoded.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(contiguous),
+                        static_cast<unsigned long long>(gaps),
+                        static_cast<unsigned long long>(missing),
+                        static_cast<unsigned long long>(reorders),
+                        static_cast<unsigned long long>(unnumbered));
+        }
+        if (!anyNumbered) {
+            std::printf("             (this platform did not populate Message::sequenceNumber "
+                        "on any arrival)\n");
+        } else {
+            std::printf("             (read as observed. How this platform allocates the "
+                        "sequence is not\n              documented, so `gaps` is upstream loss "
+                        "only if it numbers per topic;\n              `reordered` means the "
+                        "same thing under any scheme. Order THROUGH our\n              own "
+                        "queue is FIFO by construction - one deque, D-7.)\n");
+        }
+    }
 
     std::printf("\n-- after the end, not loss (log only, never in the file) ------------------\n");
     std::printf("shutdown window  samples=%llu events=%llu   past a bound: records=%llu\n",
@@ -763,6 +941,32 @@ int run(const Options& options) {
     // reaches the capture.
     std::atomic<std::uint64_t> heartbeat{0};
 
+    // One per subscription, in subscription order. BTB-OBS-2 watches `decoded` for movement
+    // while the engine reports running; BTB-BP-2 AC2 reads the sequence counters at exit.
+    enum TopicIndex { kEntityStateTopic = 0, kEntityEventTopic, kScenarioEventTopic,
+                      kEngineStateTopic, kTopicCount };
+    std::array<TopicActivity, kTopicCount> topics;
+    topics[kEntityStateTopic].label = "entity-state";
+    topics[kEntityStateTopic].topic = resolution.entityState.topic;
+    // The only continuously-published topic whose silence is not already covered by a
+    // stronger detector. See TopicActivity::silenceIsEvidence.
+    topics[kEntityStateTopic].silenceIsEvidence = true;
+    topics[kEntityEventTopic].label = "entity-event";
+    topics[kEntityEventTopic].topic = resolution.entityEvent.topic;
+    topics[kScenarioEventTopic].label = "scenario-event";
+    topics[kScenarioEventTopic].topic = resolution.scenarioEvent.topic;
+    topics[kEngineStateTopic].label = "engine-state";
+    topics[kEngineStateTopic].topic = resolution.engineState.topic;
+
+    // BTB-EP-2 AC2: a sample is written against the schema DELIVERED with its own message.
+    // A message arriving on the entity-state topic that is not the entity-state message is
+    // not entity state, however well it decodes - writing it would put a record naming a
+    // message the header does not declare into the capture, with a field set no reader could
+    // join. Counted and excluded instead (tenet 3: never silent).
+    std::atomic<std::uint64_t> foreignSchemaOnStateTopic{0};
+    const std::uint32_t expectedStateMessageId = resolution.entityState.messageId;
+    const std::uint32_t expectedStateSchemaHash = resolution.entityState.schemaHash;
+
     capture::HeaderInfo header;
     header.platform.engineConfig = options.config;
     header.platform.modelPath = options.modelPath;
@@ -848,10 +1052,22 @@ int run(const Options& options) {
     // no file. All of that is the writer thread's (CLAUDE.md hard rule 2, BTB-BP-1).
     const std::uint64_t stateSubscription = packed.subscribeByTopic(
         resolution.entityState.topic,
-        [&picture, &queue, &stateTiming](const n8ro::core::Message&,
-                                         const n8ro::sim::MessageSchema&,
-                                         const n8ro::sim::StreamValueMap& values) {
+        [&picture, &queue, &stateTiming, &topics, &foreignSchemaOnStateTopic,
+         expectedStateMessageId, expectedStateSchemaHash](
+            const n8ro::core::Message& message, const n8ro::sim::MessageSchema& schema,
+            const n8ro::sim::StreamValueMap& values) {
             const auto started = std::chrono::steady_clock::now();
+            noteDecoded(topics[kEntityStateTopic], message);
+            // The delivered schema is read, not discarded (BTB-EP-2 AC2). A topic index maps
+            // back to one message, which is not the same as a topic carrying only one, so
+            // this is the check that makes `header.schemas` a true statement about every
+            // sample record in the file.
+            if (schema.messageId != expectedStateMessageId ||
+                schema.schemaHash != expectedStateSchemaHash) {
+                foreignSchemaOnStateTopic.fetch_add(1, std::memory_order_relaxed);
+                stateTiming.note(std::chrono::steady_clock::now() - started);
+                return;
+            }
             const SampleOutcome outcome = picture.onSample(values);
             if (outcome.accepted) {
                 CaptureRecord record;
@@ -860,6 +1076,11 @@ int run(const Options& options) {
                 record.occupancy = outcome.generation;
                 record.simTimeS = outcome.simulationTimeS;
                 record.values = values;   // verbatim; the courier's whole job
+                // The message's own declaration, carried to the writer as a pointer into the
+                // registry - which outlives every subscription and is never reloaded. This is
+                // what BTB-EP-2 AC2 asks for: the schema delivered with a message is what its
+                // record's field order comes from. See CaptureRecord.h for the lifetime.
+                record.schema = &schema;
                 queue.offer(std::move(record));
             }
             stateTiming.note(std::chrono::steady_clock::now() - started);
@@ -875,10 +1096,11 @@ int run(const Options& options) {
 
     const std::uint64_t eventSubscription = packed.subscribeByTopic(
         resolution.entityEvent.topic,
-        [&picture, &queue, &eventTiming](const n8ro::core::Message&,
-                                         const n8ro::sim::MessageSchema&,
-                                         const n8ro::sim::StreamValueMap& values) {
+        [&picture, &queue, &eventTiming, &topics](const n8ro::core::Message& message,
+                                                  const n8ro::sim::MessageSchema&,
+                                                  const n8ro::sim::StreamValueMap& values) {
             const auto started = std::chrono::steady_clock::now();
+            noteDecoded(topics[kEntityEventTopic], message);
             const EventOutcome outcome = picture.onEntityEvent(values);
             if (outcome.kind != EventOutcome::Kind::Ignored) {
                 CaptureRecord record;
@@ -907,8 +1129,9 @@ int run(const Options& options) {
     // engine's own publish sites; the topic came from the registry. Neither is a literal.
     const std::uint64_t scenarioSubscription = packed.subscribeByTopic(
         resolution.scenarioEvent.topic,
-        [&queue](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
-                 const n8ro::sim::StreamValueMap& values) {
+        [&queue, &topics](const n8ro::core::Message& message, const n8ro::sim::MessageSchema&,
+                          const n8ro::sim::StreamValueMap& values) {
+            noteDecoded(topics[kScenarioEventTopic], message);
             const std::optional<std::string> eventName = tryReadString(values, "eventName");
             if (!eventName) {
                 return;
@@ -944,8 +1167,10 @@ int run(const Options& options) {
     // wholesale is what keeps that impossible rather than merely avoided.
     const std::uint64_t heartbeatSubscription = packed.subscribeByTopic(
         resolution.engineState.topic,
-        [&heartbeat](const n8ro::core::Message&, const n8ro::sim::MessageSchema&,
-                     const n8ro::sim::StreamValueMap&) {
+        [&heartbeat, &topics](const n8ro::core::Message& message,
+                              const n8ro::sim::MessageSchema&,
+                              const n8ro::sim::StreamValueMap&) {
+            noteDecoded(topics[kEngineStateTopic], message);
             heartbeat.fetch_add(1, std::memory_order_relaxed);
         },
         subscriptionOptions);
@@ -971,7 +1196,36 @@ int run(const Options& options) {
 
     // The writer thread. From here until it is joined, it is the only thing that touches the
     // file, and the queue is the only thing the two threads share.
-    std::thread writerThread([&writer, &queue] { writer.run(queue); });
+    //
+    // The body is guarded because main()'s own try/catch covers the main thread and nothing
+    // else: an exception leaving this lambda is std::terminate, which means no trailer, no
+    // flush, no diagnostic and an exit code that is not one of ExitCodes.h. Hard rule 1 says
+    // this program does not throw, and the writer thread is where the calls that could
+    // disagree live - every std::string built in CaptureFormat is a bad_alloc site, and the
+    // filesystem walk in nextRunLabel was one until this change. The guard is what makes the
+    // rule structural rather than a property of the code as currently written.
+    //
+    // Reported, never swallowed: the flag is polled by the main loop below, which breaks and
+    // runs the ordinary teardown - so the capture still gets its trailer if the file is
+    // usable - and the process exits non-zero.
+    std::atomic<bool> writerThreadFaulted{false};
+    std::thread writerThread([&writer, &queue, &writerThreadFaulted] {
+        try {
+            writer.run(queue);
+        } catch (const std::exception& e) {
+            N8RO_LOG_CRITICAL(std::string("an exception escaped the writer thread: ") + e.what() +
+                                  ". Recording stops here; the capture will be closed with "
+                                  "whatever reached the file",
+                              kCategory);
+            writerThreadFaulted.store(true);
+        } catch (...) {
+            N8RO_LOG_CRITICAL(std::string("a non-std exception escaped the writer thread. "
+                                          "Recording stops here; the capture will be closed "
+                                          "with whatever reached the file"),
+                              kCategory);
+            writerThreadFaulted.store(true);
+        }
+    });
 
     if (!installInterruptHandlers()) {
         // Not fatal: the bridge still records correctly, it just has to be ended by the host
@@ -996,6 +1250,25 @@ int run(const Options& options) {
     auto lastWaitingLogAt = lastHeartbeatAt;
     bool everAttached = false;
     int pollsSinceStatus = kPollsPerStatusLine;
+
+    // BTB-OBS-1 AC2's warning fires once. The counters only ever climb, so repeating it every
+    // second would bury the line it is trying to make visible.
+    bool decodeFaultWarned = false;
+    // BTB-BP-2 AC2's warning, same shape: said once, with the totals reported at exit.
+    bool sequenceFaultWarned = false;
+    // BTB-OBS-2: per topic, when its `decoded` counter last moved, and when we last said it
+    // had not. Seeded now rather than at zero, so the interval is measured from the moment
+    // the bridge began listening rather than from the epoch.
+    std::array<std::uint64_t, kTopicCount> lastDecodeCount{};
+    std::array<std::chrono::steady_clock::time_point, kTopicCount> lastDecodeAt;
+    std::array<std::chrono::steady_clock::time_point, kTopicCount> lastSilenceWarnAt;
+    {
+        const auto startedAt = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < kTopicCount; ++i) {
+            lastDecodeAt[i] = startedAt;
+            lastSilenceWarnAt[i] = startedAt;
+        }
+    }
 
     for (;;) {
         // Roster transitions first, so a removal is logged above the line whose count it
@@ -1037,6 +1310,70 @@ int run(const Options& options) {
                           kCategory);
         }
 
+        // BTB-OBS-2. A subscribed topic that has decoded nothing for the configured interval
+        // while the engine reports itself RUNNING is the schema-mismatch fault: the registry
+        // was not empty and the subscription succeeded, so nothing earlier could have caught
+        // it, and without this line the run produces a plausible empty capture. Gated on
+        // isRunning() because the FR requires it - a paused or stopped simulation is silent
+        // for a reason that is not a fault.
+        if (options.topicSilenceS > 0.0) {
+            // The FR measures silence WHILE THE ENGINE IS RUNNING, so the clock only runs
+            // then. Holding it at `now` through a pause is what stops a resumed simulation
+            // from warning immediately about a stretch it was legitimately quiet for.
+            const bool engineRunning = everAttached && client->isRunning();
+            for (std::size_t i = 0; i < kTopicCount; ++i) {
+                const std::uint64_t decoded =
+                    topics[i].decoded.load(std::memory_order_relaxed);
+                if (!engineRunning || !topics[i].silenceIsEvidence ||
+                    decoded != lastDecodeCount[i]) {
+                    lastDecodeCount[i] = decoded;
+                    lastDecodeAt[i] = now;
+                    continue;
+                }
+                const double silentS =
+                    std::chrono::duration<double>(now - lastDecodeAt[i]).count();
+                const double sinceWarnS =
+                    std::chrono::duration<double>(now - lastSilenceWarnAt[i]).count();
+                if (silentS > options.topicSilenceS && sinceWarnS > options.topicSilenceS) {
+                    lastSilenceWarnAt[i] = now;
+                    N8RO_LOG_WARNING(
+                        std::string("silent topic: ") + topics[i].label + " (" +
+                            topics[i].topic + ") has decoded nothing for " +
+                            std::to_string(silentS) + " s while the engine reports running. " +
+                            "The likeliest cause is a schema mismatch - a packed message "
+                            "decodes only when its schema is registered on both sides, and a "
+                            "mismatch drops it with a warning rather than failing loudly. "
+                            "Check --model-path (" + options.modelPath + ") and --schema-file (" +
+                            options.schemaFile + ") against the engine's own",
+                        kCategory);
+                }
+            }
+        }
+
+        // BTB-BP-2 AC2. A gap or an out-of-order arrival is not silently accepted; the totals
+        // go to the run summary, and the first one says so while the run is still going.
+        if (!sequenceFaultWarned) {
+            for (std::size_t i = 0; i < kTopicCount; ++i) {
+                const std::uint64_t gaps = topics[i].sequenceGaps.load(std::memory_order_relaxed);
+                const std::uint64_t reorders =
+                    topics[i].sequenceReorders.load(std::memory_order_relaxed);
+                if (gaps == 0 && reorders == 0) {
+                    continue;
+                }
+                sequenceFaultWarned = true;
+                N8RO_LOG_WARNING(
+                    std::string("Message::sequenceNumber is not contiguous on ") +
+                        topics[i].label + " (" + topics[i].topic + "): " +
+                        std::to_string(gaps) + " forward gap(s), " + std::to_string(reorders) +
+                        " repeated or backwards. Reported per topic and as observed - how this "
+                        "platform allocates the sequence is not documented, so a gap is "
+                        "upstream loss only if it numbers per topic. Our own queue's order is "
+                        "FIFO by construction; totals are in the run summary (BTB-BP-2)",
+                    kCategory);
+                break;
+            }
+        }
+
         // BTB-SD-1. The handler set a counter and returned; everything the interrupt means
         // happens here, on a thread that is allowed to allocate, lock and write.
         if (interruptCount() > 0) {
@@ -1061,6 +1398,15 @@ int run(const Options& options) {
 
         if (writer.failed()) {
             N8RO_LOG_ERROR(std::string("the writer reported a failure; stopping"), kCategory);
+            endReason = EndReason::Shutdown;
+            break;
+        }
+
+        if (writerThreadFaulted.load()) {
+            // The guard around the writer thread caught something and has already logged it.
+            // Teardown still runs in full: the queue is closed, the (already-finished) thread
+            // is joined, and finish() writes the trailer if the file is still usable, so the
+            // capture says how it ended rather than simply stopping.
             endReason = EndReason::Shutdown;
             break;
         }
@@ -1092,6 +1438,27 @@ int run(const Options& options) {
                 fresh.busMetrics.droppedByRateLimiting = busStats.droppedByRateLimiting;
                 const std::lock_guard<std::mutex> lock(busSnapshotMutex);
                 busSnapshot = fresh;
+            }
+
+            // BTB-OBS-1 AC2. The five counters are printed below and written into the
+            // trailer, which is AC1; this is the distinct warning that names the likely cause
+            // and the two things to check. Without it the operator's only signal is
+            // `decode=1234(hash=1234 ...)` inside a status line printed once a second, which
+            // is the R2 failure - three independent detections for one fault - reduced to
+            // one and a half.
+            if (!decodeFaultWarned &&
+                (metrics.schemaHashDrops > 0 || metrics.decodeFailures > 0)) {
+                decodeFaultWarned = true;
+                N8RO_LOG_WARNING(
+                    std::string("decode diagnostics are non-zero: schemaHashDrops=") +
+                        std::to_string(metrics.schemaHashDrops) + " decodeFailures=" +
+                        std::to_string(metrics.decodeFailures) +
+                        ". A packed message decodes only when its schema is registered on "
+                        "both sides, so the likeliest cause is that this bridge's schemas do "
+                        "not match the engine's. Check the two values they come from: "
+                        "--model-path (" + options.modelPath + ") and --schema-file (" +
+                        options.schemaFile + "). Messages counted here are NOT in the capture",
+                    kCategory);
             }
 
             const std::string engineState = client->getEngineState();
@@ -1163,7 +1530,10 @@ int run(const Options& options) {
     // The queue's genuine overflow, at last. M4 left this structurally 0 because the buffer
     // filling *was* the end of recording; from M5 it is what BTB-BP-4 asked for.
     drops.samplesNotRecorded = finalQueue.samplesDropped;
-    drops.eventsNotRecorded = finalQueue.structuralDropped + writer.counts().stagedDropped;
+    // Run-wide on both terms. counts_ is reset by every rotation (a trailer's `counts` is
+    // "what is in this file", spec 11), so reading it here made staging overflow from every
+    // part but the last vanish from the final trailer and from the summary.
+    drops.eventsNotRecorded = finalQueue.structuralDropped + writer.runCounts().stagedDropped;
     drops.samplesOrphaned = finalSnapshot.counters.samplesOrphaned;
     drops.samplesUnnamed = finalSnapshot.counters.samplesUnnamed;
     drops.samplesUntimed = finalSnapshot.counters.samplesUntimed;
@@ -1183,8 +1553,14 @@ int run(const Options& options) {
 
     logRosterEvents(picture.drainEvents());
     printRunSummary(writer, finalSnapshot, finalQueue, queue, stateTiming, eventTiming,
-                    finalMetrics, finalBusStats, endReason);
+                    finalMetrics, finalBusStats, endReason, topics.data(), topics.size(),
+                    foreignSchemaOnStateTopic.load());
 
+    if (writerThreadFaulted.load()) {
+        // Whatever could be saved has been. The exit code still has to say this was not a
+        // normal end, or a campaign runner would read a truncated capture as a complete one.
+        return kExitUnexpected;
+    }
     if (!written) {
         return kExitCaptureWriteFailed;
     }

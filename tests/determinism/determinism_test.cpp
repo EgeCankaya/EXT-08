@@ -22,16 +22,27 @@
 //
 // Build (from a shell that has run C:\N8RO\setup.cmd and dev\setup-dev.cmd):
 //
+// It also carries the ONE writer-side invariant that is checkable with no file and no
+// simulator: the handler-to-writer queue's structural reserve (BTB-BP-4, D-8, format spec
+// §16). That is not a determinism property, and it lives here because RecordQueue links no
+// import library and has no other simulator-free home - a separate harness for one class
+// would be a third build line for the same three checks.
+//
+// Build (from a shell that has run C:\N8RO\setup.cmd and dev\setup-dev.cmd):
+//
 //   cl /std:c++17 /EHsc /W4 /O2 ^
 //      /I %N8RO_RELEASE%\include\n8ro-core /I %N8RO_RELEASE%\include\n8ro-sim ^
 //      /Fe:determinism_test.exe ^
 //      tests\determinism\determinism_test.cpp src\CaptureFormat.cpp src\Json.cpp ^
-//      src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp
+//      src\Referee.cpp src\Conditions.cpp src\Geodesy.cpp src\JsonParse.cpp ^
+//      src\RecordQueue.cpp
 
 #include "../../src/CaptureFormat.h"
 #include "../../src/CaptureRecord.h"
+#include "../../src/RecordQueue.h"
 #include "../../src/Referee.h"
 
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <locale>
@@ -458,6 +469,104 @@ void testNoWallClock() {
     check(clean, "no date or clock shape appears in any record");
 }
 
+// ---------------------------------------------------------------------------------------
+// BTB-BP-4 / D-8 / format spec section 16: overload costs data and never structure.
+//
+// The reserve is two mechanisms, not one. The threshold (a sample is refused above
+// `sampleCapacity`, a structural record only above `sampleCapacity + reserve`) is what stops
+// a sample from *filling* the queue past a roster record's headroom. Under `drop_oldest` a
+// second mechanism is needed, because an arriving sample does not merely fail to fit - it
+// chooses a victim, and the front of the queue during a scenario load is the entity_created
+// burst. Section 16 tells a reader in writing that `events_not_recorded` cannot be non-zero
+// from overload alone, so this is checked for BOTH policies.
+// ---------------------------------------------------------------------------------------
+
+n8ro::bridge::CaptureRecord sampleRecord(const std::string& entity) {
+    n8ro::bridge::CaptureRecord record;
+    record.kind = n8ro::bridge::RecordKind::Sample;
+    record.subject = entity;
+    record.occupancy = 1;
+    return record;
+}
+
+n8ro::bridge::CaptureRecord addRecord(const std::string& entity) {
+    n8ro::bridge::CaptureRecord record;
+    record.kind = n8ro::bridge::RecordKind::EntityAdd;
+    record.subject = entity;
+    record.occupancy = 1;
+    return record;
+}
+
+std::vector<n8ro::bridge::CaptureRecord> drainAll(n8ro::bridge::RecordQueue& queue) {
+    std::vector<n8ro::bridge::CaptureRecord> out;
+    static_cast<void>(queue.waitAndDrain(out, std::chrono::milliseconds(0)));
+    return out;
+}
+
+std::size_t countStructural(const std::vector<n8ro::bridge::CaptureRecord>& records) {
+    std::size_t n = 0;
+    for (const n8ro::bridge::CaptureRecord& record : records) {
+        if (n8ro::bridge::isStructuralRecord(record.kind)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+void testStructuralReserve() {
+    section("BTB-BP-4: overload costs samples and never structure, under BOTH policies");
+
+    for (const n8ro::bridge::OverflowPolicy policy :
+         {n8ro::bridge::OverflowPolicy::DropNewest, n8ro::bridge::OverflowPolicy::DropOldest}) {
+        const std::string name = n8ro::bridge::overflowPolicyName(policy);
+
+        // The shape D-8's overload experiment had: a creation burst enqueued at load, then a
+        // sample stream that immediately overruns a tiny queue.
+        n8ro::bridge::RecordQueue queue(4, 8, policy);
+        for (int i = 0; i < 6; ++i) {
+            queue.offer(addRecord("Blue_" + std::to_string(i)));
+        }
+        for (int i = 0; i < 500; ++i) {
+            queue.offer(sampleRecord("Blue_0"));
+        }
+
+        const n8ro::bridge::QueueCounters counters = queue.counters();
+        check(counters.structuralDropped == 0,
+              name + ": 500 samples against a 4-record queue drop no structural record (got " +
+                  std::to_string(counters.structuralDropped) + ")");
+        check(counters.samplesDropped > 0,
+              name + ": and the samples that did not fit are counted");
+
+        const std::vector<n8ro::bridge::CaptureRecord> drained = drainAll(queue);
+        check(countStructural(drained) == 6,
+              name + ": all 6 entity_add records are still in the queue (got " +
+                  std::to_string(countStructural(drained)) + ")");
+
+        // Nothing invented and nothing lost: every offered record either reached the queue or
+        // was counted as dropped. This is the arithmetic tenet 3 rests on.
+        const std::uint64_t accountedFor = static_cast<std::uint64_t>(drained.size()) +
+                                           counters.samplesDropped + counters.structuralDropped;
+        check(accountedFor == counters.samplesOffered + counters.structuralOffered,
+              name + ": every offered record is either queued or counted as dropped");
+    }
+
+    // The corner the two-threshold design leaves: a queue holding nothing but structural
+    // records has no sample to give up. The arrival is refused rather than a roster record
+    // evicted, and it is still counted.
+    {
+        n8ro::bridge::RecordQueue queue(2, 0, n8ro::bridge::OverflowPolicy::DropOldest);
+        queue.offer(addRecord("Blue_0"));
+        queue.offer(addRecord("Blue_1"));
+        queue.offer(sampleRecord("Blue_0"));
+
+        const n8ro::bridge::QueueCounters counters = queue.counters();
+        check(counters.structuralDropped == 0 && counters.samplesDropped == 1,
+              "drop_oldest with no sample to evict refuses the arriving sample and counts it");
+        check(countStructural(drainAll(queue)) == 2,
+              "and both structural records survive");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -471,6 +580,7 @@ int main() {
     testKnownBytes();
     testSchemaGrowth();
     testNoWallClock();
+    testStructuralReserve();
 
     std::printf("\n%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

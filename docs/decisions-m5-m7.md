@@ -696,6 +696,213 @@ anything this project ships would change with the answer. Here, nothing does.
 
 ---
 
+## Post-M7 — the 2026-09-01 defect sweep
+
+Seven judgement calls taken while working the findings in `docs/code-review-2026-09-01.md`.
+
+> **Numbering note.** This sweep is **D-43 to D-49**, contiguous. **D-70 to D-72** belong to a
+> different change that landed the same day — EXT-17's four inbound contract defects — and the
+> two sets are unrelated; that change took the high block deliberately, to leave this one room.
+> D-50 to D-69 are unused.
+Plain corrections — a `runCounts_` read where a `counts_` read was written, a flush whose
+result was dropped — are not recorded here; these are the ones where the fix was a choice
+between two defensible behaviours, or where the honest answer was to make no change.
+
+### D-43 — under `drop_oldest`, a sample is refused before a roster record is evicted
+
+`RecordQueue` implemented the structural reserve as a **threshold** — a sample is refused above
+`capacity`, a structural record only above `capacity + reserve` (D-8). A threshold is enough
+for `drop_newest`, where an overrunning record simply fails to fit. It is not enough for
+`drop_oldest`, where the arriving record does not fail to fit: it *chooses a victim*, and the
+front of the queue during a scenario load is the `entity_created` burst. So `drop_oldest`
+inverted the exact trade D-8 was written to prevent — 2 520 samples dropped and 0 events under
+the default policy, and under the other policy the burst.
+
+Two candidate fixes. **Refuse the arriving sample when the queue is full of structural records**
+(the simple one) loses the property that `drop_oldest` keeps the *newest* data, which is the
+only reason anyone would select it. **Evict the oldest sample rather than the oldest record**
+keeps that property and keeps the reserve. Taken: the second, with the first as its fallback
+for the corner where there is no sample to give up.
+
+The scan is `find_if` from the front for the first non-structural record. That is O(n) in the
+worst case where it was O(1), and the worst case needs a queue holding nothing but roster
+records — 134 event messages against 132 188 samples on the reference run, so in practice the
+first candidate *is* the front and the scan is one comparison.
+
+The counters do not change meaning: the loss is counted under the kind of the record that
+leaves, which under `drop_oldest` is now always a sample. That is what keeps
+`trailer.drops.events_not_recorded` the number `docs/capture-format-v1.md` §16 promises.
+
+**What would reverse it:** a reader that wants `drop_oldest` to mean "the last N records,
+whatever they are". Nobody has asked for that, and §16 tells every reader the opposite.
+
+BTB-BP-4 gains the criterion in the same change (PRD rev 14), because the FR named three
+policies without saying which invariant wins when one of them collides with the reserve.
+Regression-tested for **both** policies in `tests/determinism/`, and mutation-verified: putting
+the old `pop_front()` back fails four checks.
+
+### D-44 — end-of-run verdicts get a segment opened for them, and keep their own stamp
+
+`finish()` emitted the not-met verdicts before closing the segment — correct — but never
+checked that a segment was open. Three reachable paths put them outside one: conditions
+declared and no scenario ever loaded; an interrupt between a `scenario_unloaded` and the
+reload's creation burst; and a rotation that could not open a usable part. Format spec §7 says
+`verdict` records "also fall inside an open segment", so all three produce a malformed file.
+
+The fix is one `openSegment` when none is open and the referee has conditions. The judgement is
+in what the fix deliberately does **not** do: it does not restamp the verdicts.
+
+Restamping is what `drainVerdicts` does for mid-run verdicts, and for a good reason (spec §5.2 —
+a record names the segment in the file that contains it). Doing the same here would break
+BTB-REF-4. Live and replay agree because both anchor an end-of-run verdict on the **last data
+record**, which is the only anchor a replay reading the finished file can reach; a segment
+opened solely to host verdicts contains no data record, so replay's anchor does not move when
+it reads one. Restamping to the new ordinal would make the live file say one thing and its own
+replay say another, and BTB-REF-4 AC1 is byte-identity.
+
+Spec §10 settles the value independently and in the same direction: "on a not-met verdict it is
+the time of the last data record in the run, and `segment` the segment that record was in".
+
+**The residual, stated rather than hidden:** on the rotate-abort path the last data record is in
+the *previous part*, whose ordinals the new part does not have — so a verdict there names a
+segment its own file lacks. §10 and §5.2 point opposite ways in that one corner. It is
+`docs/escalations.md` E-9, because choosing between them is a spec decision and EXT-17 reads
+both sections. It is reachable only after an error the producer already logs and stops on.
+
+**What would reverse it:** EXT-17 saying it keys verdicts on the enclosing `segment_open`
+rather than on §10's rule. Then §10 changes, and this restamps.
+
+### D-45 — the delivered `MessageSchema` is carried as a pointer, and a foreign message is excluded
+
+BTB-EP-2 AC2 requires the `MessageSchema` delivered with each message to be "used for field
+order, not discarded". It was discarded: the handler took it as an unnamed parameter and the
+writer formatted against a copy taken from the registry at startup. Identical today; not
+guaranteed by anything in the code, which is why the criterion is worded the way it is.
+
+Three ways to satisfy it. **Copy the schema per record** is a vector of strings per message on
+the bus thread — precisely the work hard rule 2 keeps out of a handler, at 818/s. **Compare and
+carry nothing** verifies the identity without ever using the delivered schema, which is not
+what the criterion says. Taken: **carry a `const MessageSchema*`**, which costs a pointer copy.
+
+Its lifetime is the registry's, and that is a condition rather than a guarantee. The schemas
+live in a `shared_ptr<const RegistrySnapshot>` that `reloadAllSchemas` / `processSchemaChanges`
+would swap; this program builds one registry, calls neither, and destroys the registry after
+both the subscriptions and the writer thread. Written down in `CaptureRecord.h` because
+"nobody calls reload" is exactly the kind of fact that stops being true silently.
+
+**And a second change the finding implies but did not name.** Using the delivered schema alone
+would swap one malformation for another: a foreign message on the entity-state topic would be
+written verbatim under its own name, into a file whose `header.schemas` declares only one
+message — a `sample` record no reader could join. So the handler also checks the delivered
+`messageId` / `schemaHash` against the resolved entity-state message and **excludes and counts**
+a mismatch. Two relaxed atomics; excluded rather than recorded because a header is written once,
+at open, and cannot gain a schema later.
+
+**What would reverse it:** a model database that deliberately multiplexes message types onto one
+topic. Then `header.schemas` has to carry every message the topic can bear, which is a format
+question (§6.5) and a version bump, not a producer change.
+
+### D-46 — a repeated `entity_deleted` is counted, not acted on
+
+`onEntityEvent` closed an occupancy without checking it was open. A second `entity_deleted` for
+a name with no `entity_created` between the two returned a second `Kind::Removed`, which the
+writer turns into a second `entity_remove` record — two closes for one open, against §8.1's
+"opened by an `entity_add` and closed by **the matching** `entity_remove`". It also
+double-counted `removalsByReason_`, so the summary's removal tally would exceed the roster.
+
+Never observed on runtime 2.1.328. Fixed anyway, because the cost is one comparison and the
+alternative is a capture EXT-17 cannot key on, produced by a vocabulary we do not own.
+
+Counted under `deleteOfClosedOccupancy` rather than warned: a warning implies the operator can
+act, and they cannot — it would be the engine's behaviour, not theirs. If the counter ever
+moves, that is a `notes.md` entry about what the stream contained that we did not expect.
+
+**What would reverse it:** the platform giving a repeated delete a meaning — a *second* removal
+of a re-created body whose `entity_created` we missed. Then the missing create is the defect and
+this guard hides it, and the fix moves to the create side.
+
+### D-47 — the writer thread is guarded, and the run summary is not the only place it shows
+
+`main()`'s `try`/`catch` covers the main thread. An exception leaving the writer-thread lambda
+is `std::terminate`: no trailer, no flush, no diagnostic, and an exit code outside
+`ExitCodes.h`. There was one concrete throwing call behind it — `nextRunLabel` constructed its
+`directory_iterator` with an `error_code` and then advanced it with the throwing `operator++`,
+which has no `error_code` form — and every `std::string` built in `CaptureFormat` is a
+`bad_alloc` site besides.
+
+Both fixed, and the second is the one that matters: the guard makes hard rule 1 structural
+rather than a property of the code as currently written.
+
+The judgement is what the guard does after catching. **Swallow and continue** is not available —
+the writer's state is unknown. **`std::exit` from the thread** skips the trailer, which is the
+one thing a consumer needs. Taken: set an atomic the main loop already polls beside
+`writer.failed()`, break, and run the **ordinary** teardown — so the queue closes, the thread
+joins, and `finish()` writes a trailer if the file is still usable. The process then returns
+`kExitUnexpected` rather than `kExitOk`, because a campaign runner reading a truncated capture
+as a complete one is the failure this is protecting against.
+
+**What would reverse it:** nothing likely. This is the shape `main()` already uses one thread
+over.
+
+### D-48 — the host-loss teardown keeps no timeout of its own (no change made)
+
+Finding L5 observes that `startDrainWatchdog` fires only on a *second interrupt*, so on an
+unattended host-loss teardown the four `unsubscribe` calls and `stopMessagePump()` run against a
+dead bus with nothing behind them. BTB-CX-3 AC2 says the bridge "never blocks indefinitely on a
+dead bus".
+
+**No change.** An unconditional teardown timeout would force-exit a drain that is merely slow —
+a large queue flushing to a slow disk is exactly that — and BTB-SD-1 requires "every record
+enqueued before the signal present in the capture". Trading a *measured* guarantee for an
+*unmeasured* one is the wrong direction, and the finding is explicitly PLAUSIBLE: whether these
+SDK calls can block on a dead bus at all could not be established statically, and establishing
+it needs a host that is killed mid-run, which this sweep did not run.
+
+What would settle it: kill `n8ro-sim-app.exe` under `tests/host-driver/` with the bridge
+attached and time the teardown. If it blocks, the fix is a timeout scoped to the SDK calls
+**before** `queue.close()`, never around the drain — the drain is ours and is bounded by the
+queue's own size.
+
+**What would reverse this non-decision:** one observation of a teardown that did not return.
+
+### D-49 — silent-topic detection watches the entity-state topic, not all four
+
+BTB-OBS-2 says "IF **a subscribed topic** has produced no decoded messages for a configurable
+interval". Read literally that is all four subscriptions, and the first draft of the check did
+exactly that. It is wrong, and wrong in the FR's own terms.
+
+Two of the four are **event-driven and legitimately silent for most of every healthy run**:
+`sim/entity/event` carries 134 messages across a 200 s reference run, and `sim/scenario/event`
+carries two per scenario. Watching them means a warning every interval, on every run, forever —
+which is not the requirement satisfied but the requirement's own pain restated. Its pain
+statement is that "a silent topic is indistinguishable from a quiet simulation until someone
+thinks to check"; a detector that cries wolf on two topics is how the operator stops reading
+the line that would have named the third.
+
+The fourth, `sim/engine/state`, publishes continuously at ~19.5/s — but its silence is
+**already** detected, at 3.0 s, as host loss, and that detector ends the run. A ten-second
+check on the same evidence can only ever fire after the three-second one has broken the loop.
+
+That leaves `sim/entity/state`, which is the topic the FR's customer scenario is actually about
+("the engineer ... returns to a log that already told them the entity-state topic never
+spoke") and the one whose silence has exactly one cause worth naming.
+
+So the flag is per topic (`TopicActivity::silenceIsEvidence`) rather than a hardcoded index,
+and the reasoning for each of the four is written at its declaration — because the next person
+to add a subscription has to make this decision, and the field is where they will meet it.
+
+**Second, smaller call in the same check:** the silence clock is held at `now` while the engine
+is not running, rather than left to accumulate. Otherwise a simulation paused for a minute
+warns the instant it resumes, about a stretch the FR explicitly excludes ("the warning fires
+only while the engine reports running, so a paused simulation does not generate noise").
+
+**What would reverse it:** a deployment where the event topics are expected to be continuous —
+a scenario that creates and destroys entities constantly. Then `silenceIsEvidence` is per-run
+configuration rather than a constant, and the honest form is a per-topic interval rather than
+one. Nobody has that scenario; `--topic-silence-s` is one number until somebody does.
+
+---
+
 ## Post-M7 — the four corrections EXT-17 raised
 
 EXT-17 filed four defects against what EXT-08 hands it, as GitHub issues #1–#4. All four are
@@ -797,39 +1004,3 @@ is a self-contained recipe that a reader runs as written, and it was written as 
 variable mattered only to the build and to `n8ro-sim-local`. The platform mentor confirmed on
 2026-09-01 that `N8RO_RELEASE` **is** expected to be set in production, which is what moved this
 from "our machine is provisioned oddly" to a defect in the instructions.
-
-### D-49 — silent-topic detection watches the entity-state topic, not all four
-
-BTB-OBS-2 says "IF **a subscribed topic** has produced no decoded messages for a configurable
-interval". Read literally that is all four subscriptions, and the first draft of the check did
-exactly that. It is wrong, and wrong in the FR's own terms.
-
-Two of the four are **event-driven and legitimately silent for most of every healthy run**:
-`sim/entity/event` carries 134 messages across a 200 s reference run, and `sim/scenario/event`
-carries two per scenario. Watching them means a warning every interval, on every run, forever —
-which is not the requirement satisfied but the requirement's own pain restated. Its pain
-statement is that "a silent topic is indistinguishable from a quiet simulation until someone
-thinks to check"; a detector that cries wolf on two topics is how the operator stops reading
-the line that would have named the third.
-
-The fourth, `sim/engine/state`, publishes continuously at ~19.5/s — but its silence is
-**already** detected, at 3.0 s, as host loss, and that detector ends the run. A ten-second
-check on the same evidence can only ever fire after the three-second one has broken the loop.
-
-That leaves `sim/entity/state`, which is the topic the FR's customer scenario is actually about
-("the engineer ... returns to a log that already told them the entity-state topic never
-spoke") and the one whose silence has exactly one cause worth naming.
-
-So the flag is per topic (`TopicActivity::silenceIsEvidence`) rather than a hardcoded index,
-and the reasoning for each of the four is written at its declaration — because the next person
-to add a subscription has to make this decision, and the field is where they will meet it.
-
-**Second, smaller call in the same check:** the silence clock is held at `now` while the engine
-is not running, rather than left to accumulate. Otherwise a simulation paused for a minute
-warns the instant it resumes, about a stretch the FR explicitly excludes ("the warning fires
-only while the engine reports running, so a paused simulation does not generate noise").
-
-**What would reverse it:** a deployment where the event topics are expected to be continuous —
-a scenario that creates and destroys entities constantly. Then `silenceIsEvidence` is per-run
-configuration rather than a constant, and the honest form is a per-topic interval rather than
-one. Nobody has that scenario; `--topic-silence-s` is one number until somebody does.
