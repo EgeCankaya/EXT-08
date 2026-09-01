@@ -497,7 +497,14 @@ statistic computed over the file meaningless.
 - **No `sample` record appears outside an open segment.** If a reader sees one, the file is
   malformed and the reader should say so.
 - `entity_add`, `entity_remove` and `verdict` records also carry `segment` and also fall
-  inside an open segment.
+  inside an open segment. **One exception, in a rotated set only:** an **end-of-run not-met**
+  `verdict` is anchored on the last *data* record of the run (§10), and in a rotated set that
+  record may live in an **earlier part**. Its `segment` therefore names a segment of that part,
+  which the part it is written into may not contain. §10 governs — it is the rule written about
+  this exact record — and a reader computing a statistic per segment should key on
+  `(part, segment)` through the trailer chain, as the ordinal rule above already requires.
+  A not-met verdict carries `sim_time_s` from the same anchor, so the two agree.
+  This cannot arise in an unrotated capture.
 - A capture may legitimately contain **zero** segments — if the producer attached, recorded
   nothing, and closed, the file is `header` then `trailer`. That is a valid, complete,
   empty capture.
@@ -695,7 +702,12 @@ that was cut short, not at a run where the rest passed.
 `sim_time_s` on a met verdict is the simulation time of the sample or event that decided it,
 so it locates the causing records exactly. On a not-met verdict it is the time of the last
 data record in the run, and `segment` the segment that record was in — there is no deciding
-moment to point at, and the producer does not invent one.
+moment to point at, and the producer does not invent one. **This rule governs even when the
+anchor falls in an earlier part of a rotated set**, in which case `segment` names a segment
+that this part does not contain; §7 says the same thing from the other side. The producer does
+not restamp such a verdict to its enclosing segment, because a replay reading the finished
+capture can only reach this anchor, and restamping would make a live run and a replay of its
+own capture disagree — the one thing the single-evaluator design exists to prevent.
 
 `values` is condition-specific but always reproducible: numbers are written through the same
 round-trip-exact, locale-independent formatter every other double in the capture uses (§8.3),
@@ -903,7 +915,7 @@ remain valid under version 1, and this document remains their specification.
 ### Clarifications made after the freeze
 
 Listed so a consumer holding a pinned copy can see what moved without diffing the whole file.
-**Neither entry changes what a conformant file contains, what any key means, or what any reader
+**No entry below changes what a conformant file contains, what any key means, or what any reader
 must accept or reject** — a capture written before them is byte-identical to one written after,
 and a reader conformant before them is conformant after. That is what makes them admissible
 under the freeze; anything else would be `n8ro-capture/2`.
@@ -912,6 +924,8 @@ under the freeze; anything else would be `n8ro-capture/2`.
 |---|---|---|---|
 | 2026-09-01 | §6.7 rule 2, and §11's restatement of it | `counts.segments` is **not** summable across the parts of a rotated set; the other four counters are. A cut segment is counted in both parts, so subtract one per cut | EXT-17, E-3 |
 | 2026-09-01 | §5.1's third bullet, and §14's self-test guidance | §5.1's frozen test is exact, but its **reading** is narrower than "the clock was reset": three phenomena satisfy it, they are distinguishable, and excluding them can leave a self-test with nothing to compare — which is a refusal, not a pass | EXT-17, E-4 |
+| 2026-09-01 | §14's "host-dependent field" paragraph | The exclusion list named only `platform.model_path`. `header.continues_from` and `trailer.continued_in` are host-dependent in the same way — they embed `<run-label>`, which defaults to an ordinal derived from the output directory — and are now named alongside it. Reachable only in a **rotated** set; an unrotated capture omits both keys | EXT-08, E-7 |
+| 2026-09-01 | §7's segment rules, and §10's not-met anchor | A **not-met** verdict's `segment` may name a segment in an **earlier part** of a rotated set, because §10 anchors it on the last data record of the run rather than on the part it is written into. §10 governs; a reader keying statistics per segment should treat the ordinal as `(part, segment)` via the trailer chain | EXT-08, E-9 |
 
 ---
 
@@ -937,9 +951,18 @@ published messages, it produces the same bytes — on every host, every build, e
 | Scheduler-dependent counters | With one deliberate exception, no count whose value depends on thread timing is written into the file; where such a number exists it goes to the producer's log instead. **The exception is `drops.samples_not_recorded` / `drops.events_not_recorded` from producer 0.5.0 on** — see immediately below |
 | Timing-dependent flags | `attached_mid_run` is derived from what the message stream contained, never from what a status tick happened to observe |
 
-**The one host-dependent field** is `platform.model_path`, a filesystem path. Two captures of
-the same run recorded on hosts with different install locations differ there and nowhere
-else; compare with that field excluded.
+**The host-dependent fields** are `platform.model_path`, a filesystem path, and — in a
+**rotated** set only — `header.continues_from` and `trailer.continued_in`, which embed the
+run label. Two captures of the same run recorded on hosts with different install locations
+differ in the first; two rotated runs recorded into different output directories, or into the
+same directory in sequence, differ in the other two, because `<run-label>` defaults to the next
+unused ordinal in `--out-dir`. Compare with those fields excluded.
+
+None of the three is variation the recorder introduced. Each is a function of where the
+recorder was pointed, which is why they belong in one sentence. An **unrotated** capture omits
+`continues_from` and `continued_in` entirely, so for most comparisons `platform.model_path`
+remains the only exclusion; and supplying `--run-label` explicitly — which a campaign runner
+addressing runs by path would do anyway — removes the other two as well.
 
 **The one deliberately scheduler-dependent field** is the pair of internal-queue drop counters
 in `trailer.drops`. From producer 0.5.0 the producer streams through a bounded queue, and how
@@ -1211,6 +1234,16 @@ shrunk to four records, a reference-scenario run recorded `samples_not_recorded:
 records specifically so that overload costs data and never structure. That asymmetry is
 deliberate and a reader can lean on it: a capture with dropped samples is a sampled but
 structurally sound record of its run.
+
+**The partition is by kind, not by topic.** There are two counters because the queue has two
+classes of record, not because there are two topics: `samples_not_recorded` counts `sample`
+records, and `events_not_recorded` counts roster and segment records — which means **the
+entity-event topic and the scenario-event topic are merged under one number**. A loss can
+therefore be attributed to *data versus structure*, which is the distinction the reserve is
+built around and the one a reader acts on, but not to one of the two event topics
+individually. That follows from the design rather than limiting it: a single FIFO carries
+every topic so that arrival order across topics is preserved, and the counters follow the
+queue's own partition, which is the reserve's partition.
 
 See §14 for what these two counters mean for a byte comparison. In short: they are the one
 deliberately scheduler-dependent thing in the file, they are zero whenever a byte comparison

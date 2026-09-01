@@ -915,7 +915,7 @@ because the publication schedule differs by about 1% between runs (§14).
 ```
 docs/prd.md                              the contract — 27 FRs prefixed BTB-
 docs/capture-format-v1.md                the cross-repo contract EXT-17 is handed
-docs/escalations.md                      the five findings this project cannot close itself
+docs/escalations.md                      five findings raised outward - three resolved, two open
 notes.md                                 what the bus actually carries (graded deliverable)
 src/main.cpp                             CLI, wiring, the lifecycle loop, the run summary
 src/TopicResolution.{h,cpp}              BTB-EP-1 — schemas, and all four topics from the registry

@@ -1,19 +1,26 @@
 # Escalations — findings EXT-08 cannot close itself
 
-Five findings from EXT-08 need a decision or a correction from someone outside this project.
-All are recorded here in full so they can be forwarded as they stand, and so that a reader who
-finds them re-derived somewhere else can see they were raised.
+Five findings from EXT-08 needed a decision or a correction from someone outside this project.
+**Three are now resolved; two remain open.** All are recorded here in full so they can be
+forwarded as they stand, and so that a reader who finds them re-derived somewhere else can see
+they were raised.
 
-None blocks EXT-08. The first blocks **EXT-17** outright. E-7 to E-9 were raised by the
-2026-09-01 defect sweep (PRD rev 14) and are all addressed to
-**EXT-17's author**, because each is a change to a frozen cross-repo contract that only its
-consumer can agree to.
+None blocks EXT-08. The first blocks **EXT-17** outright.
+
+> **E-7, E-8 and E-9 were resolved on 2026-09-01 by EXT-17's author**, who is the consumer each
+> was addressed to and therefore the party entitled to settle them. All three took EXT-08's
+> recommended option, all three were documentation-only, and **no capture byte, record type,
+> key, vocabulary or reader obligation changed** — which is what kept `n8ro-capture/1` frozen
+> rather than bumped. E-7 and E-9 are admitted through §13's post-freeze clarification table
+> (two new rows); E-8 amended EXT-08's own requirement to match the producer. The findings are
+> kept in full below, each with a resolution note, because a resolved finding that vanishes
+> leaves the next reader to re-derive it.
 
 > **E-1 and E-2 were sent to the brief's author on 2026-08-31** by this project's DRI, and both
 > remain open pending a reply. Nothing below has changed as a result; the status lines say
 > "raised" rather than "open" so a later reader can tell "nobody has been told" from "told,
-> awaiting an answer". **E-7 to E-9 have not been sent yet** — they were written on 2026-09-01
-> and are addressed to EXT-17's author rather than to the brief's.
+> awaiting an answer". **E-7 to E-9 were put to EXT-17's author on 2026-09-01 and answered the
+> same day** — see the resolution note above and each finding's status line.
 
 > **Numbering note.** This file's E-numbers run E-1, E-2, then E-7 onward. **E-3 to E-6 are
 > EXT-17's findings against *us*, not ours against anyone** — they arrived on 2026-09-01, carry
@@ -165,8 +172,11 @@ the implementer without an answer.
 ## E-7 — the format spec's determinism guarantee predates rotation and is now incomplete
 
 **To:** EXT-17's author, as the consumer of `n8ro-capture/1`
-**Status:** raised 2026-09-01 by the defect sweep. Not urgent — no capture in this repository
-is affected — but it must be settled before EXT-17 writes a comparison from §14 alone
+**Status:** **RESOLVED 2026-09-01** — EXT-17's author took option 1. §14's exclusion paragraph
+now names `header.continues_from` and `trailer.continued_in` alongside `platform.model_path`,
+and records that neither appears in an unrotated capture and that an explicit `--run-label`
+removes both. Admitted through §13's clarification table as a row attributed to E-7. No byte,
+key or reader obligation changed. *(Raised 2026-09-01 by the defect sweep.)*
 **Evidence:** `docs/capture-format-v1.md` §14 and its "What a size bound does to a byte
 comparison" subsection; PRD BTB-CAP-3 (amended at rev 14); `tests/determinism/compare_captures.py`
 
@@ -228,8 +238,11 @@ bytes, and reads neither key.
 ## E-8 — BTB-BP-4 AC3 says per-topic drop counts; the producer counts per kind
 
 **To:** EXT-17's author, as the reader of `trailer.drops`
-**Status:** raised 2026-09-01 by the defect sweep. Long-standing — the substitution was made at
-M5 and recorded, but the FR was never amended to match, so the two documents disagree
+**Status:** **RESOLVED 2026-09-01** — EXT-17's author took option 1. BTB-BP-4 AC3 now reads
+*per kind* and says a loss is attributable to data or to structure; `docs/capture-format-v1.md`
+§16 states in writing that the two event topics are merged under `events_not_recorded`. Per-topic
+keys were declined as keys nobody reads. No producer change, no format change. *(Raised
+2026-09-01 by the defect sweep; the substitution itself was made at M5.)*
 **Evidence:** PRD BTB-BP-4 AC3; `docs/capture-format-v1.md` §11
 and §16
 
@@ -269,8 +282,11 @@ EXT-08 will implement (2) if asked; it is a small change to `RecordQueue`'s coun
 ## E-9 — §10 and §5.2 disagree about a not-met verdict's `segment` across a rotation
 
 **To:** EXT-17's author, as the consumer of `verdict` records
-**Status:** raised 2026-09-01 by the defect sweep. Reachable only on an error path the producer
-already logs and stops on, so it is a correctness question rather than an operational one
+**Status:** **RESOLVED 2026-09-01** — EXT-17's author took option 1. §10 governs and now says so
+explicitly, including why the producer does not restamp; §7's segment rules carry the same
+statement from the other side, with the `(part, segment)` guidance for a reader keying per
+segment. Admitted through §13's clarification table as a row attributed to E-9. BTB-REF-4's
+byte-identity is untouched. *(Raised 2026-09-01 by the defect sweep.)*
 **Evidence:** `docs/capture-format-v1.md` §5.2, §7, §10
 
 ### The two rules
