@@ -763,7 +763,7 @@ The shoot wrote its captures into `captures/` under the `demo`, `overload` and `
 reference run is about 64 MB and the three together are roughly 79 MB. What ships instead is
 [`docs/sample-capture/`](docs/sample-capture/), a trimmed capture from a real run that is
 un-ignored deliberately. To re-check a number visible on screen against a file, re-run that
-beat's command from [Reproducing the evidence](#reproducing-the-evidence) below.
+beat's command from the sections below and compare against what it writes.
 
 ### The four unit suites — no simulator needed
 
