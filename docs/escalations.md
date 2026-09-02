@@ -23,11 +23,24 @@ None blocks EXT-08. The first blocks **EXT-17** outright.
 > same day** — see the resolution note above and each finding's status line.
 
 > **Numbering note.** This file's E-numbers run E-1, E-2, then E-7 onward. **E-3 to E-6 are
-> EXT-17's findings against *us*, not ours against anyone** — they arrived on 2026-09-01, carry
-> EXT-17's own numbering, and are answered in `docs/capture-format-v1.md` §13's post-freeze
-> clarification table. They are not repeated here
-> because this file is the outbound list. The gap in the sequence is what keeps one label from
-> meaning two things.
+> EXT-17's findings against *us*, not ours against anyone** — they arrived on 2026-09-01 and
+> carry EXT-17's own numbering. They are not repeated here because this file is the outbound
+> list. **Each was answered in a different place, and §13 is only two of the four:**
+>
+> | | Answered in |
+> |---|---|
+> | **E-3** — §6.7's rotated-set totals | `docs/capture-format-v1.md` §13's post-freeze clarification table |
+> | **E-4** — §5.1's frozen-clock test | `docs/capture-format-v1.md` §13's post-freeze clarification table |
+> | **E-5** — the condition digest stopped one heading early | **A new file**, `docs/condition-file-schema.md`, carrying all four sections, plus `tests/referee/check_schema_digest.py` so it cannot drift from the README again. Not a clarification to the format spec and not in §13 |
+> | **E-6** — the R8 headless invocation omitted `N8RO_RELEASE` | **This README's R8 preconditions block.** Nothing about it touches the capture format, so it is not in §13 either |
+>
+> The gap at E-3 to E-6 is what keeps one label from meaning two things **for those numbers, and
+> it does not do that for E-1 and E-2** — which predate the shared sequence and are local to
+> whichever file they appear in. `EXT-17/docs/escalations.md` numbers its own **E-1** as OQ-3 (the
+> headless invocation, to the mentor) and its own **E-2** as OQ-2 (the gate basis) — and *its*
+> E-2 is *this* file's **E-1**, one finding under two numbers. **This is stated rather than
+> renumbered**: both files are on the record with issues filed against them, and silently
+> re-labelling a raised question is worse than a footnote saying which is which.
 >
 > **E-1's substance has separately been resolved downstream, and that is the outcome it was
 > written to produce.** EXT-17's PRD keys its determinism gate on content rather than bytes

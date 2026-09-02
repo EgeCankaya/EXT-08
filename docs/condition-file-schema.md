@@ -17,6 +17,14 @@ silent divergence across a project boundary, which is what a vendored contract e
 prevent. Reported by EXT-17 (its E-5); the sections below are now the whole of it, in one file
 that can be vendored by identity and checked byte for byte at a re-pin.
 
+**Two links in the text below are absolute URLs into this repository, and that is deliberate.**
+This file is maintained in `README.md` at the repository root, copied here under `docs/`, and
+vendored a third time into a consumer's own tree where no such repository exists. A relative
+path is correct in at most one of those three places and was broken in two: `conditions/…` and
+`src/…` resolved under `docs/` and hit nothing. An absolute URL resolves from all three, which
+is the only form a file meant to be vendored by identity can use. **Do not "fix" them back to
+relative** — the byte-identity check would still pass and the link would break again.
+
 **The text below is verbatim from `README.md`** — four consecutive sections, "Declaring
 conditions" through "How distance is computed" and its "Boundary semantics". `README.md` remains
 where they are maintained; this file is the copy that is meant to be vendored, and
@@ -59,7 +67,7 @@ exists to prevent.
 ```
 
 A working file is committed at
-[`conditions/atacama.conditions.json`](conditions/atacama.conditions.json).
+[`conditions/atacama.conditions.json`](https://github.com/EgeCankaya/EXT-08/blob/main/conditions/atacama.conditions.json).
 
 | key | applies to | meaning |
 |---|---|---|
@@ -103,7 +111,7 @@ command-centre-is-destroyed  NOT MET
 
 Positions are converted to **earth-centred, earth-fixed (ECEF) coordinates on WGS-84**, and
 distance is the straight-line Euclidean distance between them in metres. The formulae are in
-[`src/Geodesy.h`](src/Geodesy.h) with the constants spelled out, so a third party can reproduce
+[`src/Geodesy.h`](https://github.com/EgeCankaya/EXT-08/blob/main/src/Geodesy.h) with the constants spelled out, so a third party can reproduce
 any verdict with a calculator — which is what BTB-REF-3 asks for.
 
 Haversine was rejected because it ignores altitude, and two aircraft stacked 6 km apart

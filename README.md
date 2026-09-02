@@ -10,6 +10,10 @@ plus a pass/fail verdict, live or re-judged offline long after the run has ended
 repository consumes it — see [Status, in full](#status-in-full) for what that costs and what is
 deliberately not here.
 
+**Reviewing rather than running it?** [Decisions taken without a
+ruling](#decisions-taken-without-a-ruling) is the list to start from: the ten calls that were made
+here rather than waited on, why each was made, and what overturning each one would cost.
+
 ---
 
 ## Quickstart
@@ -123,6 +127,35 @@ program's source — so *"complete enough to write a reader from"* is a test rat
   keys, four of them fragments that nothing in any file identifies as such, which is why the
   consumer takes the simpler bound.
 
+## Decisions taken without a ruling
+
+**Delivery time was the binding constraint, so the decisions below were taken here rather than
+waited on.** Each is one a reviewer is entitled to overturn, and each is already recorded in full
+in [`docs/prd.md`](docs/prd.md) — as an open question, an architecture decision record, or a
+rejected alternative. This section adds no new fact; it collects them in one list, with what
+overturning each would actually cost.
+
+The counterpart list for the downstream project is in [EXT-17's
+README](https://github.com/EgeCankaya/EXT-17#decisions-taken-without-a-ruling), and the two are
+worth reading together — the format frozen here is what constrains what could be built there.
+
+| # | What was decided here | Why it was decided rather than asked | The full record | What overturning it costs |
+|---|---|---|---|---|
+| **1** | **The entity-picture layer is ours to own, permanently** | The SDK documentation describes the layer as shipped; release 2.1.328 does not have it, and nothing says whether it is coming — checked directly rather than assumed | OQ-1 and ADR-1 in [`docs/prd.md`](docs/prd.md); E-2 in [`docs/escalations.md`](docs/escalations.md) | **Asymmetric, which is why it went this way.** If a later release ships the type, deleting ours costs about a day; being under-built while permanent costs every milestone after M3. Nothing downstream constrains the layer's internal shape, because EXT-17 binds to the capture file and not to this source |
+| **2** | **An entity's identity is `(name, occupancy)`, never name** | Forced by measurement, not preference: the engine's stop path deletes every live entity and immediately re-creates the roster under the same names, and one entity was destroyed mid-run and re-created at teardown. A name is unique within a tenure, not across a run | ADR-6 in [`docs/prd.md`](docs/prd.md) | **The most consequential row here** — three record types carry the ordinal and every downstream statistic keys on the pair. A roster keyed on name lets a stale sample survive a re-creation and corrupts everything computed after it. It is listed because it was decided here and everything else rests on it, not because it is in doubt |
+| **3** | **`FIFO_DROP` at bus queue 1024. `BLOCK` rejected on principle; `KEEP_LATEST` never in the running** | `KEEP_LATEST` discards the older of two samples — the one already part of the run's history. `BLOCK` would make a recorder that stalls the bus it records, and the downstream project reached the same rejection independently from its own side | OQ-4 and ADR-4 in [`docs/prd.md`](docs/prd.md) | **`BLOCK` cannot be adopted by measurement** — the format specification now tells consumers in writing that this producer never blocks, so testing it would mean violating a published contract. The queue depth is a header value: zero bus-side drops across 136 000 samples at 2 487/s, internal high-water 54 of 8 192 |
+| **4** | **The capture container is schema-headed JSON Lines — not a binary container, not SQLite** | It must cross a repository boundary as a versioned, self-describing, byte-comparable artifact, and be inspectable while the stream's shape was still being learned | ADR-2 and "Alternatives considered" options 2 and 3 in [`docs/prd.md`](docs/prd.md) | Post-freeze this is a format version bump plus a downstream re-pin, so it is the most expensive row to reverse. The standing cost of the decision is file size; compression was deferred rather than dismissed |
+| **5** | **Simulation time is the only clock in the file** | A single wall-clock value anywhere in a capture defeats the determinism self-test the downstream project gates on. Run labels default to ordinals, never timestamps | ADR-3 in [`docs/prd.md`](docs/prd.md) | Correlating a capture with an external wall-clock event needs the log alongside it — accepted, and stated in this README rather than left to be discovered |
+| **6** | **`std::to_chars` shortest round-trip; the whole `printf` family disqualified** | `%.17g` is round-trip exact and **silently locale-dependent** — it emits `0,05` under a comma-decimal locale, which this machine has. Found by test at M1, before there was a capture anyone depended on | OQ-5 in [`docs/prd.md`](docs/prd.md); probe and corpus at `tests/float-format/` | Reversing it re-introduces the failure it was chosen to avoid. This row is here for completeness — it was settled by measurement, not judgement |
+| **7** | **The format was frozen at M7, and every correction since has been a text change with an issue number rather than a quiet edit** | A downstream reader was written from the specification alone. If the text can be edited silently, the drift is discovered inside somebody else's analysis | BTB-CAP-5 in [`docs/prd.md`](docs/prd.md); [`docs/escalations.md`](docs/escalations.md) | **Measured rather than estimated:** four imprecisions raised by the downstream project cost an issue, a diff and a re-pin each. That is the price of the discipline, paid four times, and it is the reason all four were caught before anyone's numbers depended on them |
+| **8** | **The referee's condition schema was designed for this project's own needs and documented in full — not designed in advance for a consumer that did not yet exist** | Designing for a hypothetical consumer risks speculative generality, and an over-designed schema is harder to supersede than a simple documented one | OQ-6 in [`docs/prd.md`](docs/prd.md); "Declaring conditions" below | **None observed.** EXT-17 adopted the shape unmodified and added exactly one key — its own `expect`, for a question this referee is not asked |
+| **9** | **Three questions raised *against* the downstream project were settled between the two projects and written into the frozen specification** | E-7, E-8 and E-9 concern how a consumer must read this format. They were answered by the consumer, which is the party the answer binds | E-7, E-8, E-9 in [`docs/escalations.md`](docs/escalations.md) | E-8 is the one to look at: per-topic drop counts were **declined** rather than deferred, because they would be keys nobody reads. Reversing that is a producer change plus a version bump |
+| **10** | **The controller stretch goal stays out of scope** | It touches the invocation question, adds the write direction to a component whose whole discipline is that it subscribes and never publishes, and duplicates the downstream project's execution piece | "Out of scope" and "Rabbit holes" in [`docs/prd.md`](docs/prd.md) | Cheap to reverse and expensive to live with. It stays out **unless you ask otherwise** — which is where it has been parked since rev 1 |
+
+**If any row should read the other way, say which.** Each is a change to this repository and not
+to the argument for it — the argument is written down beside the decision, which is what makes
+overturning it cheap.
+
 ## Documentation
 
 **[`docs/prd.md`](docs/prd.md) is the deep dive and the binding contract** — the full requirements
@@ -130,17 +163,18 @@ document, revised fifteen times as measurement contradicted it, with requirement
 traceability, the user acceptance criteria, the architecture decision records, and the risks and
 open decisions.
 
-Four documents sit beside it:
+Five documents sit beside it:
 
 | | |
 |---|---|
-| [`docs/capture-format-v1.md`](docs/capture-format-v1.md) | **The frozen cross-repo contract.** The whole of what EXT-17 is given. A reader was written from this file alone, and it works |
-| [`docs/condition-file-schema.md`](docs/condition-file-schema.md) | The referee's condition shape, the distance arithmetic and the boundary rules — vendored downstream by identity, with a CI check that stops it drifting from the README it was cut from |
+| [`notes.md`](notes.md) | **[B]'s fifth deliverable** — *"a page of notes: what the stream contained that you did not expect"*. At the repository root rather than under `docs/`, and the reason it is listed here is that a reviewer sent to this section should not have to find it in the layout dump |
+| [`docs/capture-format-v1.md`](docs/capture-format-v1.md) | **The frozen cross-repo contract**, and the largest of the four artifacts EXT-17 is given. A reader was written from this file alone, and it works |
+| [`docs/condition-file-schema.md`](docs/condition-file-schema.md) | The referee's condition shape, the distance arithmetic and the boundary rules — the **second** vendored artifact, downstream by identity, with a CI check that stops it drifting from the README it was cut from |
 | [`docs/clean-room.md`](docs/clean-room.md) | Both repositories cloned cold and both READMEs walked literally, in both orders. **A pass that reads one repository cannot see the seam between two** |
-| [`docs/escalations.md`](docs/escalations.md) | Every question raised in either direction, and what came back |
+| [`docs/escalations.md`](docs/escalations.md) | **The outbound list** — every question this project raised, to the brief's author and to EXT-17, and what came back. Findings raised *at* EXT-08 carry EXT-17's numbering and are answered elsewhere; the file's numbering note says where each one went |
 
 The rest of this README is the reference manual: everything below is detail behind one of the
-five sections above.
+six sections above.
 
 ---
 
@@ -159,16 +193,22 @@ offline against a stored capture, and produce `verdict` records. Live and replay
 the same run are byte-identical — see [The referee](#the-referee).
 
 The capture format is specified in [`docs/capture-format-v1.md`](docs/capture-format-v1.md).
-That document is a **cross-repo contract**: EXT-17 gets it and nothing else, and the
-conformance reader in `tests/capture-reader/` was written from it alone — it links neither
+That document is a **cross-repo contract**, and the largest of the four artifacts that cross:
+EXT-17 vendors it, `docs/condition-file-schema.md`, `conditions/atacama.conditions.json` and one
+sample capture, and nothing else — no header, no snippet, no class name. The
+conformance reader in `tests/capture-reader/` was written from the format document alone — it links neither
 this program nor the N8RO SDK — so that "complete enough to write a reader from" is a test
 rather than a claim.
 
 **The consumer on the other side of that contract is
 [EXT-17, the headless campaign runner](https://github.com/EgeCankaya/EXT-17)**, and this line
-names it because until 2026-09-01 nothing here did. This README mentions EXT-17 eight times —
-what it is handed, what it measured downstream, which escalations it raised — and gave no way to
-find it. **EXT-17 had the exact mirror of the same defect**: it requires this repository's
+names it because until 2026-09-01 nothing here did. Before that line existed this README
+mentioned EXT-17 eight times — what it is handed, what it measured downstream, which escalations
+it raised — and gave no way to find it. (**Past tense on purpose.** The fix was to name the
+repository, which is exactly what made the number grow, so a present-tense count would have
+rotted the moment it was written — the same shape as the rotted number
+[`docs/clean-room.md`](docs/clean-room.md) §5.2 records.) **EXT-17 had the exact mirror of the
+same defect**: it requires this repository's
 `n8ro-bridge.exe` as its `--recorder`, devotes a whole section to saying so, and named no
 repository either. Both were found by cloning the two cold and following both READMEs literally,
 **in both orders** — see [`docs/clean-room.md`](docs/clean-room.md).
@@ -626,7 +666,7 @@ exists to prevent.
 ```
 
 A working file is committed at
-[`conditions/atacama.conditions.json`](conditions/atacama.conditions.json).
+[`conditions/atacama.conditions.json`](https://github.com/EgeCankaya/EXT-08/blob/main/conditions/atacama.conditions.json).
 
 | key | applies to | meaning |
 |---|---|---|
@@ -670,7 +710,7 @@ command-centre-is-destroyed  NOT MET
 
 Positions are converted to **earth-centred, earth-fixed (ECEF) coordinates on WGS-84**, and
 distance is the straight-line Euclidean distance between them in metres. The formulae are in
-[`src/Geodesy.h`](src/Geodesy.h) with the constants spelled out, so a third party can reproduce
+[`src/Geodesy.h`](https://github.com/EgeCankaya/EXT-08/blob/main/src/Geodesy.h) with the constants spelled out, so a third party can reproduce
 any verdict with a calculator — which is what BTB-REF-3 asks for.
 
 Haversine was rejected because it ignores altitude, and two aircraft stacked 6 km apart

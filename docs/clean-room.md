@@ -10,9 +10,12 @@ choosing evidence. That rule applies to a packaging audit as much as to a captur
 below was found by executing something, and four of the defects were invisible from the working
 directory** — they existed only in what a clone contained.
 
-**Verified versus relayed.** Sections 1 to 4 were measured directly in this repository. Section 5
-was measured in the sibling project by its author; it is included because it is about this
-repository's other half and the conclusion cuts both ways.
+**Verified versus relayed.** Sections 1 to 3 and 5 were measured directly in this repository.
+**Section 4 — the pair test — was run in the sibling project by its author** and its full record
+is EXT-17's `docs/clean-room.md`; the three results kept here are the ones that land on this side,
+and they are included because they are about this repository's other half and the conclusion cuts
+both ways. §5 in particular is this repository's own zero-install measurement of its own CI job,
+which is the opposite of relayed.
 
 ---
 
@@ -55,8 +58,11 @@ camera, so the regeneration did not invalidate any take.
 
 **Defect 5 had a downstream cost nobody here could see, and it is worth following.** EXT-17
 vendors this file. The regeneration was not an escalation, not an issue and not a version bump —
-so nothing downstream had any way to notice, and EXT-17 carried the 0.5.0 file for three weeks
-while its own README named 0.9.0 as the pinned producer. It found this by running its pin check
+so nothing downstream had any way to notice, and EXT-17 carried the 0.5.0 file from its first
+commit to its fifth pin while its own README named 0.9.0 as the pinned producer. **That is one
+day on the calendar and the whole life of the repository so far**, which is the honest way to
+state it: the interval measures how long the project ran, not how long the gap would have
+lasted, because nothing existed that would ever have ended it. It found this by running its pin check
 during the pair test (its F-47/F-49). **A producer-side regeneration is invisible to a consumer
 that only watches for escalations.**
 
@@ -113,9 +119,10 @@ belong on this side.
 
 ### 4.1 This README never said where EXT-17 is, and EXT-17's never said where this is
 
-Symmetrical, and neither was findable from inside one repository. This README names EXT-17 eight
-times — what it is handed, what it measured downstream, which escalations it raised — and gave no
-URL. EXT-17 requires this repository's `n8ro-bridge.exe` as its `--recorder`, devotes a section
+Symmetrical, and neither was findable from inside one repository. This README named EXT-17 eight
+times at the moment of the finding — what it is handed, what it measured downstream, which
+escalations it raised — and gave no URL. (Past tense: the fix was to name the repository, so
+the count has grown since, and a present-tense number here would be §5.2's defect again.) EXT-17 requires this repository's `n8ro-bridge.exe` as its `--recorder`, devotes a section
 titled *"The fourth binary is not in this repository"* to saying so, and named no repository
 either.
 
@@ -165,7 +172,8 @@ all three of its tests.
 **The part worth keeping is what happened next.** These answers changed the frozen specification,
 which EXT-17 vendors — and EXT-17's own escalations file recorded only *outbound* questions, so it
 had no row for any of them. It ruled on three questions about the format it consumes and then read
-a copy predating its own rulings for three weeks. It found that by running its documented pin
+a copy predating its own rulings — for a day, because the pair test happened to run the next
+morning, and for no bounded time at all if it had not. It found that by running its documented pin
 check during the pair test, and widened its rule accordingly: **an escalation a project answers
 makes its vendored copy stale exactly as one it raises does.** Nothing on this side needs to
 change, but the shape is worth remembering the next time a clarification is issued: **closing an

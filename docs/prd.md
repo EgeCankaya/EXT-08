@@ -609,7 +609,7 @@ The repository SHALL contain a sample capture from a real run, the reader that c
 
 ## Scope authority
 
-The FR sections above are the **contract** for this PRD. The design document (`docs/design.md` — to be added when the design is created) realizes these FRs as components, sequences, and milestone tasks.
+The FR sections above are the **contract** for this PRD. **There is no separate design document and none is planned** — the earlier promise of one (`docs/design.md`, "to be added") was never kept and is withdrawn here rather than left dangling. What realizes these FRs as components is the source layout itself, and what records the sequence and the reasoning is [`README.md`](../README.md): its architecture and layout sections name each component and what it is for, its decisions sections carry the trade-offs taken along the way, and "Status, in full" is the milestone record. **Where the paragraphs below say *the design*, that is what they mean.**
 
 **The design must not introduce surface area beyond this PRD's FR table without a corresponding PRD revision.** If the design proposes a new record type, a new CLI option, a fourth condition kind, a new output file, or a network listener not authorized by an FR, the PRD must be updated first — adding the FR through the revision flow. This matters more than usual here: the capture format is consumed across a repo boundary, so unauthorized surface added at design time becomes a contract EXT-17 depends on before anyone agreed to it.
 
@@ -894,6 +894,13 @@ None. Data retention is the user's: captures accumulate in `--out-dir` and are n
 | **R8 — The host EXT-17 will actually use has never been checked for repeatability. RESOLVED at M7.** Two runs of `Atacama Air Defense` on the headless `n8ro-sim-app.exe`, each stopped at **exactly frame 1200** — a frame budget, not a wall-clock one, which is what makes two runs cover the same simulation. **Byte comparison fails; content comparison passes completely**: 50 358 samples compared per `(entity, occupancy)` aligned on `sim_time_s`, 50 358 agree, zero differ. The runs disagree only about which frames were published — 83 samples across 4 frames of ~1 198, about 0.2% against `n8ro-sim-local`'s ~1% | High for EXT-17 — its step-4 gate either passes or its whole self-test design changes; low for EXT-08, whose own guarantee is scoped to the recorder | **Measured** | **The gate as written cannot pass, and the property it was reaching for holds exactly.** EXT-17 should key its determinism self-test on **content, not bytes**; `tests/determinism/compare_captures.py` is that comparison, kept in this repository so it is inherited rather than re-derived. OQ-2 had to be answered first and was, by observation — `tests/host-driver/` is the driver that made the experiment possible, and it lives in `tests/` because the bridge is a passive observer and must stay one. `docs/capture-format-v1.md` §14 carries the measurement |
 
 ### Open questions
+
+> **For a reviewer.** Every row below reads *resolved* or *closed*, and each was settled inside
+> this project rather than by the person the question was addressed to, because delivery time was
+> the binding constraint. The README's [Decisions taken without a
+> ruling](../README.md#decisions-taken-without-a-ruling) section indexes them in one place — with
+> the cost of overturning each — and holds no fact that is not already in this table, in Appendix C,
+> or in `docs/escalations.md`.
 
 | # | Question | Status | Decision target | Rationale (why open / what would resolve it) |
 |---|----------|--------|-----------------|----------------------------------------------|
